@@ -10,9 +10,9 @@
          and nothing else. The app-wide machinery of the monorepo (spotless, dev-guard, enforcer,
          jandex) is intentionally absent; a clone of this repo alone must `./mvnw verify` green.
 
-         The reactor holds only ci-daemon-protocol today. The Quarkus application module lands with
-         the daemon itself; listing a module that does not exist yet would break the clone-alone
-         rule this file is here to keep. -->
+         The reactor holds the wire contract and the application that speaks it. Both exist; a
+         module listed here that did not would break the clone-alone rule this file is here to
+         keep. -->
     <groupId>eu.wohlben</groupId>
     <artifactId>qits</artifactId>
     <version>1.0.0-SNAPSHOT</version>
@@ -20,6 +20,7 @@
 
     <modules>
         <module>ci-daemon-protocol</module>
+        <module>ci-daemon</module>
     </modules>
 
     <properties>
@@ -37,9 +38,9 @@
 
     <dependencyManagement>
         <dependencies>
-            <!-- Supplies the managed versions the children leave unversioned. For the protocol
-                 module that is junit-jupiter alone — it has no main-scope dependency at all and is
-                 not allowed to grow one. -->
+            <!-- Supplies the managed versions the children leave unversioned: junit-jupiter for
+                 both modules, quarkus-arc/quarkus-vertx for the application. The protocol module
+                 has no main-scope dependency at all and is not allowed to grow one. -->
             <dependency>
                 <groupId>${quarkus.platform.group-id}</groupId>
                 <artifactId>${quarkus.platform.artifact-id}</artifactId>

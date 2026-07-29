@@ -31,7 +31,15 @@ environment is what catches it.
 
 The capability modules — today `ci-daemon-protocol`, and anything extracted beside it — are
 **framework-free**: plain classes with plain constructors and no annotations. The application module
-news them up. Only the socket, the app shell and `Main` are CDI beans.
+news them up.
+
+**`Main` is the only CDI bean**, and the application module holds itself to the same standard the
+capability modules are held to: `DaemonMain`, `ControlSocket`, `Workspace` and `StepProcess` are
+plain classes taking everything they need as constructor arguments. `Main` resolves configuration,
+constructs them, and hands its exit code back to the runtime. (The workspace daemon keeps its socket
+and its API as beans; it has more of them and a longer life. Here there is one flow and it ends, so
+there is nothing a bean would buy — and the whole flow being constructible by hand is what lets
+`DaemonMainTest` drive it against a real socket with no container.)
 
 That has a consequence worth stating plainly: **a capability module cannot read configuration.** Every
 setting it needs arrives as a constructor argument from the one class that resolves it. Do not reach

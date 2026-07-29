@@ -1,0 +1,66 @@
+# The GraalVM native-image builder image this repo's `-Dnative` build runs inside: GraalVM CE plus a
+# musl toolchain and a musl-built zlib. Built locally, lives in no registry.
+#
+#     docker build -t qits/graalvmce-musl-builder:jdk-25 -f docker/Dockerfile.musl-builder docker/
+#     ./mvnw -B -ntp -pl ci-daemon -am package -Dnative -DskipTests
+#
+# The context is `docker/` on purpose: nothing from the source tree is copied in, so there is no
+# reason to hand the daemon the whole repo as a build context.
+#
+# --- WHY THIS BASE IS NOT THE ONE qits-workspace-daemon USES ---------------------------------------
+# Read this before "harmonizing" the two. The sibling daemon's docker/Dockerfile builds on
+# quay.io/quarkus/ubi9-quarkus-mandrel-builder-image:jdk-25 and that image CANNOT build this binary:
+#
+#  1. Mandrel ships static JDK libraries for glibc only — /opt/mandrel/lib/static/linux-amd64/glibc
+#     and nothing beside it. A `--libc=musl` build dies at [1/8] Initializing in about two seconds:
+#
+#         Error: Building images on LINUX_AMD64 (target libc: musl) is not supported on your
+#         platform. Missing libraries: java, nio, net
+#         (search path: /opt/mandrel/lib/static/linux-amd64/musl)
+#
+#     Nothing is installable after the fact: libjava.a/libnio.a/libnet.a for musl are part of the
+#     JDK distribution, and Mandrel omits them. GraalVM CE ships both flavours, which is the whole
+#     reason the base differs.
+#  2. Neither image carries a musl *toolchain* — no musl-gcc, no libc.a, no libz.a — and quay
+#     publishes no musl-flavoured tag for any Quarkus builder image, Mandrel or CE. So the toolchain
+#     half is added here, from GraalVM's own documented static-image recipe.
+#
+# The alternative to all of this is shipping a glibc-linked binary, which does not execute at all on
+# an alpine-family image ("exec /qits-ci-daemon: no such file or directory") — and half of what a
+# pipeline config declares is alpine-family. The static musl binary costs +4.8% in size over the
+# glibc-dynamic one. That is the trade, and it is not close.
+FROM quay.io/quarkus/ubi10-quarkus-graalvmce-builder-image:jdk-25
+USER root
+
+# more.musl.cc is a small community host. If build reproducibility ever matters more than build
+# simplicity, mirror this tarball rather than fetching it per image build. zlib comes from the
+# GitHub release and not zlib.net, which 404s old versions as soon as a new one lands.
+ARG MUSL_URL=https://more.musl.cc/11.2.1/x86_64-linux-musl/x86_64-linux-musl-native.tgz
+ARG ZLIB_URL=https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz
+
+RUN mkdir -p /opt/musl \
+ && curl -fsSL "$MUSL_URL" | tar -xz -C /opt/musl --strip-components=1 \
+ && /opt/musl/bin/x86_64-linux-musl-gcc --version
+
+# native-image with --libc=musl invokes `x86_64-linux-musl-gcc`, so that name must be on PATH — but
+# ONLY that name. Putting /opt/musl/bin itself on PATH also shadows the system `gcc`, and then any
+# *glibc* native build in the same image dies in native-image's C query step with a wall of
+# "'LC_ADDRESS' undeclared / 'LM_ID_BASE' undeclared" (musl has no glibc-only locale categories and
+# no dlmopen namespace macros). This repo only ever builds musl, so it would not bite here — but the
+# error names nothing relevant, and the next person to reuse the image would pay for it. A shim
+# directory holding just the target-prefixed symlinks keeps the system gcc the default.
+RUN mkdir -p /opt/musl-shim \
+ && for f in /opt/musl/bin/x86_64-linux-musl-*; do ln -s "$f" "/opt/musl-shim/$(basename "$f")"; done
+ENV PATH=/opt/musl-shim:$PATH
+
+# native-image links `-lz`, so zlib has to exist for the musl target too — compiled against the
+# toolchain above and installed into the same prefix.
+RUN mkdir -p /tmp/zlib \
+ && curl -fsSL "$ZLIB_URL" | tar -xz -C /tmp/zlib --strip-components=1 \
+ && cd /tmp/zlib \
+ && CC=/opt/musl/bin/x86_64-linux-musl-gcc ./configure --static --prefix=/opt/musl \
+ && make -j"$(nproc)" && make install \
+ && rm -rf /tmp/zlib
+
+# Back to the unprivileged user the base image runs the build as.
+USER 1001

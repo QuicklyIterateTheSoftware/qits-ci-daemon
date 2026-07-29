@@ -17,10 +17,13 @@ pipeline config, persisting runs and steps — belongs to
 | Module | What |
 |---|---|
 | `ci-daemon-protocol/` | The control-socket wire contract: message records + a codec over a plain `Map`. Depends on nothing. qits-ci vendors a byte-identical copy. |
+| `ci-daemon/` | The binary. A Quarkus command-mode app — no web stack, it dials out and never listens — compiled to a fully static musl native image. |
 
-The Quarkus application module lands next; today this repo is the wire contract and the scaffolding
-around it. The reactor lists only modules that exist, because `./mvnw verify` on a fresh clone is the
-gate and a placeholder module would fail it.
+Inside `ci-daemon/`, `Main` is the only CDI bean: it resolves configuration and news up plain
+classes with plain constructors — `DaemonMain` (the flow), `ControlSocket` (the dial),
+`Workspace` (clone + checkout), `StepProcess` (the child). One reader per setting, which is what
+stops two components from resolving the same key differently, and a suite that can drive the whole
+flow against a real socket without a container.
 
 `ci-daemon-protocol` is **framework-free**: no Quarkus, no CDI, no JAX-RS, no Jackson — a plain jar
 of records with plain constructors. That is not stylistic. The shipping form of this daemon is a
@@ -68,7 +71,20 @@ prelude-sentinel inference.
 of the precedent it otherwise mirrors. Any terminal condition — result delivered, `InitFailed` sent,
 an `Ack` carrying a capability version this binary does not know, or dial failure after a short
 capped retry — ends the process. Exit code 0 only on the clean paths, so `docker logs` of a reaped
-container reads honestly.
+container reads honestly:
+
+| Exit | Ending |
+|---|---|
+| 0 | A step ran and its `StepFinished` reached the host. The only clean one. |
+| 2 | The env contract was not satisfied; nothing was dialled. |
+| 3 | No connection within the dial budget (~30s total, not infinite). |
+| 4 | The `Ack` carried a capability version this binary does not know. |
+| 5 | `InitFailed` delivered — the daemon did its job, the container did not run its step. |
+| 6 | The socket closed before a `RunStep`; the host has reaped us. |
+| 7 | `Cancel` with no step running. |
+
+The socket already carried whether the daemon behaved; the exit code is about whether the
+*container* did what it was started for, which is why 5 is not a zero.
 
 ## The image contract
 
@@ -81,6 +97,41 @@ What that asks of a step's image: **`git`, `bash`, and a downloader** (`wget` or
 bootstrap probes for either). What it asks of this repo: the binary must be a **fully static musl
 build**, because a glibc-linked one dies on every alpine-family image, and it must take no arguments
 — the environment above is its whole input.
+
+`git` and `bash` are probed with `--version` before the clone, so an image that does not satisfy the
+contract reports `InitFailed{TOOLING_MISSING}` rather than failing halfway through a step.
+
+## Building the binary
+
+    docker build -t qits/graalvmce-musl-builder:jdk-25 -f docker/Dockerfile.musl-builder docker/
+    ./mvnw -B -ntp -pl ci-daemon -am package -Dnative -DskipTests
+
+The result is `ci-daemon/target/qits-ci-daemon` (~43 MB, stripped), and it is the direct output that
+`$QITS_CI_DAEMON_BINARY_URL` serves — no image, no wrapper.
+
+The builder image is **built locally and lives in no registry**, so whatever publishes a release has
+to build it first; `quarkus.native.builder-image.pull=missing` is what stops every build from trying
+to `docker pull` it. Its base is GraalVM CE and **not** the Mandrel image qits-workspace-daemon
+builds on, because Mandrel ships static JDK libraries for glibc only and a `--libc=musl` build dies
+in its first second. `docker/Dockerfile.musl-builder` carries the error message and the rest of the
+reasoning; `ci-daemon/src/main/resources/application.properties` carries the four properties.
+
+Checking a build:
+
+    $ file ci-daemon/target/qits-ci-daemon
+    ...: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), static-pie linked, stripped
+    $ ldd ci-daemon/target/qits-ci-daemon
+            statically linked
+
+**`file` says `static-pie linked`, not `statically linked`** — GraalVM emits a position-independent
+static executable. It is genuinely fully static; assert on `ldd`, or on `static-pie`, never on the
+literal string `statically linked`.
+
+Running the binary with no environment at all is the cheap check the test suite structurally cannot
+do: it must print the name of the first missing variable and exit 2, not die resolving config.
+
+    $ docker run --rm -v "$PWD/ci-daemon/target/qits-ci-daemon":/qits-ci-daemon:ro alpine:3 /qits-ci-daemon
+    ... ci-daemon cannot start: QITS_CI_DAEMON_URL is not set. Exiting.
 
 ## Relationship to qits-workspace-daemon
 

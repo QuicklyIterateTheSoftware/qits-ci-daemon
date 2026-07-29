@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>eu.wohlben</groupId>
+        <artifactId>qits</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>ci-daemon</artifactId>
+    <packaging>quarkus</packaging>
+
+    <!-- The binary that runs inside a qits-ci step container: one step, one container lifetime.
+         A Quarkus command-mode app with NO web stack — it dials out and never listens — compiled to
+         a fully static musl GraalVM native image (see ../docker/Dockerfile.musl-builder for why the
+         builder image is not the Mandrel one qits-workspace-daemon uses).
+
+         Dependencies are the same minimal set qits-workspace-daemon settled on, minus everything it
+         needs and this does not: quarkus-arc for CDI + command mode, quarkus-vertx for a managed
+         Vertx carrying the vertx-core WebSocketClient (and, unlike websockets-next, no HTTP server),
+         and the wire contract. No Jackson (io.vertx.core.json bridges the codec's Map), no JAX-RS,
+         no YAML, no process library (ProcessBuilder shells git and bash). Every addition here is a
+         decision about image size and about whether it links anything glibc-only. -->
+
+    <dependencies>
+        <dependency>
+            <groupId>eu.wohlben</groupId>
+            <artifactId>ci-daemon-protocol</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-arc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-vertx</artifactId>
+        </dependency>
+        <dependency>
+            <!-- Plain JUnit 5, not quarkus-junit5: nothing here is a @QuarkusTest. The suite drives
+                 real bash, real git and a real in-JVM Vert.x server against plain constructors. -->
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>${quarkus.platform.group-id}</groupId>
+                <artifactId>quarkus-maven-plugin</artifactId>
+                <extensions>true</extensions>
+            </plugin>
+            <plugin>
+                <artifactId>maven-compiler-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <artifactId>maven-surefire-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <!-- GraalVM native build, the same shape as qits-workspace-daemon's: `-Dnative` disables the
+             jar and enables the native image. The root pom has no native profile to inherit, so it
+             lives here. The musl/static specifics are in application.properties, next to the note
+             explaining each one. -->
+        <profile>
+            <id>native</id>
+            <activation>
+                <property>
+                    <name>native</name>
+                </property>
+            </activation>
+            <properties>
+                <quarkus.package.jar.enabled>false</quarkus.package.jar.enabled>
+                <quarkus.native.enabled>true</quarkus.native.enabled>
+            </properties>
+        </profile>
+    </profiles>
+</project>

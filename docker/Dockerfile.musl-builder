@@ -29,7 +29,11 @@
 # an alpine-family image ("exec /qits-ci-daemon: no such file or directory") — and half of what a
 # pipeline config declares is alpine-family. The static musl binary costs +4.8% in size over the
 # glibc-dynamic one. That is the trade, and it is not close.
-FROM quay.io/quarkus/ubi10-quarkus-graalvmce-builder-image:jdk-25
+#
+# `localhost:8081/quay/…` is qits-artifacts' pull-through mirror of quay.io: the first build fetches
+# the image from upstream and caches it, every later build is served from local disk. The tag is
+# upstream's, unchanged — the mirror revalidates it, so `jdk-25` still moves when quay moves it.
+FROM localhost:8081/quay/quarkus/ubi10-quarkus-graalvmce-builder-image:jdk-25
 USER root
 
 # more.musl.cc is a small community host. If build reproducibility ever matters more than build

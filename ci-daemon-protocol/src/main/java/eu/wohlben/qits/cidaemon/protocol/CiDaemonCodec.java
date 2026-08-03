@@ -29,6 +29,7 @@ public final class CiDaemonCodec {
         map.put(Field.DAEMON_ID, m.daemonId());
         map.put(Field.CAPABILITY_VERSION, m.capabilityVersion());
       }
+      case AckReceived _ -> map.put(Field.TYPE, Type.ACK_RECEIVED); // no fields beyond the tag
       case Initialized _ -> map.put(Field.TYPE, Type.INITIALIZED); // no fields beyond the tag
       case InitFailed m -> {
         map.put(Field.TYPE, Type.INIT_FAILED);
@@ -76,6 +77,7 @@ public final class CiDaemonCodec {
     return switch (type) {
       case Type.HELLO ->
           new Hello(str(map, Field.DAEMON_ID), intVal(map, Field.CAPABILITY_VERSION));
+      case Type.ACK_RECEIVED -> new AckReceived();
       case Type.INITIALIZED -> new Initialized();
       case Type.INIT_FAILED -> new InitFailed(reason(map, Field.REASON), str(map, Field.DETAIL));
       case Type.STEP_CHUNK ->

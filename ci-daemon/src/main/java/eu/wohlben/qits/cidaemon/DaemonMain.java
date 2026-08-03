@@ -1,6 +1,7 @@
 package eu.wohlben.qits.cidaemon;
 
 import eu.wohlben.qits.cidaemon.protocol.Ack;
+import eu.wohlben.qits.cidaemon.protocol.AckReceived;
 import eu.wohlben.qits.cidaemon.protocol.Cancel;
 import eu.wohlben.qits.cidaemon.protocol.CiDaemonMessage;
 import eu.wohlben.qits.cidaemon.protocol.CiDaemonProtocol;
@@ -21,7 +22,8 @@ import org.jboss.logging.Logger;
  * The whole life of a step container, in one flow:
  *
  * <pre>
- *   dial → Hello → Ack → clone+checkout → Initialized → RunStep → StepChunk* → StepFinished → exit
+ *   dial → Hello → Ack → AckReceived → clone+checkout → Initialized → RunStep → StepChunk* →
+ *   StepFinished → exit
  * </pre>
  *
  * with {@code Heartbeat} underneath from dial to close, {@code InitFailed} standing in for {@code
@@ -147,6 +149,13 @@ public final class DaemonMain implements ControlSocket.Listener {
       closeAndFinish(ExitCode.CAPABILITY_MISMATCH);
       return;
     }
+    // Confirms host→daemon delivery, which Hello never did — see AckReceived's javadoc. Fired
+    // before the clone starts and best-effort: a container probe is the only caller that waits for
+    // it, and a probe that never sees it is REJECTED at its own deadline rather than this daemon
+    // retrying a send the socket has already told it is gone.
+    socket
+        .send(new AckReceived())
+        .onFailure(t -> LOG.debugf("ci-daemon could not confirm the Ack: %s", t.getMessage()));
     workers.execute(this::initialize);
   }
 

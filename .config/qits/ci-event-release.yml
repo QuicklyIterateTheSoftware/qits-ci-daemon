@@ -23,11 +23,13 @@
 # deployment's addresses. `qits-ci-daemon` is the daemon's name in the `daemons` repository, and
 # the reader supplies its own host.
 #
-# WHAT THIS PIPELINE DELIBERATELY DOES NOT DO: move the pin. `QITS_CI_DAEMON_VERSION` still travels
-# by a human deployment act — edit qits-cd's run-args volume and the compose file, restart qits-cd,
-# redeploy qits-ci, in that order, because cd caches its run-args at boot. The pin is the one value
-# where a wrong move breaks all of CI, so publishing and pinning stay separate acts. The digest is
-# echoed at the end of the step for the human who carries it across.
+# THE PIN NOW MOVES ITSELF. qits-ci listens for the SoftwareRelease this step announces, launches
+# the new version in a real container, and adopts it only once that container dials and speaks the
+# host's protocol version — falling back to the version before it, and then to
+# QITS_CI_DAEMON_VERSION, if it does not (ci-daemon-autoadopt-plan.md). Publishing here is therefore
+# the whole act: nothing further to carry by hand. QITS_CI_DAEMON_VERSION stays qits-ci's bottom
+# rung, moved only by a deliberate deployment act, for the platform to fall back to if every adopted
+# release is rejected.
 event: SCMRelease
 when:
   - repository: { exact: qits-ci-daemon }
@@ -98,9 +100,8 @@ steps:
       # THE PUT CARRIES NO CREDENTIAL, and that is the platform's posture rather than a gap: the
       # daemon publish surface is tokenless like `npm publish`, `mvn deploy` and `docker push`,
       # because on qits-net producers are trusted. What keeps it honest is the 409 below — a version
-      # is immutable, so this step can add a version and can never change one — and the digest it
-      # echoes, which is what a consumer pins. Do not invent a static token here; machine auth
-      # arrives with qits-idp for every publish path at once.
+      # is immutable, so this step can add a version and can never change one. Do not invent a static
+      # token here; machine auth arrives with qits-idp for every publish path at once.
 
       # One request stages the bytes, promotes them and inserts the row. 409 means this version
       # already exists, and it is a HARD FAILURE rather than a skip: versions are immutable here,
@@ -123,10 +124,8 @@ steps:
           exit 1 ;;
       esac
 
-      # THE DIGEST IS THE DELIVERABLE OF THIS OUTPUT. It is what QITS_CI_DAEMON_VERSION pins (the
-      # version-addressed GET is the readable second spelling; the pin stays the self-naming one),
-      # and a human copies it from here into qits-cd's run-args and the compose file. Printed
-      # alone on its own line so it can be selected without the surrounding prose.
+      # THE DIGEST IS PRINTED FOR A HUMAN READING THE LOG, not for carrying across by hand: qits-ci
+      # adopts this version off the SoftwareRelease announced below on its own, and pins by version
+      # rather than by digest (ci-daemon-autoadopt-plan.md §2.2).
       digest=$(jq -er .digest /tmp/daemon-publish.json)
-      echo "published qits-ci-daemon $version, $(jq -er .sizeBytes /tmp/daemon-publish.json) bytes"
-      echo "QITS_CI_DAEMON_VERSION=${digest#sha256:}"
+      echo "published qits-ci-daemon $version, $(jq -er .sizeBytes /tmp/daemon-publish.json) bytes, digest $digest"

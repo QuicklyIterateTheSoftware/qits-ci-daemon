@@ -95,6 +95,13 @@ steps:
       # reading (a host-published mapping the docker daemon dials) and must not be used for it.
       artifacts=$(printf '%s' "$QITS_MAVEN_REGISTRY_URL" | sed -E 's#^(https?://[^/]+).*#\1#')
 
+      # THE PUT CARRIES NO CREDENTIAL, and that is the platform's posture rather than a gap: the
+      # daemon publish surface is tokenless like `npm publish`, `mvn deploy` and `docker push`,
+      # because on qits-net producers are trusted. What keeps it honest is the 409 below — a version
+      # is immutable, so this step can add a version and can never change one — and the digest it
+      # echoes, which is what a consumer pins. Do not invent a static token here; machine auth
+      # arrives with qits-idp for every publish path at once.
+
       # One request stages the bytes, promotes them and inserts the row. 409 means this version
       # already exists, and it is a HARD FAILURE rather than a skip: versions are immutable here,
       # so a 409 says the release train tried to ship a coordinate that is already spoken for, and
@@ -109,16 +116,6 @@ steps:
         201) ;;
         409)
           echo "qits-ci-daemon $version is already published — a version is never republished" >&2
-          cat /tmp/daemon-publish.json >&2
-          exit 1 ;;
-        401|403)
-          # The publish route is guarded by a machine token addressed to qits-artifacts whenever
-          # qits.auth.machine.required is on, and a step container is handed no machine credential
-          # of any kind — qits-ci injects registry roots and addresses, never a token. So on a
-          # gated platform this step cannot authenticate today, and it says so here rather than
-          # failing as a mystery. The fix belongs to qits-idp's machine-auth work (a credential a
-          # step can present), NOT to a static token invented in this file.
-          echo "publish refused $status: a step container holds no machine token for qits-artifacts" >&2
           cat /tmp/daemon-publish.json >&2
           exit 1 ;;
         *)

@@ -93,6 +93,7 @@ class DaemonMainTest {
     Host host = host((h, message) -> h.reply(message, "echo hello; echo oops >&2; exit 4"));
 
     int code = runDaemon(host.url("/ci/daemon"), ready(), 30).get(30, TimeUnit.SECONDS);
+    host.awaitDrained();
 
     assertEquals(ExitCode.OK, code);
     assertEquals(
@@ -123,6 +124,7 @@ class DaemonMainTest {
             });
 
     int code = runDaemon(host.url("/ci/daemon"), ready(), 30).get(30, TimeUnit.SECONDS);
+    host.awaitDrained();
 
     assertEquals(ExitCode.CAPABILITY_MISMATCH, code);
     // No compat mode, and nothing half-done: the daemon does not clone for a host it cannot talk to.
@@ -139,6 +141,7 @@ class DaemonMainTest {
                 () -> new Workspace.Preparation(InitFailed.Reason.SHA_GONE, "fatal: reference is not a tree"),
                 30)
             .get(30, TimeUnit.SECONDS);
+    host.awaitDrained();
 
     // The frame carries the outcome the host branches on; the exit code says the container did not
     // run its step. Those are two different statements and both are true.
@@ -220,6 +223,7 @@ class DaemonMainTest {
             });
 
     int code = runDaemon(host.url("/ci/daemon"), ready(), 30).get(60, TimeUnit.SECONDS);
+    host.awaitDrained();
 
     assertEquals(ExitCode.OK, code);
     StepFinished finished = host.first(StepFinished.class);
@@ -280,6 +284,7 @@ class DaemonMainTest {
             });
 
     int code = runDaemon(host.url("/ci/daemon"), ready(), 30).get(30, TimeUnit.SECONDS);
+    host.awaitDrained();
 
     // The daemon is the party that can least afford to die of a frame it did not understand: to the
     // host it would be indistinguishable from a container that went quiet mid-step.
@@ -337,6 +342,9 @@ class DaemonMainTest {
     volatile String requestUri;
     volatile ServerWebSocket socket;
 
+    /** Completes when the daemon's socket closes; see {@link #awaitDrained()}. */
+    private final CompletableFuture<Void> closed = new CompletableFuture<>();
+
     Host(BiConsumer<Host, CiDaemonMessage> script) throws Exception {
       this.script = script;
       this.server =
@@ -354,12 +362,24 @@ class DaemonMainTest {
       requestPath = ws.path();
       requestUri = ws.uri();
       socket = ws;
+      ws.closeHandler(v -> closed.complete(null));
       ws.textMessageHandler(
           json -> {
             CiDaemonMessage message = CiDaemonCodec.decode(new JsonObject(json).getMap());
             received.add(message);
             script.accept(this, message);
           });
+    }
+
+    /**
+     * Wait until the wire is drained before reading {@link #received}. The daemon's exit code only
+     * proves its last frame was <em>written</em>; this side reads it on another event loop, so an
+     * assertion made the instant {@code run()} returns can look at the list before the frame has
+     * reached it. Vert.x delivers the close after the frames that preceded it on the same
+     * connection, so the close is the signal that everything the daemon sent has been handled here.
+     */
+    void awaitDrained() throws Exception {
+      closed.get(10, TimeUnit.SECONDS);
     }
 
     /** The default script: Ack the Hello, answer Initialized with a trivial step. */

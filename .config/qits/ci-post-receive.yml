@@ -1,0 +1,76 @@
+# The pipeline qits-ci runs on every push to a tracked branch of this repository.
+#
+# Two steps, and the split is the repo's own two rules (CLAUDE.md):
+#
+#   1. `./mvnw verify` — "a clone of this repo alone builds and tests green". No docker, no
+#      network beyond Maven Central, no prior install anywhere. It runs FIRST because it is the
+#      cheap gate: a broken test must not cost a GraalVM native build.
+#   2. the shipping form — a fully static musl native image. A sibling service proves its native
+#      build inside `docker build` (its Dockerfile has a native stage); this repo ships no image
+#      at all, so the native build is the artifact itself and needs its own step.
+#
+# --- WHY STEP 2 BUILDS INSIDE A CONTAINER IT STARTS BY HAND ---------------------------------------
+# The documented recipe (README.md, "Building the binary") is `./mvnw -Dnative` with
+# `quarkus.native.container-build=true`, which makes Maven `docker run` the builder image with the
+# project bind-mounted. That does not work from a step container: `docker: true` hands this step
+# the HOST daemon's socket, so every `-v` path is resolved on the host and the step's own
+# /workspace does not exist there. `docker build` is fine (the CLI streams its context over the
+# API) and so is `docker cp` (same), which is the whole trick — source in, binary out, and
+# container-build switched off because we are already inside the container it would have launched.
+# qits-local-up.sh builds the daemon exactly this way and for exactly this reason; the two should
+# keep matching.
+#
+# The native build's ~4 GB therefore belongs to the HOST daemon, not to this step's container —
+# the same reading every sibling's `docker: true` build step has of its own memory.
+steps:
+  - image: qits/build-images/maven-base:latest
+    timeout-seconds: 1800
+    script: |
+      # The daemon runs this with `bash -c` and no -e, so without this a failed build is swallowed
+      # and the run reports SUCCESS.
+      set -eu
+      ./mvnw -B -ntp verify
+
+  - image: qits/build-images/ci-base:latest
+    docker: true
+    timeout-seconds: 3600
+    script: |
+      set -eu
+
+      # The builder image lives in NO registry (README.md: "built locally and lives in no
+      # registry"), so whatever needs it builds it. Its own FROM names qits-artifacts'
+      # pull-through mirror at localhost:8081 — an address the HOST daemon resolves, which is the
+      # side that runs this build. `quarkus.native.builder-image.pull=missing` in the app's
+      # application.properties is what stops the native build from trying to `docker pull` it.
+      docker build -t qits/graalvmce-musl-builder:jdk-25 -f docker/Dockerfile.musl-builder docker/
+
+      # --entrypoint: the builder image entrypoints to native-image itself. --user root: the base
+      # runs as 1001 and /qits-build arrives owned by root.
+      # The ldd assertion is inside the build container because that is where the binary is, and it
+      # is `ldd` rather than `file` on purpose: GraalVM emits a position-independent static
+      # executable, so `file` says "static-pie linked" and never the literal "statically linked".
+      cid=$(docker create --user root --entrypoint bash qits/graalvmce-musl-builder:jdk-25 -c '
+        set -eu
+        cd /qits-build
+        ./mvnw -B -ntp -pl ci-daemon -am package -Dnative -DskipTests \
+          -Dquarkus.native.container-build=false
+        ldd ci-daemon/target/qits-ci-daemon 2>&1 | grep -qE "statically linked|not a dynamic executable"
+      ')
+      docker cp "$PWD" "$cid:/qits-build"
+      docker start -a "$cid" || { docker rm -f "$cid" >/dev/null; echo "native build failed" >&2; exit 1; }
+      docker cp "$cid:/qits-build/ci-daemon/target/qits-ci-daemon" ./qits-ci-daemon
+      docker rm "$cid" >/dev/null
+
+      # The cheap check the test suite structurally cannot do (README.md): a binary run with no
+      # environment at all must name the first missing variable and exit 2, not die resolving
+      # config. An empty `defaultValue` regresses exactly this and nothing in `./mvnw verify` sees
+      # it. alpine:3 also proves the musl half — a glibc-linked binary answers "no such file or
+      # directory" here rather than exiting 2.
+      probe=$(docker create alpine:3 /qits-ci-daemon)
+      docker cp ./qits-ci-daemon "$probe:/qits-ci-daemon"
+      docker start -a "$probe" || true
+      code=$(docker inspect -f '{{.State.ExitCode}}' "$probe")
+      docker rm "$probe" >/dev/null
+      [ "$code" = 2 ] || { echo "a daemon run with no environment exited $code, expected 2" >&2; exit 1; }
+
+      echo "qits-ci-daemon built: $(sha256sum ./qits-ci-daemon | cut -d' ' -f1)"

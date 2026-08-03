@@ -1,0 +1,132 @@
+# The release pipeline: this repository reacts to its OWN release and publishes the binary under the
+# released VERSION.
+#
+# THE SELECTION NAMES THIS REPOSITORY, WHICH READS LIKE A LOOP AND IS NOT — the same shape every
+# sibling's release pipeline has. `SCMRelease` says only "source control has this version";
+# qits-workspaces publishes it the instant the release push is accepted, and nothing here publishes
+# it. The event that could loop is `SoftwareRelease`, and this file neither listens for it nor
+# emits it.
+#
+# WHAT IS NEW HERE, AND IT IS THE POINT: before this file existed, the one binary every CI run
+# downloads and execs was the only artifact on this platform no release train could announce. It
+# reached the store as a bootstrap script's blob upload — bytes with no row, no name and no
+# version, which is why every row-less byte in qits-artifacts was a ci-daemon build. The PUT below
+# writes the identity and the bytes in one transaction, so publishing without an identity is no
+# longer expressible. (daemon-artifact-identity-plan.md §2.2 and §2.4.)
+#
+# `artifacts:` IS A DECLARATION, NOT A REPORT. qits-ci never learns how to publish anything — the
+# PUT below is this repository's own step, exactly as `npm publish` and `docker push` are siblings'
+# — so it cannot see what landed. It announces `SoftwareRelease {daemon, qits-ci-daemon}` on the
+# strength of these two lines after the whole pipeline is green. Keep them true.
+#
+# THE NAME IS UNQUALIFIED for the same reason a docker declaration's is: no repository states a
+# deployment's addresses. `qits-ci-daemon` is the daemon's name in the `daemons` repository, and
+# the reader supplies its own host.
+#
+# WHAT THIS PIPELINE DELIBERATELY DOES NOT DO: move the pin. `QITS_CI_DAEMON_VERSION` still travels
+# by a human deployment act — edit qits-cd's run-args volume and the compose file, restart qits-cd,
+# redeploy qits-ci, in that order, because cd caches its run-args at boot. The pin is the one value
+# where a wrong move breaks all of CI, so publishing and pinning stay separate acts. The digest is
+# echoed at the end of the step for the human who carries it across.
+event: SCMRelease
+when:
+  - repository: { exact: qits-ci-daemon }
+artifacts:
+  - { type: daemon, name: qits-ci-daemon }
+steps:
+    # ci-base: the docker CLI for the build, git for the tag checkout, curl for the PUT and jq for
+    # the two JSON documents this step reads. Nothing needs node, and nothing needs maven on THIS
+    # side of the socket — the build runs inside the builder image.
+  - image: qits/build-images/ci-base:latest
+    docker: true
+    timeout-seconds: 3600
+    script: |
+      # The daemon runs this with `bash -c` and no -e, so without this a failed build is swallowed:
+      # the PUT sends whatever stale file is around, or none, and the run still reports SUCCESS —
+      # and a green release run is what makes qits-ci announce the artifact. -u makes an unset
+      # injected variable stop the step too.
+      set -eu
+
+      # THE EVENT, READ AS DATA. The payload reaches the container verbatim as one string in
+      # $QITS_EVENT_PAYLOAD; there is no per-field projection.
+      version=$(printf '%s' "$QITS_EVENT_PAYLOAD" | jq -er .version)
+      # SCMRelease versions are CalVer — digits and dots. Checked before anything is built, for two
+      # reasons: the version is a path segment in the PUT below, and an absent or malformed one
+      # would otherwise publish a daemon under a coordinate nobody can guess. qits-oci's release
+      # pipeline refuses the same way for the same reason.
+      case "$version" in
+        ''|*[!0-9.]*) echo "SCMRelease carries no valid CalVer" >&2; exit 1 ;;
+      esac
+      echo "releasing qits-ci-daemon $version"
+
+      # THE TAG IS THE CHECKOUT TARGET. An event-triggered run is cloned at the head of main, which
+      # is where the release commit is *now* — a later push moves that and the tag does not, so a
+      # busy main cannot make this pipeline ship a different tree than the one that was released.
+      # The clone is shallow and carries no tags, hence the explicit refspec; the URL rather than
+      # `origin` because every address a step needs arrives as environment.
+      git fetch "$QITS_CI_REPOSITORY_URL" "refs/tags/$version:refs/tags/$version"
+      git checkout --detach "$version"
+
+      # --- the binary -----------------------------------------------------------------------------
+      # ci-post-receive.yml's build, verbatim minus the smoke checks that file already gates on.
+      # Why it runs inside a container this step starts by hand rather than through
+      # `quarkus.native.container-build=true` is explained at length there; the short form is that
+      # `docker: true` gives this step the HOST daemon, so a bind mount of /workspace resolves to
+      # nothing while `docker build` and `docker cp` stream over the API and work.
+      docker build -t qits/graalvmce-musl-builder:jdk-25 -f docker/Dockerfile.musl-builder docker/
+      cid=$(docker create --user root --entrypoint bash qits/graalvmce-musl-builder:jdk-25 -c '
+        set -eu
+        cd /qits-build
+        ./mvnw -B -ntp -pl ci-daemon -am package -Dnative -DskipTests \
+          -Dquarkus.native.container-build=false
+        ldd ci-daemon/target/qits-ci-daemon 2>&1 | grep -qE "statically linked|not a dynamic executable"
+      ')
+      docker cp "$PWD" "$cid:/qits-build"
+      docker start -a "$cid" || { docker rm -f "$cid" >/dev/null; echo "native build failed" >&2; exit 1; }
+      docker cp "$cid:/qits-build/ci-daemon/target/qits-ci-daemon" ./qits-ci-daemon
+      docker rm "$cid" >/dev/null
+
+      # --- the publish ----------------------------------------------------------------------------
+      # The address is DERIVED, not spelled: no repository states a deployment's addresses, and the
+      # Maven root is the injected variable that already carries this service's in-network origin
+      # (http://qits-artifacts:8080/...). Its own reading of "reachable from where" is the one that
+      # applies here — the PUT is an ordinary HTTP call from THIS container over qits-net, needing
+      # no socket and no privilege, exactly like an npm publish. $QITS_REGISTRY is the opposite
+      # reading (a host-published mapping the docker daemon dials) and must not be used for it.
+      artifacts=$(printf '%s' "$QITS_MAVEN_REGISTRY_URL" | sed -E 's#^(https?://[^/]+).*#\1#')
+
+      # THE PUT CARRIES NO CREDENTIAL, and that is the platform's posture rather than a gap: the
+      # daemon publish surface is tokenless like `npm publish`, `mvn deploy` and `docker push`,
+      # because on qits-net producers are trusted. What keeps it honest is the 409 below — a version
+      # is immutable, so this step can add a version and can never change one — and the digest it
+      # echoes, which is what a consumer pins. Do not invent a static token here; machine auth
+      # arrives with qits-idp for every publish path at once.
+
+      # One request stages the bytes, promotes them and inserts the row. 409 means this version
+      # already exists, and it is a HARD FAILURE rather than a skip: versions are immutable here,
+      # so a 409 says the release train tried to ship a coordinate that is already spoken for, and
+      # letting it pass would announce a SoftwareRelease for bytes nobody published. That is the
+      # one place this differs from the maven and npm release steps, which skip an already-present
+      # version because re-running their publish is a no-op and re-running this one is a lie.
+      status=$(curl -sS -o /tmp/daemon-publish.json -w '%{http_code}' -X PUT \
+        -H 'Content-Type: application/octet-stream' \
+        --data-binary @./qits-ci-daemon \
+        "$artifacts/artifacts/daemons/qits-ci-daemon/$version")
+      case "$status" in
+        201) ;;
+        409)
+          echo "qits-ci-daemon $version is already published — a version is never republished" >&2
+          cat /tmp/daemon-publish.json >&2
+          exit 1 ;;
+        *)
+          echo "publish answered $status: $(cat /tmp/daemon-publish.json)" >&2
+          exit 1 ;;
+      esac
+
+      # THE DIGEST IS THE DELIVERABLE OF THIS OUTPUT. It is what QITS_CI_DAEMON_VERSION pins (the
+      # version-addressed GET is the readable second spelling; the pin stays the self-naming one),
+      # and a human copies it from here into qits-cd's run-args and the compose file. Printed
+      # alone on its own line so it can be selected without the surrounding prose.
+      digest=$(jq -er .digest /tmp/daemon-publish.json)
+      echo "published qits-ci-daemon $version, $(jq -er .sizeBytes /tmp/daemon-publish.json) bytes"
+      echo "QITS_CI_DAEMON_VERSION=${digest#sha256:}"

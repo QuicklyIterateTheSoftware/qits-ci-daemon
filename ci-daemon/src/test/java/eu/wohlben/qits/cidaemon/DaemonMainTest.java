@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import eu.wohlben.qits.cidaemon.protocol.Ack;
+import eu.wohlben.qits.cidaemon.protocol.AckReceived;
 import eu.wohlben.qits.cidaemon.protocol.Cancel;
 import eu.wohlben.qits.cidaemon.protocol.CiDaemonCodec;
 import eu.wohlben.qits.cidaemon.protocol.CiDaemonMessage;
@@ -129,6 +130,23 @@ class DaemonMainTest {
     assertEquals(ExitCode.CAPABILITY_MISMATCH, code);
     // No compat mode, and nothing half-done: the daemon does not clone for a host it cannot talk to.
     assertNull(host.first(Initialized.class));
+  }
+
+  @Test
+  void aMatchingAckIsConfirmedBeforeTheCloneStarts() throws Exception {
+    Host host = host((h, message) -> h.reply(message));
+
+    int code = runDaemon(host.url("/ci/daemon"), ready(), 30).get(30, TimeUnit.SECONDS);
+    host.awaitDrained();
+
+    assertEquals(ExitCode.OK, code);
+    List<CiDaemonMessage> received = host.received;
+    int ackReceivedAt = indexOfFirst(received, AckReceived.class);
+    int initializedAt = indexOfFirst(received, Initialized.class);
+    assertTrue(ackReceivedAt >= 0, "expected an AckReceived confirming the host's Ack");
+    assertTrue(
+        ackReceivedAt < initializedAt,
+        "AckReceived must reach the host before the clone's own Initialized: " + received);
   }
 
   @Test
@@ -296,6 +314,15 @@ class DaemonMainTest {
 
   private DaemonMain.Initializer ready() {
     return () -> Workspace.Preparation.READY;
+  }
+
+  private static int indexOfFirst(List<CiDaemonMessage> messages, Class<?> type) {
+    for (int i = 0; i < messages.size(); i++) {
+      if (type.isInstance(messages.get(i))) {
+        return i;
+      }
+    }
+    return -1;
   }
 
   private Step step(RunStep request, java.util.function.Consumer<CiDaemonMessage> emit) {

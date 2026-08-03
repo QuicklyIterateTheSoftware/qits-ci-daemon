@@ -7,6 +7,7 @@ package eu.wohlben.qits.cidaemon.protocol;
  */
 public sealed interface CiDaemonMessage
     permits Hello,
+        AckReceived,
         Initialized,
         InitFailed,
         StepChunk,

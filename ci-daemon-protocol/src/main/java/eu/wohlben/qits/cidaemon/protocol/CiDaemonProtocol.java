@@ -10,10 +10,12 @@ package eu.wohlben.qits.cidaemon.protocol;
  * caught in one place.
  *
  * <p>The contract is one step's worth of conversation, because that is a container's whole life:
- * {@link Hello}/{@link Ack}, then {@link Initialized} or {@link InitFailed}, then exactly one
- * {@link RunStep} answered by {@link StepChunk}* and a terminal {@link StepFinished}, with {@link
- * Cancel} as the only other thing the host may send and {@link Heartbeat} running underneath from
- * dial to close.
+ * {@link Hello}/{@link Ack}/{@link AckReceived}, then {@link Initialized} or {@link InitFailed},
+ * then exactly one {@link RunStep} answered by {@link StepChunk}* and a terminal {@link
+ * StepFinished}, with {@link Cancel} as the only other thing the host may send and {@link
+ * Heartbeat} running underneath from dial to close. {@link AckReceived} is the one frame in that
+ * list no real run ever waits for — see its own javadoc for who does and why it costs no capability
+ * bump.
  *
  * <p><b>Identity is not on the wire.</b> The daemon presents {@code X-Qits-Ci-Daemon-Id} and {@code
  * X-Qits-Ci-Daemon-Secret} as handshake headers and the host validates them before the first frame
@@ -43,6 +45,7 @@ public final class CiDaemonProtocol {
   public static final class Type {
     // ci-daemon -> qits-ci
     public static final String HELLO = "hello";
+    public static final String ACK_RECEIVED = "ackReceived";
     public static final String INITIALIZED = "initialized";
     public static final String INIT_FAILED = "initFailed";
     public static final String STEP_CHUNK = "stepChunk";

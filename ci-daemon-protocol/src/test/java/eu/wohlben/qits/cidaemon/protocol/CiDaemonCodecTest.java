@@ -31,6 +31,14 @@ class CiDaemonCodecTest {
   }
 
   @Test
+  void ackReceivedRoundTrips() {
+    assertEquals(new AckReceived(), roundTrip(new AckReceived()));
+    assertEquals(
+        CiDaemonProtocol.Type.ACK_RECEIVED,
+        CiDaemonCodec.encode(new AckReceived()).get(CiDaemonProtocol.Field.TYPE));
+  }
+
+  @Test
   void initializedRoundTrips() {
     assertEquals(new Initialized(), roundTrip(new Initialized()));
     assertEquals(

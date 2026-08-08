@@ -10,7 +10,7 @@
 # WHAT IS NEW HERE, AND IT IS THE POINT: before this file existed, the one binary every CI run
 # downloads and execs was the only artifact on this platform no release train could announce. It
 # reached the store as a bootstrap script's blob upload — bytes with no row, no name and no
-# version, which is why every row-less byte in qits-artifacts was a ci-daemon build. The PUT below
+# version, which is why every row-less byte in qits-platform-artifacts was a ci-daemon build. The PUT below
 # writes the identity and the bytes in one transaction, so publishing without an identity is no
 # longer expressible. (daemon-artifact-identity-plan.md §2.2 and §2.4.)
 #
@@ -91,7 +91,7 @@ steps:
       # --- the publish ----------------------------------------------------------------------------
       # The address is DERIVED, not spelled: no repository states a deployment's addresses, and the
       # Maven root is the injected variable that already carries this service's in-network origin
-      # (http://qits-artifacts:8080/...). Its own reading of "reachable from where" is the one that
+      # (http://qits-platform-artifacts:8080/...). Its own reading of "reachable from where" is the one that
       # applies here — the PUT is an ordinary HTTP call from THIS container over qits-net, needing
       # no socket and no privilege, exactly like an npm publish. $QITS_REGISTRY is the opposite
       # reading (a host-published mapping the docker daemon dials) and must not be used for it.
@@ -101,7 +101,7 @@ steps:
       # daemon publish surface is tokenless like `npm publish`, `mvn deploy` and `docker push`,
       # because on qits-net producers are trusted. What keeps it honest is the 409 below — a version
       # is immutable, so this step can add a version and can never change one. Do not invent a static
-      # token here; machine auth arrives with qits-idp for every publish path at once.
+      # token here; machine auth arrives with qits-platform-idp for every publish path at once.
 
       # One request stages the bytes, promotes them and inserts the row. 409 means this version
       # already exists, and it is a HARD FAILURE rather than a skip: versions are immutable here,

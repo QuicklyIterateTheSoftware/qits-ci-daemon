@@ -38,8 +38,8 @@ steps:
       set -eu
 
       # The builder image lives in NO registry (README.md: "built locally and lives in no
-      # registry"), so whatever needs it builds it. Its own FROM names qits-platform-artifacts'
-      # pull-through mirror at localhost:8081 — an address the HOST daemon resolves, which is the
+      # registry"), so whatever needs it builds it. Its own FROM names qits-platform-mirror's
+      # pull-through mirror at localhost:8082 — an address the HOST daemon resolves, which is the
       # side that runs this build. `quarkus.native.builder-image.pull=missing` in the app's
       # application.properties is what stops the native build from trying to `docker pull` it.
       docker build -t qits/graalvmce-musl-builder:jdk-25 -f docker/Dockerfile.musl-builder docker/

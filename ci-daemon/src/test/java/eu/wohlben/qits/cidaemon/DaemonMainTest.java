@@ -77,6 +77,8 @@ class DaemonMainTest {
     assertEquals("/ci/daemon", host.requestPath);
     assertEquals("daemon-1", host.headers.get(ControlSocket.HEADER_ID));
     assertEquals("s3cret", host.headers.get(ControlSocket.HEADER_SECRET));
+    assertEquals("qits-ci-daemon", host.headers.get("X-Qits-User"));
+    assertEquals("qits:system", host.headers.get("X-Qits-Roles"));
   }
 
   @Test

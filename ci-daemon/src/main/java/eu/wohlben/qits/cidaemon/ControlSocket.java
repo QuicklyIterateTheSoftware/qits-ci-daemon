@@ -121,7 +121,11 @@ public final class ControlSocket {
       end(() -> listener.onDialFailed("malformed QITS_CI_DAEMON_URL '" + url + "'"));
       return;
     }
-    options.addHeader(HEADER_ID, daemonId).addHeader(HEADER_SECRET, daemonSecret);
+    options
+        .addHeader("X-Qits-User", "qits-ci-daemon")
+        .addHeader("X-Qits-Roles", "qits:system")
+        .addHeader(HEADER_ID, daemonId)
+        .addHeader(HEADER_SECRET, daemonSecret);
     client
         .connect(options)
         .onSuccess(this::onConnected)

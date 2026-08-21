@@ -328,7 +328,7 @@ class DaemonMainTest {
   }
 
   private Step step(RunStep request, java.util.function.Consumer<CiDaemonMessage> emit) {
-    return new StepProcess(workDir, request, emit, 8192, 100, 2000);
+    return new StepProcess(workDir, request, emit, 8192, 100, 2000, "bash");
   }
 
   private CompletableFuture<Integer> runDaemon(

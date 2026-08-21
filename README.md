@@ -93,13 +93,24 @@ feature — so the entrypoint is overridden with a fixed, host-authored bootstra
 `$QITS_CI_DAEMON_BINARY_URL`, `chmod +x`, and `exec`s it. Nothing is mounted and nothing is injected
 into the image; the container fetches over the same network path it already uses for its clone.
 
-What that asks of a step's image: **`git`, `bash`, and a downloader** (`wget` or `curl` — the
-bootstrap probes for either). What it asks of this repo: the binary must be a **fully static musl
-build**, because a glibc-linked one dies on every alpine-family image, and it must take no arguments
-— the environment above is its whole input.
+What that asks of a step's image: **`git` and a downloader** (`wget` or `curl` — the bootstrap probes
+for either). What it asks of this repo: the binary must be a **fully static musl build**, because a
+glibc-linked one dies on every alpine-family image, and it must take no arguments — the environment
+above is its whole input.
 
-`git` and `bash` are probed with `--version` before the clone, so an image that does not satisfy the
-contract reports `InitFailed{TOOLING_MISSING}` rather than failing halfway through a step.
+`git` is probed with `--version` before the clone, so an image that does not satisfy the contract
+reports `InitFailed{TOOLING_MISSING}` rather than failing halfway through a step.
+
+**`bash` is preferred but not required.** It is probed at the same moment — before the clone rather
+than at step time, so a broken image is still reported as a broken image — and an image that has it
+runs the step's script under it exactly as before. An image without it runs the script under `sh`.
+
+That distinction is not a nicety, and it was bought. Demanding bash refused an entire class of image
+for no capability: `docker:28-dind` carries docker, git and wget but no bash, and it is the only
+upstream image that can build the platform's own `qits/build-images/*` step images. So those images
+were buildable only from an image that was itself one of them — and on 2026-08-20 a `docker system
+prune` on a full disk deleted all five, leaving no run anywhere on the platform able to rebuild them.
+Requiring a shell every container already has, rather than a specific one, is what closes that.
 
 ## Building the binary
 

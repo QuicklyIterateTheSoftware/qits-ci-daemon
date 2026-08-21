@@ -92,8 +92,10 @@ The checkout is untrusted and the step's script *is* the untrusted thing — it 
 over the socket, and this daemon runs it on purpose. That is the design, not a hole. What follows
 from it:
 
-- The script is passed to `bash -c` as **one argv element**, never assembled into a shell line with
-  anything else interpolated around it.
+- The script is passed to `<shell> -c` as **one argv element**, never assembled into a shell line
+  with anything else interpolated around it. The shell is `bash` when the image has it and `sh`
+  otherwise — `Workspace.probeTooling` decides once, at initialization, and `StepProcess` is told
+  rather than probing again.
 - Nothing the script writes is read back as instructions. Output is bytes to be chunked and
   forwarded, bounded at the source; a marker string in stdout must never mean anything to this
   daemon or to the host. (qits-ci's old runner inferred setup failure from a sentinel in the output

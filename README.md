@@ -54,7 +54,8 @@ its own; it is handed everything before the socket exists:
 | `QITS_CI_DAEMON_URL` | The control socket, dialled **verbatim**. |
 | `QITS_CI_DAEMON_ID` | The host-minted registration identity. |
 | `QITS_CI_DAEMON_SECRET` | The per-container secret, minted at launch and dead when the container is reaped. |
-| `QITS_CI_REPOSITORY_URL`, `QITS_CI_BRANCH`, `QITS_CI_SHA`, `QITS_CI_REPO_ID` | What to clone and what to check out. |
+| `QITS_CI_REPOSITORY_URL`, `QITS_CI_BRANCH`, `QITS_CI_SHA` | What to clone and what to check out. |
+| `QITS_CI_REPO_ID`, `QITS_CI_PROJECT_ID`, `QITS_CI_REPO_NAME` | Which repository, in both coordinate systems: the storage id, and the public `(projectId, repoName)` pair a step's release call spells. The pair is empty — never absent — on an id-addressed run. Read by the step's script, not by the daemon. |
 | `CI`, `QITS_CI` | Both `true`, set for the step script's benefit rather than the daemon's. |
 
 Then, over one WebSocket dialled outbound with `X-Qits-Ci-Daemon-Id` and `X-Qits-Ci-Daemon-Secret` as

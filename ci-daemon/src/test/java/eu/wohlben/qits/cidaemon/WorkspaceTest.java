@@ -121,7 +121,10 @@ class WorkspaceTest {
   }
 
   @Test
-  void anImageWithoutBashIsReportedAsToolingMissingBeforeAnythingIsCloned() {
+  void anImageWithoutBashClonesAnywayAndRunsTheStepUnderSh() {
+    // The change that let the platform build its own step images: docker:28-dind carries docker,
+    // git and wget but no bash, so demanding bash refused the one upstream image that could build
+    // qits-oci — leaving those images buildable only by a machine that already had them.
     List<String> ran = new ArrayList<>();
     CommandRunner noBash =
         (dir, argv) -> {
@@ -131,16 +134,44 @@ class WorkspaceTest {
               : new CommandRunner.Result(0, "");
         };
 
-    Workspace.Preparation preparation =
-        new Workspace(tmp.resolve("workspace"), "file:///origin", "main", "abcdef1", noBash)
-            .prepare();
+    Workspace workspace =
+        new Workspace(tmp.resolve("workspace"), "file:///origin", "main", "abcdef1", noBash);
+    Workspace.Preparation preparation = workspace.prepare();
 
-    assertEquals(InitFailed.Reason.TOOLING_MISSING, preparation.failure());
-    // Probed up front: discovering it when the step starts would report a broken image as a failed
-    // step, which is a different thing entirely to whoever reads the run.
-    assertFalse(
+    assertTrue(preparation.ready(), () -> String.valueOf(preparation.detail()));
+    assertEquals("sh", workspace.shell());
+    assertTrue(
         ran.stream().anyMatch(command -> command.startsWith("git clone")),
-        () -> "nothing should have been cloned, but ran: " + ran);
+        () -> "the clone should have happened, but ran: " + ran);
+  }
+
+  @Test
+  void anImageWithBashStillRunsTheStepUnderBash() {
+    // The compatibility half, and the reason no existing pipeline's bashisms are at risk: every
+    // image that has bash behaves exactly as it did before.
+    CommandRunner everything = (dir, argv) -> new CommandRunner.Result(0, "");
+
+    Workspace workspace =
+        new Workspace(tmp.resolve("workspace"), "file:///origin", "main", "abcdef1", everything);
+
+    assertTrue(workspace.prepare().ready());
+    assertEquals("bash", workspace.shell());
+  }
+
+  @Test
+  void theShellIsShUntilTheImageHasBeenProbed() {
+    // Read before prepare(), the answer names the shell every image has rather than one that may
+    // be absent. The daemon's own order makes this unreachable; the default is what makes that
+    // cheap to guarantee.
+    assertEquals(
+        "sh",
+        new Workspace(
+                tmp.resolve("workspace"),
+                "file:///origin",
+                "main",
+                "abcdef1",
+                (dir, argv) -> new CommandRunner.Result(0, ""))
+            .shell());
   }
 
   @Test

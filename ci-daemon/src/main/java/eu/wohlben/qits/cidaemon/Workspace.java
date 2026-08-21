@@ -15,11 +15,11 @@ import java.util.regex.Pattern;
  * behaviour rather than just a log line:
  *
  * <ul>
- *   <li>no usable {@code git} or {@code bash} ⇒ {@link InitFailed.Reason#TOOLING_MISSING} — the
- *       image does not satisfy the contract, which is a pipeline-config mistake and not an
- *       infrastructure failure. {@code bash} is probed here, before the clone, even though nothing
- *       needs it until the step runs: discovering it at step time would report a broken image as a
- *       failed step.
+ *   <li>no usable {@code git} ⇒ {@link InitFailed.Reason#TOOLING_MISSING} — the image does not
+ *       satisfy the contract, which is a pipeline-config mistake and not an infrastructure failure.
+ *       {@code bash} is probed here too, before the clone rather than at step time so that a broken
+ *       image is reported as a broken image — but it is <b>not</b> required: an image without it
+ *       runs the step under {@code sh}. See {@link #probeTooling()} for what demanding it cost.
  *   <li>the clone did not produce a checkout ⇒ {@link InitFailed.Reason#CLONE_FAILED}.
  *   <li><b>the clone succeeded but the sha is not there ⇒ {@link InitFailed.Reason#SHA_GONE}</b>,
  *       which is the force-push backstop. The host verified the sha was an ancestor of the branch
@@ -61,6 +61,20 @@ public final class Workspace {
   private final String branch;
   private final String sha;
   private final CommandRunner runner;
+
+  /**
+   * The shell the step's script will be run under, decided by {@link #probeTooling()}.
+   *
+   * <p>{@code sh} until proven otherwise, so a {@link #shell()} read before {@link #prepare()} names
+   * the shell every image has rather than one that may be absent. In the daemon's real order that
+   * cannot happen — initialization completes before a {@code RunStep} is accepted — and defaulting
+   * to the safe answer is cheaper than a state machine that says so.
+   *
+   * <p>Volatile because it is written on the worker that initializes and read on the worker that
+   * runs the step; the daemon's own ordering makes them the same thread today, and this does not
+   * depend on that staying true.
+   */
+  private volatile String shell = "sh";
 
   public Workspace(
       Path dir, String repositoryUrl, String branch, String sha, CommandRunner runner) {
@@ -128,22 +142,31 @@ public final class Workspace {
   }
 
   /**
-   * Both binaries the image contract promises, probed with {@code --version} so a missing one is a
-   * failed spawn rather than a mystery halfway through the clone. Returns {@code null} when the
-   * image is fine.
+   * What the image promises, probed with {@code --version} so a missing tool is a failed spawn
+   * rather than a mystery halfway through the clone. Returns {@code null} when the image is fine.
+   *
+   * <p><b>{@code git} is required and {@code bash} is not.</b> The clone needs git and there is no
+   * substitute for it here; a shell is different, because every image that can run a container at
+   * all has {@code /bin/sh}. Demanding bash cost the platform an entire class of image for no
+   * capability: {@code docker:28-dind} carries docker, git and wget but no bash, so the one upstream
+   * image that could have built the platform's own step images was refused
+   * {@code TOOLING_MISSING} — and those step images were consequently buildable only by a machine
+   * that already had them, which on 2026-08-20 meant a pruned host could not rebuild its own CI.
+   *
+   * <p>{@code bash} is still PREFERRED, and that is what keeps this change invisible to every
+   * existing pipeline: an image that has it runs its script under it exactly as before, so no
+   * script's bashisms are at risk. Only an image without it falls back, and such a script could
+   * never have run there anyway.
    */
   private Preparation probeTooling() {
-    for (String tool : new String[] {"git", "bash"}) {
-      CommandRunner.Result probe = runner.run(null, tool, "--version");
-      if (!probe.ok()) {
-        return new Preparation(
-            InitFailed.Reason.TOOLING_MISSING,
-            "the step image has no usable `"
-                + tool
-                + "` (a ci step image must provide git and bash): "
-                + tail(probe.output()));
-      }
+    CommandRunner.Result git = runner.run(null, "git", "--version");
+    if (!git.ok()) {
+      return new Preparation(
+          InitFailed.Reason.TOOLING_MISSING,
+          "the step image has no usable `git` (a ci step image must provide git): "
+              + tail(git.output()));
     }
+    shell = runner.run(null, "bash", "--version").ok() ? "bash" : "sh";
     return null;
   }
 
@@ -160,5 +183,13 @@ public final class Workspace {
   /** Where the checkout lives, for the step process that runs in it. */
   public File directory() {
     return dir.toFile();
+  }
+
+  /**
+   * Which shell the step's script runs under — {@code bash} when the image has it, {@code sh}
+   * otherwise. Read after {@link #prepare()}; see {@link #shell} for what it answers before that.
+   */
+  public String shell() {
+    return shell;
   }
 }

@@ -37,8 +37,30 @@ class StepProcessTest {
 
   private final List<CiDaemonMessage> emitted = Collections.synchronizedList(new ArrayList<>());
 
+  /**
+   * Which shell {@link #run} builds the step with. Defaults to what every existing image provides,
+   * so every case here keeps asserting the behaviour a bash image has always had; the fallback case
+   * sets it to {@code sh}.
+   */
+  private String shell = "bash";
+
   @Test
   void aStepsStdoutAndStderrArriveAsSeparateStreamsAndItsExitCodeIsReported() {
+    StepFinished finished = run("echo to-stdout; echo to-stderr >&2; exit 3", 30);
+
+    assertEquals(3, finished.exitCode());
+    assertFalse(finished.timedOut());
+    assertEquals("to-stdout\n", textOf(Stream.OUT));
+    assertEquals("to-stderr\n", textOf(Stream.ERR));
+  }
+
+  @Test
+  void aScriptRunsUnderShWhenTheImageHasNoBash() {
+    // What docker:28-dind gets: no bash in the image, so Workspace resolves the shell to sh and the
+    // step runs anyway. A POSIX script behaves identically under either, which is what makes the
+    // fallback safe rather than a second dialect nobody tested.
+    shell = "sh";
+
     StepFinished finished = run("echo to-stdout; echo to-stderr >&2; exit 3", 30);
 
     assertEquals(3, finished.exitCode());
@@ -138,7 +160,8 @@ class StepProcessTest {
             emitted::add,
             8192,
             100,
-            5000);
+            5000,
+            "bash");
     CompletableFuture<StepFinished> finished =
         CompletableFuture.supplyAsync(process::run);
 
@@ -178,7 +201,8 @@ class StepProcessTest {
             emitted::add,
             8192,
             100,
-            5000);
+            5000,
+            "bash");
 
     StepFinished finished = process.run();
 
@@ -191,7 +215,13 @@ class StepProcessTest {
 
   private StepFinished run(String script, int timeoutSeconds) {
     return new StepProcess(
-            workDir, new RunStep("c1", script, timeoutSeconds), emitted::add, 8192, 100, 5000)
+            workDir,
+            new RunStep("c1", script, timeoutSeconds),
+            emitted::add,
+            8192,
+            100,
+            5000,
+            shell)
         .run();
   }
 

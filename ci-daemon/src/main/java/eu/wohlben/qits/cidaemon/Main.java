@@ -119,7 +119,10 @@ public class Main {
                       emit,
                       stepChunkMaxChars,
                       stepChunkFlushMillis,
-                      stepKillGraceMillis))
+                      stepKillGraceMillis,
+                      // Read here rather than captured above: initialization decides it, and it has
+                      // always completed by the time a RunStep is accepted.
+                      workspace.shell()))
           .run();
     }
   }

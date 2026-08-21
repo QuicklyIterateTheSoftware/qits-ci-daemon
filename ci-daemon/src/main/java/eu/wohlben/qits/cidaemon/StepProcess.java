@@ -18,7 +18,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 /**
- * The step's script, running as this daemon's child. {@code bash -c <script>} with the checkout as
+ * The step's script, running as this daemon's child. {@code <shell> -c <script>} with the checkout as
  * its working directory — and <b>the script is one argv element</b>, never spliced into a command
  * string with anything around it. Inside this container that is the designed execution of hostile
  * code: it arrives from a repository, over the socket, and the daemon runs it on purpose. What
@@ -54,6 +54,13 @@ public final class StepProcess implements Step {
   private final long flushIntervalMillis;
   private final long killGraceMillis;
 
+  /**
+   * The shell to run the script under, decided by {@link Workspace#probeTooling()} and passed in
+   * rather than probed again here — the image contract is initialization's subject, and a second
+   * probe could disagree with the one the run was admitted on.
+   */
+  private final String shell;
+
   /** Guards both pump buffers and the seq allocation; see the class javadoc on ordering. */
   private final Object lock = new Object();
 
@@ -68,7 +75,9 @@ public final class StepProcess implements Step {
       Consumer<CiDaemonMessage> emit,
       int maxChunkChars,
       long flushIntervalMillis,
-      long killGraceMillis) {
+      long killGraceMillis,
+      String shell) {
+    this.shell = shell == null || shell.isBlank() ? "sh" : shell;
     this.workDir = workDir;
     this.request = request;
     this.emit = emit;
@@ -81,9 +90,10 @@ public final class StepProcess implements Step {
   public StepFinished run() {
     ProcessBuilder builder =
         // Three argv elements, always: the script is the third and is never concatenated with
-        // anything. bash is probed during initialization (see Workspace), so reaching here without
-        // it means the image changed under us.
-        new ProcessBuilder("bash", "-c", request.script() == null ? "" : request.script());
+        // anything. The shell was chosen during initialization (see Workspace.probeTooling) — bash
+        // when the image has it, sh otherwise — so reaching here with neither means the image
+        // changed under us.
+        new ProcessBuilder(shell, "-c", request.script() == null ? "" : request.script());
     builder.directory(workDir.toFile());
     Process started;
     try {
@@ -92,7 +102,7 @@ public final class StepProcess implements Step {
       // A failed spawn still has to produce a terminal frame, or the host's await runs to timeout
       // and records a stalled container instead of a step that could not start. 127 is the shell's
       // own "command not found", which is what this is.
-      emitChunk(Stream.ERR, "ci-daemon could not start bash: " + e.getMessage() + "\n");
+      emitChunk(Stream.ERR, "ci-daemon could not start " + shell + ": " + e.getMessage() + "\n");
       return new StepFinished(request.correlationId(), 127, false);
     }
     process = started;

@@ -8,7 +8,7 @@ commit, executes that one step's script as its own child process, streams the ou
 socket it dialled, reports the exit, and exits. Then the container is reaped and the next step gets a
 fresh one. Everything on the host's side of the boundary — launching containers, parsing the
 pipeline config, persisting runs and steps — belongs to
-[qits-ci](https://github.com/QuicklyIterateTheSoftware/qits-ci).
+[qits-ci-service](https://github.com/QuicklyIterateTheSoftware/qits-ci-service).
 
     ./mvnw verify     # a clone of this repo alone builds and tests green — no monorepo, no docker
 
@@ -16,7 +16,7 @@ pipeline config, persisting runs and steps — belongs to
 
 | Module | What |
 |---|---|
-| `ci-daemon-protocol/` | The control-socket wire contract: message records + a codec over a plain `Map`. Depends on nothing. qits-ci vendors a byte-identical copy. |
+| `ci-daemon-protocol/` | The control-socket wire contract: message records + a codec over a plain `Map`. Depends on nothing. qits-ci-service vendors a byte-identical copy. |
 | `ci-daemon/` | The binary. A Quarkus command-mode app — no web stack, it dials out and never listens — compiled to a fully static musl native image. |
 
 Inside `ci-daemon/`, `Main` is the only CDI bean: it resolves configuration and news up plain
@@ -28,7 +28,7 @@ flow against a real socket without a container.
 `ci-daemon-protocol` is **framework-free**: no Quarkus, no CDI, no JAX-RS, no Jackson — a plain jar
 of records with plain constructors. That is not stylistic. The shipping form of this daemon is a
 fully static musl native image, so every dependency is a decision about image size and about what the
-GraalVM builder has to be told; and the module is copied into qits-ci, where a framework dependency
+GraalVM builder has to be told; and the module is copied into qits-ci-service, where a framework dependency
 would arrive as a second opinion about how a ci service is wired.
 
 ## The boundary

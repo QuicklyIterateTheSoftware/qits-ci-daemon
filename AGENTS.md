@@ -64,17 +64,18 @@ Test names are sentences describing the behaviour, not the method
 3. Encode and decode arms in `CiDaemonCodec`.
 4. A round-trip case in `CiDaemonCodecTest`.
 5. Bump `CiDaemonProtocol.CAPABILITY_VERSION`.
-6. **Mirror the whole module into qits-ci**, byte-identical, and handle the new case in its
+6. **Mirror the whole module into qits-ci-service**, byte-identical, and handle the new case in its
    `CiDaemonRegistry`. `CiDaemonCodecTest` living in both copies is the drift detector; `diff -r` the
    two `src/` trees before you push.
 
-**This repo is the protocol's only author.** qits-ci *copies* — it never edits its vendored copy, not
-even for a one-line fix, not even to unbreak its own build. A correction discovered while working in
-qits-ci comes back here as a commit and goes over as a re-vendor; that round trip is slower than the
-edit and it is the whole point. The workspace pair drifted exactly once, by exactly that shortcut,
-and the two sides then disagreed about a field for as long as nobody diffed them.
+**This repo is the protocol's only author.** qits-ci-service *copies* — it never edits its vendored
+copy, not even for a one-line fix, not even to unbreak its own build. A correction discovered while
+working in qits-ci-service comes back here as a commit and goes over as a re-vendor; that round trip
+is slower than the edit and it is the whole point. The workspace pair drifted exactly once, by
+exactly that shortcut, and the two sides then disagreed about a field for as long as nobody diffed
+them.
 
-    diff -r ci-daemon-protocol/src <qits-ci>/services/qits-ci/ci-daemon-protocol/src
+    diff -r ci-daemon-protocol/src <qits-qits>/components/qits-ci/qits-ci-service/ci-daemon-protocol/src
 
 Prefer extending an existing message to minting a new one, and prefer an enum constant to a free-text
 field: `InitFailed.reason` is the shape to copy — three values the host branches on, with the human

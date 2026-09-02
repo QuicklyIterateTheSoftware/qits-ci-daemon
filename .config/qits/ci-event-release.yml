@@ -80,12 +80,27 @@ steps:
         set -eu
         cd /qits-build
         ./mvnw -B -ntp -pl ci-daemon -am package -Dnative -DskipTests \
-          -Dquarkus.native.container-build=false
+          -Dquarkus.native.container-build=false \
+          org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeBom \
+          -DoutputFormat=json -DoutputName=sbom -DschemaVersion=1.6 \
+          -Dcyclonedx.skipNotDeployed=false
         ldd ci-daemon/target/qits-ci-daemon 2>&1 | grep -qE "statically linked|not a dynamic executable"
       ')
       docker cp "$PWD" "$cid:/qits-build"
       docker start -a "$cid" || { docker rm -f "$cid" >/dev/null; echo "native build failed" >&2; exit 1; }
       docker cp "$cid:/qits-build/ci-daemon/target/qits-ci-daemon" ./qits-ci-daemon
+      # THE DOCUMENT COMES OUT OF THE SAME CONTAINER AS THE BINARY, and it has to: the reactor and
+      # its resolved dependency tree exist only in there — this step's own container carries no
+      # maven at all. `makeBom` rides on the mvnw invocation above rather than a second one, so the
+      # document describes the very resolve that produced the bytes beside it.
+      #
+      # cyclonedx.skipNotDeployed=false is LOAD-BEARING, measured in qits-artifacts-service on its
+      # first release: `ci-daemon` is <packaging>quarkus</packaging> and ships as this binary rather
+      # than as a jar, so it skips maven-deploy — and the plugin SKIPS deploy-skipping modules by
+      # default, with a green build and one INFO line. The `docker cp` below then fails on a file
+      # nothing wrote. The spelling matters too: a bare -DskipNotDeployed=false is silently ignored,
+      # and only the cyclonedx.-prefixed property reaches the plugin.
+      docker cp "$cid:/qits-build/ci-daemon/target/sbom.json" ./sbom.json
       docker rm "$cid" >/dev/null
 
       # --- the publish ----------------------------------------------------------------------------
@@ -129,3 +144,22 @@ steps:
       # rather than by digest (ci-daemon-autoadopt-plan.md §2.2).
       digest=$(jq -er .digest /tmp/daemon-publish.json)
       echo "published qits-ci-daemon $version, $(jq -er .sizeBytes /tmp/daemon-publish.json) bytes, digest $digest"
+
+      # --- the SBOM -------------------------------------------------------------------------------
+      # AFTER THE PUBLISH AND BEFORE THIS STEP EXITS GREEN, which is the ordering rule rather than a
+      # preference: qits-ci announces `SoftwareRelease` only for a green run, so a document stored
+      # here can never be missing for a version somebody was told about. A failed PUT fails the
+      # release ON PURPOSE — the store being down is not a reason to announce a version nobody can
+      # audit. And it goes SECOND on purpose too: the 409 above is what makes a version immutable,
+      # so a re-run that would have overwritten a document stops before it reaches this line.
+      #
+      # THE PATH NAMES THE DECLARED ARTIFACT IDENTITY VERBATIM. `artifacts:` above says
+      # `{type: daemon, name: qits-ci-daemon}`, and (packageType, packageName, version) is how the
+      # SoftwareRelease consumer will ask for it — the same coordinate under a `sboms` sibling of
+      # the `daemons` path the bytes went to, and derived from the same $artifacts origin for the
+      # same reason: no repository states a deployment's addresses, and $QITS_REGISTRY is the
+      # opposite reading of "reachable from where".
+      sbom_base="$artifacts/artifacts/sboms"
+      curl -fsS -X PUT -H 'Content-Type: application/vnd.cyclonedx+json' \
+        --data-binary @./sbom.json \
+        "$sbom_base/daemon/qits-ci-daemon/-/$version"

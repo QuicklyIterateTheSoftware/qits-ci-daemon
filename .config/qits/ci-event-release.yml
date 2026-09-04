@@ -70,10 +70,10 @@ steps:
       git checkout --detach "$version"
 
       # --- the binary -----------------------------------------------------------------------------
-      # ci-post-receive.yml's build, verbatim minus the smoke checks that file already gates on.
-      # Why it runs inside a container this step starts by hand rather than through
-      # `quarkus.native.container-build=true` is explained at length there; the short form is that
-      # `docker: true` gives this step the HOST daemon, so a bind mount of /workspace resolves to
+      # The QA pipeline's build, verbatim minus the smoke checks ci-event-release-request.yml
+      # already gates the fold on. Why it runs inside a container this step starts by hand rather
+      # than through `quarkus.native.container-build=true` is explained at length there; the short
+      # form is that `docker: true` gives this step the HOST daemon, so a bind mount of /workspace resolves to
       # nothing while `docker build` and `docker cp` stream over the API and work.
       docker build -t qits/graalvmce-musl-builder:jdk-25 -f docker/Dockerfile.musl-builder docker/
       # --network host and QITS_MAVEN_CENTRAL_URL route the builder's Maven Central resolve through

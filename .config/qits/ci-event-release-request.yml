@@ -1,4 +1,28 @@
-# The pipeline qits-ci runs on every push to a tracked branch of this repository.
+# THE ONE QA PIPELINE THIS REPOSITORY HAS, and it runs for a release request and nothing else.
+#
+# There is no push pipeline any more, and `ci-post-receive.yml` is what this file replaces.
+# qits-projects keeps a backing branch `release/<id>` per open release request — an octopus merge of
+# that request's sources, refolded whenever the set changes — and publishes `ReleaseRequestChanged`
+# on every successful re-fold. The merge primitive that writes that branch fires no `post-receive`
+# and so publishes no `SCMPublishCommit`: without this file the fold exists and NOTHING BUILDS IT.
+# A fold the git host answered `unchanged`, and one that conflicted, publish nothing — so every
+# arrival here is a new sha worth a build.
+#
+# DECIDED AT MAIN, BUILT AT THE FOLD. This file is discovered, parsed and selected at `main`'s head,
+# always; only the run's branch and sha come from the payload, which is why `checkout:` names them
+# as a pair — a sha with no branch whose history holds it is not something a step container can
+# fetch. A release request therefore cannot alter the CI that gates it by folding in a commit that
+# edits this file. Inside a step, $QITS_CI_BRANCH is `release/<id>` and $QITS_CI_SHA is the merged
+# sha; the fold is already checked out, so nothing below fetches or switches refs.
+#
+# EVERY STEP HERE IS GATING, and there is no trailing `gating: false` half because this repository
+# publishes nothing from a fold. The verdict returns on the ordinary `BuildSuccessful`/`BuildFailed`
+# with `commitSha` = the merged sha, which is what qits-projects' `BuildStatusListener` matches on
+# together with `repoId`.
+#
+# ci-event-release.yml BESIDE THIS FILE IS UNTOUCHED and is still the other half: it reacts to this
+# repository's release TAG and publishes the released coordinate. This file names a build by the
+# merged sha; that one names a release by its version. Neither pushes the other's coordinate.
 #
 # Two steps, and the split is the repo's own two rules (CLAUDE.md):
 #
@@ -22,6 +46,19 @@
 #
 # The native build's ~4 GB therefore belongs to the HOST daemon, not to this step's container —
 # the same reading every sibling's `docker: true` build step has of its own memory.
+
+event: ReleaseRequestChanged
+
+when:
+  # repoName, not repoId: the git host's storage coordinate is an opaque UUID since
+  # the identity cutover, so a name match on repoId is not dependable. The event
+  # echoes the public name; a rename updates this line in the same campaign.
+  - repoName: { exact: qits-ci-daemon }
+
+checkout:
+  branch: backingBranch
+  sha: mergedSha
+
 steps:
   - image: qits/build-images/maven-base:latest
     timeout-seconds: 1800

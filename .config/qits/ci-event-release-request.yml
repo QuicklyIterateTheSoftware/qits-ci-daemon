@@ -66,7 +66,11 @@ steps:
       # The daemon runs this with `bash -c` and no -e, so without this a failed build is swallowed
       # and the run reports SUCCESS.
       set -eu
-      ./mvnw -B -ntp verify
+      # Maven Central through the platform mirror's in-network alias — empty (an older qits-ci that
+      # injects nothing, or a deployment that turned the mirror plane off) deactivates the settings
+      # profile and Central is resolved directly.
+      export QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}"
+      ./mvnw -B -ntp -s .qits-maven-settings.xml verify
 
   - image: qits/build-images/ci-base:latest
     docker: true
@@ -83,13 +87,21 @@ steps:
 
       # --entrypoint: the builder image entrypoints to native-image itself. --user root: the base
       # runs as 1001 and /qits-build arrives owned by root.
+      # --network host and QITS_MAVEN_CENTRAL_URL route the builder's Maven Central resolve through
+      # the mirror, exactly like the fleet's docker-build RUNs: the injected URL is an edge vhost on
+      # 127.0.0.1:8080, which only the host namespace reaches. Empty deactivates the settings
+      # profile and the resolve goes to Central directly, as it always did. No credential rides
+      # along — edge reads are anonymous, and a transient container's env is `docker inspect`able;
+      # if the vhost read policy ever tightens, this build fails loudly and earns a secret then.
       # The ldd assertion is inside the build container because that is where the binary is, and it
       # is `ldd` rather than `file` on purpose: GraalVM emits a position-independent static
       # executable, so `file` says "static-pie linked" and never the literal "statically linked".
-      cid=$(docker create --user root --entrypoint bash qits/graalvmce-musl-builder:jdk-25 -c '
+      cid=$(docker create --user root --network host --entrypoint bash \
+        -e QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_CENTRAL_MIRROR_URL:-}" \
+        qits/graalvmce-musl-builder:jdk-25 -c '
         set -eu
         cd /qits-build
-        ./mvnw -B -ntp -pl ci-daemon -am package -Dnative -DskipTests \
+        ./mvnw -B -ntp -s .qits-maven-settings.xml -pl ci-daemon -am package -Dnative -DskipTests \
           -Dquarkus.native.container-build=false
         ldd ci-daemon/target/qits-ci-daemon 2>&1 | grep -qE "statically linked|not a dynamic executable"
       ')

@@ -76,10 +76,17 @@ steps:
       # `docker: true` gives this step the HOST daemon, so a bind mount of /workspace resolves to
       # nothing while `docker build` and `docker cp` stream over the API and work.
       docker build -t qits/graalvmce-musl-builder:jdk-25 -f docker/Dockerfile.musl-builder docker/
-      cid=$(docker create --user root --entrypoint bash qits/graalvmce-musl-builder:jdk-25 -c '
+      # --network host and QITS_MAVEN_CENTRAL_URL route the builder's Maven Central resolve through
+      # the mirror, exactly as ci-event-release-request.yml's build step explains — empty
+      # deactivates the settings profile and the resolve goes to Central directly. No credential
+      # rides along: edge reads are anonymous, and a transient container's env is `docker
+      # inspect`able.
+      cid=$(docker create --user root --network host --entrypoint bash \
+        -e QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_CENTRAL_MIRROR_URL:-}" \
+        qits/graalvmce-musl-builder:jdk-25 -c '
         set -eu
         cd /qits-build
-        ./mvnw -B -ntp -pl ci-daemon -am package -Dnative -DskipTests \
+        ./mvnw -B -ntp -s .qits-maven-settings.xml -pl ci-daemon -am package -Dnative -DskipTests \
           -Dquarkus.native.container-build=false \
           org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeBom \
           -DoutputFormat=json -DoutputName=sbom -DschemaVersion=1.6 \

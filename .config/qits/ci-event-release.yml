@@ -75,7 +75,12 @@ steps:
       # than through `quarkus.native.container-build=true` is explained at length there; the short
       # form is that `docker: true` gives this step the HOST daemon, so a bind mount of /workspace resolves to
       # nothing while `docker build` and `docker cp` stream over the API and work.
-      docker build -t qits/graalvmce-musl-builder:jdk-25 -f docker/Dockerfile.musl-builder docker/
+      # --network host: the toolchain tarballs the Dockerfile curls come from
+      # registry.dev.localhost, an edge vhost published on the host's 127.0.0.1:8080, which a RUN in
+      # the default bridge namespace resolves to its own loopback. Same reason as the QA pipeline's
+      # copy of this build, and as every fleet image build that reads an edge vhost.
+      docker build --network host \
+        -t qits/graalvmce-musl-builder:jdk-25 -f docker/Dockerfile.musl-builder docker/
       # --network host and QITS_MAVEN_CENTRAL_URL route the builder's Maven Central resolve through
       # the mirror, exactly as ci-event-release-request.yml's build step explains — empty
       # deactivates the settings profile and the resolve goes to Central directly. No credential

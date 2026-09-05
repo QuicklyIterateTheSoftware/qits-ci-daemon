@@ -115,8 +115,14 @@ Requiring a shell every container already has, rather than a specific one, is wh
 
 ## Building the binary
 
-    docker build -t qits/graalvmce-musl-builder:jdk-25 -f docker/Dockerfile.musl-builder docker/
+    docker build --network host -t qits/graalvmce-musl-builder:jdk-25 -f docker/Dockerfile.musl-builder docker/
     ./mvnw -B -ntp -pl ci-daemon -am package -Dnative -DskipTests
+
+`--network host` because the builder pulls its musl toolchain and its zlib source from the platform's
+own maven registry at `registry.dev.localhost:8080`, an edge vhost published on the host's loopback —
+a `RUN` in the default bridge namespace resolves that name to its own loopback and reaches nothing.
+Off the platform, drop the flag and override the two URLs back to upstream; the exact `--build-arg`
+pair is in `docker/Dockerfile.musl-builder`.
 
 The result is `ci-daemon/target/qits-ci-daemon` (~43 MB, stripped), and it is the direct output that
 `$QITS_CI_DAEMON_BINARY_URL` serves — no image, no wrapper.

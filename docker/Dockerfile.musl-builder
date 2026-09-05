@@ -37,11 +37,39 @@
 FROM mirror.dev.localhost:8080/quay/quarkus/ubi10-quarkus-graalvmce-builder-image:jdk-25
 USER root
 
-# more.musl.cc is a small community host. If build reproducibility ever matters more than build
-# simplicity, mirror this tarball rather than fetching it per image build. zlib comes from the
-# GitHub release and not zlib.net, which 404s old versions as soon as a new one lands.
-ARG MUSL_URL=https://more.musl.cc/11.2.1/x86_64-linux-musl/x86_64-linux-musl-native.tgz
-ARG ZLIB_URL=https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz
+# BOTH TARBALLS COME FROM THE PLATFORM'S OWN MAVEN REGISTRY, not from the internet. They used to be
+# fetched per cold image build from more.musl.cc — a small community host that is slow on a good day
+# and was down on a bad one: a QA run reddened on 2026-09-04 the first time the docker layer cache
+# had been collected out from under it. The old comment here suggested mirroring the tarball "if
+# build reproducibility ever matters more than build simplicity"; a flaky gate settled that.
+#
+# The bytes are the upstream bytes, uploaded once, byte-identical to what these coordinates used to
+# name:
+#
+#   x86_64-linux-musl-native.tgz  89080066 B  sha256 eb1db6f0f3c2bdbdbfb993d7ef7e2eeef82ac1259f6a6e1757c33a97dbcef3ad
+#                                 from https://more.musl.cc/11.2.1/x86_64-linux-musl/
+#   zlib-1.3.1.tar.gz              1512791 B  sha256 9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23
+#                                 from the GitHub release, not zlib.net, which 404s old versions as
+#                                 soon as a new one lands
+#
+# They sit under `eu.wohlben.qits.toolchain` in qits-artifacts' maven repository, which is an
+# ordinary artifact store rather than a special case: reads are anonymous, and the GC rule for the
+# platform's own maven repository keeps the last two released versions of every artifact whatever
+# their age, so a single-version coordinate like these two is kept by policy and cannot age out.
+#
+# `registry.dev.localhost:8080` is the edge vhost in front of it, the same host plane the `FROM`
+# above resolves on — WHICH MEANS THE BUILD NEEDS THE HOST NETWORK. The vhost is published on the
+# host's 127.0.0.1:8080, so a RUN in the default bridge namespace resolves the name to its own
+# loopback and dials nothing; `.config/qits/ci-event-release{,-request}.yml` therefore pass
+# `docker build --network host`, as every fleet image build that reads an edge vhost does.
+#
+# The upstream URLs remain valid overrides, which is what a dev machine off the platform uses:
+#
+#   docker build --build-arg MUSL_URL=https://more.musl.cc/11.2.1/x86_64-linux-musl/x86_64-linux-musl-native.tgz \
+#                --build-arg ZLIB_URL=https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz \
+#                -t qits/graalvmce-musl-builder:jdk-25 -f docker/Dockerfile.musl-builder docker/
+ARG MUSL_URL=http://registry.dev.localhost:8080/artifacts/maven/maven/eu/wohlben/qits/toolchain/x86_64-linux-musl-native/11.2.1/x86_64-linux-musl-native-11.2.1.tgz
+ARG ZLIB_URL=http://registry.dev.localhost:8080/artifacts/maven/maven/eu/wohlben/qits/toolchain/zlib/1.3.1/zlib-1.3.1.tar.gz
 
 RUN mkdir -p /opt/musl \
  && curl -fsSL "$MUSL_URL" | tar -xz -C /opt/musl --strip-components=1 \

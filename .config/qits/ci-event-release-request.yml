@@ -83,7 +83,14 @@ steps:
       # pull-through mirror at localhost:8082 — an address the HOST daemon resolves, which is the
       # side that runs this build. `quarkus.native.builder-image.pull=missing` in the app's
       # application.properties is what stops the native build from trying to `docker pull` it.
-      docker build -t qits/graalvmce-musl-builder:jdk-25 -f docker/Dockerfile.musl-builder docker/
+      #
+      # --network host for the same reason every fleet image build carries it: the toolchain
+      # tarballs the Dockerfile curls now come from registry.dev.localhost, an edge vhost published
+      # on the host's 127.0.0.1:8080. A RUN in the default bridge namespace resolves that name to
+      # its own loopback and dials nothing. It applies to the RUN steps only — the FROM was always
+      # the daemon's own resolve and never needed it.
+      docker build --network host \
+        -t qits/graalvmce-musl-builder:jdk-25 -f docker/Dockerfile.musl-builder docker/
 
       # --entrypoint: the builder image entrypoints to native-image itself. --user root: the base
       # runs as 1001 and /qits-build arrives owned by root.

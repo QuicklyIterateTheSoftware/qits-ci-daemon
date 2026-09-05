@@ -34,17 +34,17 @@
 # first build fetches the image from upstream and caches it, every later build is served from local
 # disk. The tag is upstream's, unchanged — the mirror revalidates it, so `jdk-25` still moves when
 # quay moves it.
-FROM mirror.dev.localhost:8080/quay/quarkus/ubi10-quarkus-graalvmce-builder-image:jdk-25
-USER root
-
-# BOTH TARBALLS COME FROM THE PLATFORM'S OWN MAVEN REGISTRY, not from the internet. They used to be
-# fetched per cold image build from more.musl.cc — a small community host that is slow on a good day
-# and was down on a bad one: a QA run reddened on 2026-09-04 the first time the docker layer cache
-# had been collected out from under it. The old comment here suggested mirroring the tarball "if
-# build reproducibility ever matters more than build simplicity"; a flaky gate settled that.
 #
-# The bytes are the upstream bytes, uploaded once, byte-identical to what these coordinates used to
-# name:
+# --- WHERE THE TWO TARBALLS COME FROM, AND WHY `ADD` RATHER THAN `curl` ---------------------------
+# BOTH COME FROM THE PLATFORM'S OWN MAVEN REGISTRY, not from the internet. They used to be fetched
+# per cold image build from more.musl.cc — a small community host that is slow on a good day and was
+# down on a bad one: a QA run reddened on 2026-09-04 the first time the docker layer cache had been
+# collected out from under it. The comment that stood here suggested mirroring the tarball "if build
+# reproducibility ever matters more than build simplicity"; a flaky gate settled that trade.
+#
+# The bytes are the upstream bytes, uploaded once and unmodified, under
+# `eu.wohlben.qits.toolchain` in qits-artifacts' maven repository — an ordinary artifact store
+# rather than a special case, read anonymously:
 #
 #   x86_64-linux-musl-native.tgz  89080066 B  sha256 eb1db6f0f3c2bdbdbfb993d7ef7e2eeef82ac1259f6a6e1757c33a97dbcef3ad
 #                                 from https://more.musl.cc/11.2.1/x86_64-linux-musl/
@@ -52,16 +52,24 @@ USER root
 #                                 from the GitHub release, not zlib.net, which 404s old versions as
 #                                 soon as a new one lands
 #
-# They sit under `eu.wohlben.qits.toolchain` in qits-artifacts' maven repository, which is an
-# ordinary artifact store rather than a special case: reads are anonymous, and the GC rule for the
-# platform's own maven repository keeps the last two released versions of every artifact whatever
-# their age, so a single-version coordinate like these two is kept by policy and cannot age out.
+# They cannot age out from under a build: the GC rule for the platform's own maven repository keeps
+# the last two released versions of every artifact whatever their age, and each of these is the only
+# version of its coordinate.
 #
-# `registry.dev.localhost:8080` is the edge vhost in front of it, the same host plane the `FROM`
-# above resolves on — WHICH MEANS THE BUILD NEEDS THE HOST NETWORK. The vhost is published on the
-# host's 127.0.0.1:8080, so a RUN in the default bridge namespace resolves the name to its own
-# loopback and dials nothing; `.config/qits/ci-event-release{,-request}.yml` therefore pass
-# `docker build --network host`, as every fleet image build that reads an edge vhost does.
+# THE FETCH IS AN `ADD` IN A `scratch` STAGE, AND THAT IS THE LOAD-BEARING PART. `registry.dev.localhost`
+# is an edge vhost, on the same host plane the `FROM` above resolves on — and a `RUN` cannot reach
+# that plane. A build container gets its own netns and its own /etc/hosts, and glibc answers any
+# *.localhost name from RFC 6761 as the container's OWN loopback, where nothing listens; the measured
+# failure is `curl: (7) Failed to connect to registry.dev.localhost port 8080 after 0 ms`. Nor does
+# `docker build --network host` fix it, and it is not worth reaching for: the pipeline that builds
+# this file is read from main's head while the Dockerfile comes from the fold, so a flag added there
+# cannot be exercised by the change that needs it.
+#
+# BuildKit resolves an `ADD <url>` itself, in the daemon's own network context — the same one that
+# resolves the `FROM` line and pushes to `registry.dev.localhost:8080`. So the fetch lands where the
+# image pull already lands, and the RUN below never dials anything. The stage is `scratch` because
+# nothing is executed in it, and the tarballs reach the build stage as a bind mount rather than a
+# COPY so 90 MB of tarball never becomes a layer of an image that only wants what is inside them.
 #
 # The upstream URLs remain valid overrides, which is what a dev machine off the platform uses:
 #
@@ -71,8 +79,20 @@ USER root
 ARG MUSL_URL=http://registry.dev.localhost:8080/artifacts/maven/maven/eu/wohlben/qits/toolchain/x86_64-linux-musl-native/11.2.1/x86_64-linux-musl-native-11.2.1.tgz
 ARG ZLIB_URL=http://registry.dev.localhost:8080/artifacts/maven/maven/eu/wohlben/qits/toolchain/zlib/1.3.1/zlib-1.3.1.tar.gz
 
-RUN mkdir -p /opt/musl \
- && curl -fsSL "$MUSL_URL" | tar -xz -C /opt/musl --strip-components=1 \
+FROM scratch AS tarballs
+# Re-declared: an ARG before the first FROM is global, and a stage that wants to read one has to name
+# it again.
+ARG MUSL_URL
+ARG ZLIB_URL
+ADD $MUSL_URL /musl.tgz
+ADD $ZLIB_URL /zlib.tar.gz
+
+FROM mirror.dev.localhost:8080/quay/quarkus/ubi10-quarkus-graalvmce-builder-image:jdk-25
+USER root
+
+RUN --mount=type=bind,from=tarballs,target=/tarballs \
+    mkdir -p /opt/musl \
+ && tar -xzf /tarballs/musl.tgz -C /opt/musl --strip-components=1 \
  && /opt/musl/bin/x86_64-linux-musl-gcc --version
 
 # native-image with --libc=musl invokes `x86_64-linux-musl-gcc`, so that name must be on PATH — but
@@ -88,8 +108,9 @@ ENV PATH=/opt/musl-shim:$PATH
 
 # native-image links `-lz`, so zlib has to exist for the musl target too — compiled against the
 # toolchain above and installed into the same prefix.
-RUN mkdir -p /tmp/zlib \
- && curl -fsSL "$ZLIB_URL" | tar -xz -C /tmp/zlib --strip-components=1 \
+RUN --mount=type=bind,from=tarballs,target=/tarballs \
+    mkdir -p /tmp/zlib \
+ && tar -xzf /tarballs/zlib.tar.gz -C /tmp/zlib --strip-components=1 \
  && cd /tmp/zlib \
  && CC=/opt/musl/bin/x86_64-linux-musl-gcc ./configure --static --prefix=/opt/musl \
  && make -j"$(nproc)" && make install \

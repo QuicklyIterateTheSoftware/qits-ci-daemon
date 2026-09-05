@@ -33,6 +33,29 @@
 event: SCMRelease
 when:
   - repository: { exact: qits-ci-daemon }
+# THE RUN IS ANCHORED AT THE TAG IT BUILDS. `SCMRelease` carries `commitSha` — the commit the tag
+# points at — since qits-projects 2026.905.73500, and qits-ci resolves these two dot-paths since
+# 2026.905.83431. Before that the event named no commit at all: `branch` is the release request's
+# BACKING BRANCH, which the tagging operation deletes, and `version` names a tag rather than a
+# commit — so this file could declare no `checkout:`, the run was recorded at `main`, and every
+# release displayed as `main@<head>`, a run recorded against a commit it did not build.
+#
+# `branch: version` IS NOT A MISNOMER. The key is named for the run row's ref column, and a tag is a
+# ref: the daemon clones `--branch "$QITS_CI_BRANCH"`, which git resolves against tags exactly as
+# against heads, and the sha is what `checkout --detach` then lands on. Nothing in qits-ci holds a
+# concept of a tag.
+#
+# `optional: true` IS THE TRANSITION AND IT STAYS UNTIL NO OLD EVENT CAN ARRIVE. `commitSha` is
+# additive, so an `SCMRelease` published before it existed — a replay out of the durable log, a
+# hand-built event through qits-ci's manual trigger door — resolves nothing here. Without the flag
+# that would cost this pipeline its run, which is a released version whose artifact is silently
+# never published. With it, such a run is recorded at `main`'s head, byte-for-byte as before, and
+# the `git fetch refs/tags/$version` in the step below is what supplies the released tree — which
+# is why that fetch STAYS: a no-op on the anchored path, the whole mechanism on the fallback one.
+checkout:
+  branch: version       # the tag's name — a ref name, which `clone --branch` resolves
+  sha: commitSha        # what it points at; absent on any release published before the field
+  optional: true        # ...and then this run is main's head, exactly as it was before
 artifacts:
   - { type: daemon, name: qits-ci-daemon }
 steps:

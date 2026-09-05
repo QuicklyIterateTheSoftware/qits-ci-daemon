@@ -1,0 +1,19 @@
+# What `docker/Dockerfile`'s `COPY . .` must NOT drag into the build context.
+#
+# Both entries are about the same failure in two forms. A developer's tree carries target/ dirs from
+# host builds; copying them in makes the context tens of megabytes and — worse — lets a stale
+# artifact shadow what the builder stage compiles, so a green build can ship bytes nobody just
+# produced. .git is the same cost with none of the benefit: nothing in the build reads history.
+#
+# This file is the CONTEXT ROOT's, so it applies to `--local context=.` builds of docker/Dockerfile
+# and to nothing else. `docker/Dockerfile.musl-builder` is built with `docker/` as its context —
+# qits-bootstrap-cli builds it that way too — and is unaffected.
+target/
+**/target/
+.git/
+
+# And the build's OWN outputs, which land here as `--output type=local,dest=out`. Without this line
+# the release pipeline's second export (the SBOM stage) sends a context containing the binary the
+# first one just wrote, `COPY . .` hashes differently, and the document costs a whole second native
+# compile.
+out/

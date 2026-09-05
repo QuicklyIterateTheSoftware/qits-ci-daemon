@@ -30,22 +30,32 @@
 #      network beyond Maven Central, no prior install anywhere. It runs FIRST because it is the
 #      cheap gate: a broken test must not cost a GraalVM native build.
 #   2. the shipping form — a fully static musl native image. A sibling service proves its native
-#      build inside `docker build` (its Dockerfile has a native stage); this repo ships no image
+#      build inside its image build (its Dockerfile has a native stage); this repo ships no image
 #      at all, so the native build is the artifact itself and needs its own step.
 #
-# --- WHY STEP 2 BUILDS INSIDE A CONTAINER IT STARTS BY HAND ---------------------------------------
-# The documented recipe (README.md, "Building the binary") is `./mvnw -Dnative` with
-# `quarkus.native.container-build=true`, which makes Maven `docker run` the builder image with the
-# project bind-mounted. That does not work from a step container: `docker: true` hands this step
-# the HOST daemon's socket, so every `-v` path is resolved on the host and the step's own
-# /workspace does not exist there. `docker build` is fine (the CLI streams its context over the
-# API) and so is `docker cp` (same), which is the whole trick — source in, binary out, and
-# container-build switched off because we are already inside the container it would have launched.
-# qits-local-up.sh builds the daemon exactly this way and for exactly this reason; the two should
-# keep matching.
+# --- STEP 2 BUILDS ON THE PLATFORM'S OWN BUILDKITD ------------------------------------------------
+# qits-buildkit-plan.md in the wrapper is the whole migration; qits-workspace-daemon's pipeline pair
+# is the converted exemplar. What this file used to do instead is worth knowing, because the shape
+# it replaced was a workaround for the socket rather than a way anyone wanted to build:
+# `docker build` the toolchain image, `docker create` a container from it, `docker cp` the checkout
+# in, `docker start -a`, `docker cp` the binary back out. All four verbs existed because a step
+# container holding the HOST daemon's socket cannot bind-mount its own /workspace — every `-v` path
+# is resolved on the host, where the step's tree does not exist — so streaming the source in over
+# the API was the only way to hand a builder a tree at all. BuildKit takes a context, so `COPY . .`
+# in docker/Dockerfile's build stage does all of it in one call, and the binary comes back out as
+# `--opt target=binary --output type=local`.
 #
-# The native build's ~4 GB therefore belongs to the HOST daemon, not to this step's container —
-# the same reading every sibling's `docker: true` build step has of its own memory.
+# THE NATIVE BUILD'S ~4 GB THEREFORE BELONGS TO THE BUILDER, not to this step's container: an exec
+# runs in buildkitd, which qits-containers owns and caps.
+#
+# --- AND WHY THIS STEP STILL DECLARES `docker: true` ----------------------------------------------
+# The two builds below are buildctl and touch no socket. The SMOKE PROBE does: it starts a real
+# alpine container on the extracted binary and reads its exit code, which is a container RUN and not
+# an image build — the one thing on this platform that genuinely still wants the daemon. So this
+# step keeps the socket flag rather than `build: true`, and the flag keeps carrying the build-mode
+# environment ($QITS_BUILD_REGISTRY, and the $BUILDKIT_HOST qits-containers injects into every step
+# container) exactly as `build: true` would. Dropping it is a change for the day the probe has
+# somewhere else to run, not for this one.
 
 event: ReleaseRequestChanged
 
@@ -78,48 +88,87 @@ steps:
     script: |
       set -eu
 
-      # The builder image lives in NO registry (README.md: "built locally and lives in no
-      # registry"), so whatever needs it builds it. Its own FROM names qits-platform-mirror's
-      # pull-through mirror at localhost:8082 — an address the HOST daemon resolves, which is the
-      # side that runs this build. `quarkus.native.builder-image.pull=missing` in the app's
-      # application.properties is what stops the native build from trying to `docker pull` it.
-      docker build -t qits/graalvmce-musl-builder:jdk-25 -f docker/Dockerfile.musl-builder docker/
+      # The platform builder, demanded loudly before anything is built. Unset means a
+      # qits-ci/qits-containers pair too old to inject it; EMPTY means the kill switch
+      # (qits.ci.buildkit.enabled=false spells off as empty-never-absent). Either way this recipe
+      # must fail here, naming the cause, rather than fall back to the socket it still holds for
+      # the probe — a silent fallback is exactly what the migration exists to remove.
+      : "${BUILDKIT_HOST:?the platform builder is off or not injected; this recipe builds only through it}"
+      : "${QITS_BUILD_REGISTRY:?}"
 
-      # --entrypoint: the builder image entrypoints to native-image itself. --user root: the base
-      # runs as 1001 and /qits-build arrives owned by root.
-      # --network host and QITS_MAVEN_CENTRAL_URL route the builder's Maven Central resolve through
-      # the mirror, exactly like the fleet's docker-build RUNs: the injected URL is an edge vhost on
-      # 127.0.0.1:8080, which only the host namespace reaches. Empty deactivates the settings
-      # profile and the resolve goes to Central directly, as it always did. No credential rides
-      # along — edge reads are anonymous, and a transient container's env is `docker inspect`able;
-      # if the vhost read policy ever tightens, this build fails loudly and earns a secret then.
-      # The ldd assertion is inside the build container because that is where the binary is, and it
-      # is `ldd` rather than `file` on purpose: GraalVM emits a position-independent static
-      # executable, so `file` says "static-pie linked" and never the literal "statically linked".
-      cid=$(docker create --user root --network host --entrypoint bash \
-        -e QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_CENTRAL_MIRROR_URL:-}" \
-        qits/graalvmce-musl-builder:jdk-25 -c '
-        set -eu
-        cd /qits-build
-        ./mvnw -B -ntp -s .qits-maven-settings.xml -pl ci-daemon -am package -Dnative -DskipTests \
-          -Dquarkus.native.container-build=false
-        ldd ci-daemon/target/qits-ci-daemon 2>&1 | grep -qE "statically linked|not a dynamic executable"
-      ')
-      docker cp "$PWD" "$cid:/qits-build"
-      docker start -a "$cid" || { docker rm -f "$cid" >/dev/null; echo "native build failed" >&2; exit 1; }
-      docker cp "$cid:/qits-build/ci-daemon/target/qits-ci-daemon" ./qits-ci-daemon
-      docker rm "$cid" >/dev/null
+      # --- the toolchain image --------------------------------------------------------------------
+      # It is built here because nothing releases it: `docker/Dockerfile.musl-builder` is GraalVM CE
+      # plus a musl toolchain, and `quarkus.native.builder-image.pull=missing` in the app's
+      # application.properties is what stops a build from trying to pull it. What is new is that it
+      # is PUSHED: a `FROM` is resolved from a registry and from nowhere else, so the binary build
+      # below can only name this image if it has an address. The tag is fixed and overwritten in
+      # place, so this costs the registry one image and never a version per build — and it is
+      # NOT an artifact: nothing declares it, nothing deploys it, and the release pipeline's
+      # `artifacts:` says nothing about it. It is a cache coordinate for one builder.
+      #
+      # THE TARBALL URLS ARE THIS RUN'S, NOT THE DOCKERFILE'S DEFAULTS, and that is the same
+      # correction `--network host` used to make. BuildKit resolves an `ADD <url>` in the BUILDER's
+      # own network context, which is now qits-net; the committed defaults name
+      # registry.dev.localhost:8080, an edge vhost on the host loopback that resolves to the
+      # builder's own empty loopback from there. The in-network route is the injected
+      # $QITS_MAVEN_REGISTRY_URL, and the maven COORDINATE is read out of the Dockerfile rather than
+      # restated here — one source of truth for the version, so a toolchain bump is one file.
+      # (qits-bootstrap-cli overrides the same two args for the same reason, from the other side.)
+      maven_root="${QITS_MAVEN_REGISTRY_URL%/}"
+      musl_url=$(sed -n 's/^ARG MUSL_URL=//p' docker/Dockerfile.musl-builder)
+      zlib_url=$(sed -n 's/^ARG ZLIB_URL=//p' docker/Dockerfile.musl-builder)
+      : "${musl_url:?docker/Dockerfile.musl-builder declares no ARG MUSL_URL}"
+      : "${zlib_url:?docker/Dockerfile.musl-builder declares no ARG ZLIB_URL}"
+      musl_url="$maven_root${musl_url#*/artifacts/maven/maven}"
+      zlib_url="$maven_root${zlib_url#*/artifacts/maven/maven}"
 
+      builder="$QITS_BUILD_REGISTRY/$QITS_IMAGE_REPOSITORY/graalvmce-musl-builder:jdk-25"
+      buildctl build --frontend dockerfile.v0 \
+        --local context=docker --local dockerfile=docker \
+        --opt filename=Dockerfile.musl-builder \
+        --opt build-arg:MUSL_URL="$musl_url" \
+        --opt build-arg:ZLIB_URL="$zlib_url" \
+        --output "type=image,name=$builder,push=true"
+
+      # --- the binary ------------------------------------------------------------------------------
+      # docker/Dockerfile compiles inside that image and ends on a `FROM scratch` holding the one
+      # file, so the export writes out/qits-ci-daemon — what the four `docker` verbs this replaces
+      # used to fetch out of a container. The context is the checkout; `.dockerignore` keeps
+      # target/, .git and out/ out of it. No `--network host` and nothing replaces it: the RUN
+      # executes in the builder's namespace on qits-net, so Maven Central goes through the mirror's
+      # IN-NETWORK route ($QITS_MAVEN_PROXY_URL) rather than the edge vhost the host namespace
+      # needed, and empty deactivates the settings profile so the resolve goes to Central directly
+      # as it always did. No credential rides along: platform reads are anonymous.
+      #
+      # ci-event-release.yml runs this same invocation and adds the SBOM export; the two must stay
+      # byte-identical in every buildctl argument, because the builder's cache is shared and that is
+      # what makes a release following a green fold a stack of cache hits rather than a second
+      # native compile.
+      buildctl build --frontend dockerfile.v0 \
+        --local context=. --local dockerfile=docker \
+        --opt target=binary \
+        --opt build-arg:BUILDER_IMAGE="$builder" \
+        --opt build-arg:QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}" \
+        --output type=local,dest=out
+
+      # --- the smoke probe, AND THE ONE THING HERE THAT STILL WANTS THE SOCKET ---------------------
       # The cheap check the test suite structurally cannot do (README.md): a binary run with no
       # environment at all must name the first missing variable and exit 2, not die resolving
       # config. An empty `defaultValue` regresses exactly this and nothing in `./mvnw verify` sees
       # it. alpine:3 also proves the musl half — a glibc-linked binary answers "no such file or
       # directory" here rather than exiting 2.
+      #
+      # This is a container RUN and not an image build, so it does not convert: what it asserts is
+      # the binary's behaviour when something EXECUTES it, which is the thing a build cannot say
+      # anything about. It is why this step declares `docker: true` rather than `build: true`, and
+      # the header above says so. Moving it into a builder stage would make the check a cached
+      # layer and the bare `alpine:3` a Docker Hub pull the offline posture forbids — two
+      # regressions for the sake of one flag.
       probe=$(docker create alpine:3 /qits-ci-daemon)
-      docker cp ./qits-ci-daemon "$probe:/qits-ci-daemon"
+      docker cp out/qits-ci-daemon "$probe:/qits-ci-daemon"
       docker start -a "$probe" || true
       code=$(docker inspect -f '{{.State.ExitCode}}' "$probe")
       docker rm "$probe" >/dev/null
       [ "$code" = 2 ] || { echo "a daemon run with no environment exited $code, expected 2" >&2; exit 1; }
 
-      echo "qits-ci-daemon built: $(sha256sum ./qits-ci-daemon | cut -d' ' -f1)"
+      echo "qits-ci-daemon built: $(sha256sum out/qits-ci-daemon | cut -d' ' -f1)"

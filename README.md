@@ -121,12 +121,29 @@ Requiring a shell every container already has, rather than a specific one, is wh
 The result is `ci-daemon/target/qits-ci-daemon` (~43 MB, stripped), and it is the direct output that
 `$QITS_CI_DAEMON_BINARY_URL` serves — no image, no wrapper.
 
-The builder image is **built locally and lives in no registry**, so whatever publishes a release has
-to build it first; `quarkus.native.builder-image.pull=missing` is what stops every build from trying
-to `docker pull` it. Its base is GraalVM CE and **not** the Mandrel image qits-workspace-daemon
-builds on, because Mandrel ships static JDK libraries for glibc only and a `--libc=musl` build dies
-in its first second. `docker/Dockerfile.musl-builder` carries the error message and the rest of the
-reasoning; `ci-daemon/src/main/resources/application.properties` carries the four properties.
+**CI does not build it that way.** `docker/Dockerfile` is the shipping form: it compiles inside the
+toolchain image as a build stage and ends on a `FROM scratch` holding the one file, so both pipelines
+are `buildctl build --opt target=binary --output type=local,dest=out` on the platform's own
+buildkitd, and the binary comes back as `out/qits-ci-daemon`. That file replaced a hand-rolled
+builder container — build the image, `docker create`, `docker cp` the source in, `docker start -a`,
+`docker cp` the binary out — five verbs that existed only because a step container holding the host
+daemon's socket cannot bind-mount its own workspace. The wrapper's `qits-buildkit-plan.md` is the
+migration. The same file exports the CycloneDX document as a second stage, so a release's SBOM is a
+cache hit rather than a second compile:
+
+    docker build --target binary --output type=local,dest=out -f docker/Dockerfile .
+
+The builder image is **not released by anything**, so whatever needs it builds it first;
+`quarkus.native.builder-image.pull=missing` is what stops every build from trying to `docker pull`
+it. CI pushes it to the platform registry under a fixed tag, because a `FROM` is resolved from a
+registry and from nowhere else — it is a cache coordinate for one builder and not an artifact, and
+nothing declares or deploys it. Its base is GraalVM CE and **not** the Mandrel image
+qits-workspace-daemon builds on, because Mandrel ships static JDK libraries for glibc only and a
+`--libc=musl` build dies in its first second. `docker/Dockerfile.musl-builder` carries the error
+message and the rest of the reasoning, and stays a file of its own because its last stage must
+remain the toolchain image: qits-bootstrap-cli builds it by default target, on a machine where no
+platform exists yet. `ci-daemon/src/main/resources/application.properties` carries the four
+properties.
 
 Checking a build:
 

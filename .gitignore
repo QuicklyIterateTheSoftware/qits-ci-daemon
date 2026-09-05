@@ -2,6 +2,9 @@
 target/
 target-ide/
 
+# Where docker/Dockerfile's `--output type=local,dest=out` drops the binary and its SBOM
+out/
+
 # IDE
 .vscode/
 .idea/

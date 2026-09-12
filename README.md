@@ -162,6 +162,29 @@ do: it must print the name of the first missing variable and exit 2, not die res
     $ docker run --rm -v "$PWD/ci-daemon/target/qits-ci-daemon":/qits-ci-daemon:ro alpine:3 /qits-ci-daemon
     ... ci-daemon cannot start: QITS_CI_DAEMON_URL is not set. Exiting.
 
+## Other repositories build on this image
+
+CI pushes the builder image to
+`$QITS_BUILD_REGISTRY/$QITS_IMAGE_REPOSITORY/graalvmce-musl-builder:jdk-25`, and other repositories
+build `FROM` that tag:
+
+- **qits-artifacts-cli** passes it as `BUILDER_IMAGE` in its recipes.
+- **qits-platform-access-cli** did the same in its first release. A fix builds its toolchain as
+  stages of its own instead.
+
+The tag exists in a platform's registry only after this repository's gate (a release-request fold)
+or release has run. The bootstrap builds the image into the host's image store and does not push it.
+So on a freshly booted platform, every release of those CLIs fails with
+`graalvmce-musl-builder:jdk-25: not found` until a qits-ci-daemon fold has run. That happened on
+2026-09-12: qits-ci-daemon had not run since the 2026-09-10 clean boot.
+
+What follows:
+
+- On a cold platform, run a qits-ci-daemon fold (open a release request for it) before you release
+  those CLIs.
+- Keep `push=true` on the builder build in both recipes. Without it the tag never reaches the
+  registry and the other CLIs cannot build.
+
 ## Relationship to qits-workspace-daemon
 
 The same recipe, at one-fifth the size:

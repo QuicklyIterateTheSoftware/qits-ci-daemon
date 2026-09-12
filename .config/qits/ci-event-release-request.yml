@@ -105,6 +105,11 @@ steps:
       # place, so this costs the registry one image and never a version per build — and it is
       # NOT an artifact: nothing declares it, nothing deploys it, and the release pipeline's
       # `artifacts:` says nothing about it. It is a cache coordinate for one builder.
+      # OTHER REPOSITORIES BUILD `FROM` THE PUSHED TAG: qits-artifacts-cli passes it as its
+      # BUILDER_IMAGE, and qits-platform-access-cli's first release did the same (a fix moves its
+      # toolchain into its own stages). A cold platform has no such tag until this recipe or the
+      # release recipe has run, so keep `push=true` — README.md, "Other repositories build on this
+      # image".
       #
       # THE TARBALL URLS ARE THIS RUN'S, NOT THE DOCKERFILE'S DEFAULTS, and that is the same
       # correction `--network host` used to make. BuildKit resolves an `ADD <url>` in the BUILDER's

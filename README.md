@@ -168,22 +168,23 @@ CI pushes the builder image to
 `$QITS_BUILD_REGISTRY/$QITS_IMAGE_REPOSITORY/graalvmce-musl-builder:jdk-25`, and other repositories
 build `FROM` that tag:
 
-- **qits-artifacts-cli** passes it as `BUILDER_IMAGE` in its recipes.
 - **qits-platform-access-cli** did the same in its first release. A fix builds its toolchain as
   stages of its own instead.
+- **qits-artifacts-cli** passed it as `BUILDER_IMAGE` in its recipes. That repository is retired —
+  its publish client now ships inside the `qits` CLI — so nothing of it names the tag any more.
 
 The tag exists in a platform's registry only after this repository's gate (a release-request fold)
 or release has run. The bootstrap builds the image into the host's image store and does not push it.
-So on a freshly booted platform, every release of those CLIs fails with
+So on a freshly booted platform, a release that builds `FROM` the tag fails with
 `graalvmce-musl-builder:jdk-25: not found` until a qits-ci-daemon fold has run. That happened on
 2026-09-12: qits-ci-daemon had not run since the 2026-09-10 clean boot.
 
 What follows:
 
 - On a cold platform, run a qits-ci-daemon fold (open a release request for it) before you release
-  those CLIs.
+  anything that builds `FROM` the tag.
 - Keep `push=true` on the builder build in both recipes. Without it the tag never reaches the
-  registry and the other CLIs cannot build.
+  registry and nothing else can build on it.
 
 ## Relationship to qits-workspace-daemon
 

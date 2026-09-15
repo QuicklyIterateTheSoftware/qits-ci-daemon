@@ -168,10 +168,10 @@ CI pushes the builder image to
 `$QITS_BUILD_REGISTRY/$QITS_IMAGE_REPOSITORY/graalvmce-musl-builder:jdk-25`, and other repositories
 build `FROM` that tag:
 
-- **qits-platform-access-cli** did the same in its first release. A fix builds its toolchain as
-  stages of its own instead.
 - **qits-artifacts-cli** passed it as `BUILDER_IMAGE` in its recipes. That repository is retired —
   its publish client now ships inside the `qits` CLI — so nothing of it names the tag any more.
+- **qits-platform-access-cli** did the same in its first release. A fix builds its toolchain as
+  stages of its own instead.
 
 The tag exists in a platform's registry only after this repository's gate (a release-request fold)
 or release has run. The bootstrap builds the image into the host's image store and does not push it.

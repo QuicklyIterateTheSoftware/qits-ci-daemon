@@ -64,6 +64,14 @@ Two consequences worth stating, because they are the ones that bite:
 - **Nothing here reaches qits-ci by releasing.** Publishing a version makes it *available*; a bump
   in qits-ci's pom is what makes it *used*. A release of this repository that nobody bumps changes
   no running step, which is the property the old configuration entry did not have.
+- **A release publishes what `main`'s recipe says, not what the released tree says.** qits-ci reads
+  `.config/qits/ci-event-*.yml` at this repository's `main` head and takes only the branch and sha
+  from the release, so a version tagged before the recipe reaching `main` is built by the *old*
+  pipeline. Measured here on 2026-09-17: `2026.917.31410` carried the jar step and published no jar,
+  which was expected; `2026.917.33716` carried the jar itself and *also* published none, because its
+  build was decided while `main` still ended at the release before it. The rule is not "budget one
+  extra release" but "do not start the next release until the recipe is on `main`" — check with
+  `git log origin/main` rather than assuming the previous release finished landing.
 
 ## The boundary
 

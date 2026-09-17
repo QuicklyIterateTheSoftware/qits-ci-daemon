@@ -13,8 +13,11 @@ import org.junit.jupiter.api.Test;
  * qits-ci and {@code ci-daemon} only bridge the map to their JSON library, so this test covers the
  * shared mapping both depend on.
  *
- * <p>It lives in qits-ci's vendored copy too, byte-identical. That is the drift detector: a copy
- * edited on one side fails here rather than in production.
+ * <p>It used to live in qits-ci's vendored copy too, byte-identical, as the drift detector for two
+ * sources that could be edited apart. There is one source now — qits-ci depends on the released
+ * {@code eu.wohlben.qits:qits-ci-daemon-protocol} rather than copying it — so this suite guards the
+ * contract itself rather than a copy of it, and it runs once, here, on the tree that is about to be
+ * published.
  */
 class CiDaemonCodecTest {
 
@@ -179,7 +182,8 @@ class CiDaemonCodecTest {
 
   @Test
   void theCapabilityVersionIsOne() {
-    // Pinned so a bump is a deliberate edit here and in the vendored copy, never a side effect.
+    // Pinned so a bump is a deliberate edit rather than a side effect. It reaches qits-ci as a
+    // version bump of this jar, and the host's side of the skew is decided there.
     assertEquals(1, CiDaemonProtocol.CAPABILITY_VERSION);
   }
 }

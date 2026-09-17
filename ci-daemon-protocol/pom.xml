@@ -9,7 +9,22 @@
         <relativePath>../pom.xml</relativePath>
     </parent>
 
-    <artifactId>ci-daemon-protocol</artifactId>
+    <!-- PUBLISHED COORDINATES, and they deliberately do not inherit the parent's.
+         `eu.wohlben.qits:qits-*` is what every artifact this platform releases is called
+         (qits-auth-core, qits-db-core, qits-eventstream, qits-workspace-daemon-protocol), and this
+         module joined them the day qits-ci started taking the daemon version from a released
+         dependency instead of a configuration entry — see CiDaemonBinary.
+
+         The artifactId gains the `qits-` prefix the directory does not because the directory name
+         is a path in one reactor and the coordinate is a name in a registry shared by every
+         repository here; `ci-daemon-protocol` in a global namespace says nothing about whose ci.
+         It is also the name the coordinate ALREADY HAS on the consumer's side: qits-ci's vendored
+         copy of this module is `eu.wohlben.qits:qits-ci-daemon-protocol` in its own reactor today,
+         so the published jar takes that name as the vendored copy is deleted and the dependency
+         resolves to this artifact without a single call site changing. Two artifacts under one
+         coordinate with two owners is the state that rename avoids. -->
+    <groupId>eu.wohlben.qits</groupId>
+    <artifactId>qits-ci-daemon-protocol</artifactId>
 
     <!-- The ci-daemon control-socket wire contract: plain records + enums + the shared type/field
          name constants, framework-free and dependency-free. Both qits-ci (the host, serializing
@@ -19,8 +34,12 @@
 
          Deliberately NOT the workspace-daemon protocol: the messages are disjoint, and coupling
          the two repos' wire contracts would make every workspace capability bump a ci event
-         (finish-ci-feature.md §3). qits-ci vendors this module byte-identical and never edits its
-         copy; `diff -r` is the drift detector. -->
+         (finish-ci-feature.md §3).
+
+         IT CARRIES THE RELEASE'S OWN VERSION TOO (CiDaemonBinary), which is why it is the module
+         that gets deployed rather than a second "pin" jar beside it: the thing a consumer must pin
+         and the thing it must speak are the same release, and one artifact cannot ship half of that
+         pair. -->
 
     <dependencies>
         <dependency>
@@ -31,6 +50,29 @@
     </dependencies>
 
     <build>
+        <!-- FILTERING IS ON FOR THIS MODULE'S ONE RESOURCE AND NOTHING ELSE. The include/exclude
+             pair is not belt-and-braces: filtering every resource would rewrite any future wire
+             fixture that happens to contain `${`, and this module is the wire contract — a corrupt
+             fixture here is a wrong assertion, not a build error. CiDaemonBinary refuses an
+             unfiltered value, so switching this block off fails loudly rather than shipping the
+             literal `${project.version}` as the path segment a step container downloads its binary
+             from. -->
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+                <filtering>true</filtering>
+                <includes>
+                    <include>eu/wohlben/qits/cidaemon/protocol/ci-daemon-binary.properties</include>
+                </includes>
+            </resource>
+            <resource>
+                <directory>src/main/resources</directory>
+                <filtering>false</filtering>
+                <excludes>
+                    <exclude>eu/wohlben/qits/cidaemon/protocol/ci-daemon-binary.properties</exclude>
+                </excludes>
+            </resource>
+        </resources>
         <plugins>
             <plugin>
                 <artifactId>maven-compiler-plugin</artifactId>

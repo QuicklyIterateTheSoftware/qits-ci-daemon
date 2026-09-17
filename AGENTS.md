@@ -64,18 +64,29 @@ Test names are sentences describing the behaviour, not the method
 3. Encode and decode arms in `CiDaemonCodec`.
 4. A round-trip case in `CiDaemonCodecTest`.
 5. Bump `CiDaemonProtocol.CAPABILITY_VERSION`.
-6. **Mirror the whole module into qits-ci-service**, byte-identical, and handle the new case in its
-   `CiDaemonRegistry`. `CiDaemonCodecTest` living in both copies is the drift detector; `diff -r` the
-   two `src/` trees before you push.
+6. **Release this repository, then bump the dependency in qits-ci-service** and handle the new case
+   in its `CiDaemonRegistry`. There is no copy to keep matched: qits-ci-service depends on
+   `eu.wohlben.qits:qits-ci-daemon-protocol`, the jar this repository's release pipeline deploys, so
+   the new record is on its classpath the moment its pom names the new version and not one second
+   before.
 
-**This repo is the protocol's only author.** qits-ci-service *copies* — it never edits its vendored
-copy, not even for a one-line fix, not even to unbreak its own build. A correction discovered while
-working in qits-ci-service comes back here as a commit and goes over as a re-vendor; that round trip
-is slower than the edit and it is the whole point. The workspace pair drifted exactly once, by
-exactly that shortcut, and the two sides then disagreed about a field for as long as nobody diffed
-them.
+**This repo is the protocol's only author, and the dependency is what enforces it now.** It used to
+be a convention — qits-ci-service vendored the module byte-identical and was asked never to edit its
+copy, with `diff -r` as the drift detector — and a convention is exactly what the workspace pair
+broke, once, by the obvious shortcut of a one-line fix on the consumer's side; the two then
+disagreed about a field for as long as nobody diffed them. A published artifact cannot be edited in
+place, so the shortcut no longer exists: a correction discovered while working in qits-ci-service
+comes back here as a commit, gets released, and goes over as a version bump.
 
-    diff -r ci-daemon-protocol/src <qits-qits>/components/qits-ci/qits-ci-service/ci-daemon-protocol/src
+That round trip is slower than the edit and it buys two things the copy never did. **The version of
+the jar is the version of the binary** (`CiDaemonBinary` — see README.md), so pinning the protocol
+is pinning the daemon and the pair cannot be mismatched by a deployment act. And the bump is gated
+by qits-ci's own release request, which runs this binary at that version against its own host before
+the merge — so a wire change that breaks the host fails a gate rather than a production step.
+
+**Nothing you do here reaches qits-ci by itself.** Publishing a version makes it available; only a
+bump in qits-ci's pom makes it used. Leaving the bump to the maintenance train is fine and normal —
+what is not fine is assuming a release of this repository changed anything about a running run.
 
 Prefer extending an existing message to minting a new one, and prefer an enum constant to a free-text
 field: `InitFailed.reason` is the shape to copy — three values the host branches on, with the human

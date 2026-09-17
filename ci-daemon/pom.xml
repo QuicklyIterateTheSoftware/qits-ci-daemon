@@ -25,9 +25,14 @@
          decision about image size and about whether it links anything glibc-only. -->
 
     <dependencies>
+        <!-- The wire contract, under the coordinate it is PUBLISHED as rather than the directory
+             it lives in — see ../ci-daemon-protocol/pom.xml. Version-less: the root pom manages it
+             at ${project.version}, so this always resolves to the sibling in the reactor and the
+             binary can never be compiled against a released protocol older than the one it ships
+             beside. -->
         <dependency>
-            <groupId>eu.wohlben</groupId>
-            <artifactId>ci-daemon-protocol</artifactId>
+            <groupId>eu.wohlben.qits</groupId>
+            <artifactId>qits-ci-daemon-protocol</artifactId>
         </dependency>
         <dependency>
             <groupId>io.quarkus</groupId>

@@ -42,10 +42,15 @@ FROM ${BUILDER_IMAGE} AS build
 USER root
 WORKDIR /qits-build
 
-# The whole reactor, not a module list. `-am` builds ci-daemon's dependency from source —
-# `ci-daemon-protocol` is a 1.0.0-SNAPSHOT this repo publishes nowhere — so a builder with an empty
-# ~/.m2 has nowhere else to get it. `.dockerignore` is what keeps this cheap: without it the line
-# drags in every target/ dir, and a stale one can shadow what this stage compiles.
+# The whole reactor, not a module list. `-am` builds ci-daemon's dependency from source, and it has
+# to: `eu.wohlben.qits:qits-ci-daemon-protocol` IS published now — the release pipeline deploys it
+# beside the binary so qits-ci can pin this daemon's version by pinning that jar — but never at the
+# version being built here. The reactor's version is the one about to be tagged, so it is by
+# definition not yet in any registry, and a builder with an empty ~/.m2 has nowhere but the tree
+# beside it to get the jar this binary is compiled against. That is also the property worth
+# keeping: the binary and the protocol it speaks come out of one compile of one tree.
+# `.dockerignore` is what keeps this cheap: without it the line drags in every target/ dir, and a
+# stale one can shadow what this stage compiles.
 COPY . .
 
 # Where Maven Central is mirrored, when it is. CI passes the platform mirror's IN-NETWORK route

@@ -16,7 +16,7 @@ pipeline config, persisting runs and steps — belongs to
 
 | Module | What |
 |---|---|
-| `ci-daemon-protocol/` | The control-socket wire contract: message records + a codec over a plain `Map`. Depends on nothing. qits-ci-service vendors a byte-identical copy. |
+| `ci-daemon-protocol/` | The control-socket wire contract: message records + a codec over a plain `Map`, plus `CiDaemonBinary` naming the binary version released beside it. Depends on nothing. Published as `eu.wohlben.qits:qits-ci-daemon-protocol`; qits-ci-service depends on it. |
 | `ci-daemon/` | The binary. A Quarkus command-mode app — no web stack, it dials out and never listens — compiled to a fully static musl native image. |
 
 Inside `ci-daemon/`, `Main` is the only CDI bean: it resolves configuration and news up plain
@@ -28,8 +28,42 @@ flow against a real socket without a container.
 `ci-daemon-protocol` is **framework-free**: no Quarkus, no CDI, no JAX-RS, no Jackson — a plain jar
 of records with plain constructors. That is not stylistic. The shipping form of this daemon is a
 fully static musl native image, so every dependency is a decision about image size and about what the
-GraalVM builder has to be told; and the module is copied into qits-ci-service, where a framework dependency
-would arrive as a second opinion about how a ci service is wired.
+GraalVM builder has to be told; and the module is a released jar on qits-ci-service's classpath, where
+a framework dependency would arrive as a second opinion about how a ci service is wired — and, since
+that service pins this jar to pin the daemon, would arrive on every host that ever bumps the daemon.
+
+## The protocol module is a published artifact, and its version is the binary's version
+
+`ci-daemon-protocol` is deployed by this repository's release pipeline as
+`eu.wohlben.qits:qits-ci-daemon-protocol`, at the same version as the binary the same release PUTs
+to `…/artifacts/daemons/qits-ci-daemon/<version>`. It carries `CiDaemonBinary.VERSION`, which the
+build filters out of `${project.version}` — so the jar's version and the binary's version are one
+string by construction, and there is no second place for them to disagree.
+
+That exists to answer one question: **who decides which daemon binary a step container downloads.**
+It used to be the platform underneath qits-ci — `QITS_CI_DAEMON_VERSION`, a configuration entry
+rewritten the instant a version was published, with an adoption probe layered on top that launched
+whatever had just landed and kept it if the container dialled. Both of those move a version into a
+running service without any build ever having put the two sides together: one is a string swapped
+under a deployment, the other is a probe the released service performs on itself in production. The
+consequence was that a protocol break was discovered by a real run, in a throwaway container, after
+the release.
+
+Now qits-ci pins the jar in its pom and reads the daemon version off the constant. Moving the daemon
+version is an ordinary dependency bump on a branch — the same act as moving any internal library —
+which means a change to the wire contract reaches qits-ci only through qits-ci's own release
+request: gated by its fold, proven before the merge by an integration test that downloads and runs
+*this* binary at *that* version against its own host, and approved by a person against the diff that
+ships it. A daemon that broke the wire fails a gate instead of a production step.
+
+Two consequences worth stating, because they are the ones that bite:
+
+- **The pipeline publishes in one order and it is not arbitrary.** The binary goes to the `daemons`
+  store first and the jar is deployed second, because the jar is what tells qits-ci which binary to
+  fetch — a jar that resolves before its binary exists is a pin pointing at nothing.
+- **Nothing here reaches qits-ci by releasing.** Publishing a version makes it *available*; a bump
+  in qits-ci's pom is what makes it *used*. A release of this repository that nobody bumps changes
+  no running step, which is the property the old configuration entry did not have.
 
 ## The boundary
 

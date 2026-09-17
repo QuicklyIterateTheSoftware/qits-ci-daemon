@@ -49,10 +49,16 @@
                 <scope>import</scope>
             </dependency>
             <!-- The wire-contract module, so a version-less dependency on it resolves within the
-                 reactor once the application module exists. -->
+                 reactor. The coordinate is the PUBLISHED one — `eu.wohlben.qits:
+                 qits-ci-daemon-protocol`, not this reactor's group and not the directory name —
+                 because that module overrides its inherited coordinates to the name every artifact
+                 this platform releases carries, and the aggregator has to name it the way the
+                 module names itself or `-pl ci-daemon -am` resolves the dependency from a registry
+                 instead of from the reactor beside it. Its pom says why the published name differs
+                 from the directory's. -->
             <dependency>
-                <groupId>eu.wohlben</groupId>
-                <artifactId>ci-daemon-protocol</artifactId>
+                <groupId>eu.wohlben.qits</groupId>
+                <artifactId>qits-ci-daemon-protocol</artifactId>
                 <version>${project.version}</version>
             </dependency>
         </dependencies>

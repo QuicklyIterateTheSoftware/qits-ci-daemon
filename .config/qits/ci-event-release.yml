@@ -15,21 +15,33 @@
 # longer expressible. (daemon-artifact-identity-plan.md §2.2 and §2.4.)
 #
 # `artifacts:` IS A DECLARATION, NOT A REPORT. qits-ci never learns how to publish anything — the
-# PUT below is this repository's own step, exactly as `npm publish` and `docker push` are siblings'
-# — so it cannot see what landed. It announces `SoftwareRelease {daemon, qits-ci-daemon}` on the
-# strength of these two lines after the whole pipeline is green. Keep them true.
+# PUT and the `mvn deploy` below are this repository's own steps, exactly as `npm publish` and
+# `docker push` are siblings' — so it cannot see what landed. It announces one `SoftwareRelease` per
+# entry on the strength of these declarations once the WHOLE pipeline is green, both steps included.
+# Keep them true.
 #
 # THE NAME IS UNQUALIFIED for the same reason a docker declaration's is: no repository states a
 # deployment's addresses. `qits-ci-daemon` is the daemon's name in the `daemons` repository, and
 # the reader supplies its own host.
 #
-# THE PIN NOW MOVES ITSELF. qits-ci listens for the SoftwareRelease this step announces, launches
-# the new version in a real container, and adopts it only once that container dials and speaks the
-# host's protocol version — falling back to the version before it, and then to
-# QITS_CI_DAEMON_VERSION, if it does not (ci-daemon-autoadopt-plan.md). Publishing here is therefore
-# the whole act: nothing further to carry by hand. QITS_CI_DAEMON_VERSION stays qits-ci's bottom
-# rung, moved only by a deliberate deployment act, for the platform to fall back to if every adopted
-# release is rejected.
+# THE PIN IS A LINE IN THE CONSUMER'S POM, AND THAT IS WHY THERE ARE TWO PUBLISHES HERE. qits-ci
+# used to learn this daemon's version from the platform underneath it — `QITS_CI_DAEMON_VERSION`, a
+# configuration entry rewritten the moment a version was published, with an adoption probe on top
+# that launched whatever had just landed and kept it if it dialled. Both of those move a version
+# into a running service without any build ever having put the two sides together: the first is a
+# string swapped under a deployment, the second is a probe the released service performs on itself
+# in production. Now the version travels as the VERSION OF A JAR — `eu.wohlben.qits:
+# qits-ci-daemon-protocol`, published by the second step below at the same version as the binary the
+# first step publishes, carrying the wire contract qits-ci already speaks plus the constant that
+# names that binary (CiDaemonBinary). qits-ci depends on it, so moving the daemon version is an
+# ordinary dependency bump on a branch: gated by qits-ci's own release request, proven before the
+# merge by an integration test that downloads and runs THIS binary at THAT version, and approved by
+# a person against the diff that ships it. A daemon that broke the protocol fails the consumer's
+# gate instead of a production container.
+#
+# THE TWO PUBLISHES ARE ONE RELEASE AND THEIR ORDER IS LOAD-BEARING: the jar is what tells qits-ci
+# which binary to fetch, so a resolvable jar whose binary is not yet in the `daemons` store is a pin
+# pointing at nothing. Binary first, jar second — see the second step's own note.
 event: SCMRelease
 when:
   - repository: { exact: qits-ci-daemon }
@@ -58,10 +70,20 @@ checkout:
   optional: true        # ...and then this run is main's head, exactly as it was before
 artifacts:
   - { type: daemon, name: qits-ci-daemon }
+  # THE PIN AND THE PROTOCOL, IN ONE JAR — the same artifact qits-workspace-daemon settled on, for
+  # the same reason. `ci-daemon-protocol` was already the wire contract both sides speak; what it
+  # gained is `CiDaemonBinary.VERSION`, filtered from `${project.version}` at build time, which
+  # means the jar's version IS the version of the binary published above it and cannot drift from
+  # it by an edit somebody forgot. qits-ci pins this coordinate in its pom and takes the daemon
+  # version from the constant, instead of reading `QITS_CI_DAEMON_VERSION` out of configuration —
+  # so the thing a consumer must pin and the thing it must speak arrive as one release, and one
+  # artifact cannot ship half of that pair. CiDaemonBinary's javadoc has the whole reasoning.
+  - { type: maven, name: "eu.wohlben.qits:qits-ci-daemon-protocol" }
 steps:
     # ci-base: buildctl for the build, git for the tag checkout, curl for the PUT and jq for the two
-    # JSON documents this step reads. Nothing needs node, and nothing needs maven on THIS side of
-    # the builder — the compile happens in the toolchain image, as a stage.
+    # JSON documents this step reads. Nothing needs node, and nothing in THIS step needs maven — the
+    # compile happens in the toolchain image, as a stage. (The jar step below does need one, which
+    # is exactly why it is a second step on a second image rather than more script down here.)
     #
     # `build: true`, AND NO SOCKET AT ALL. This step used to declare `docker: true` for a
     # hand-rolled builder container (build the image, create, cp the source in, start, cp the binary
@@ -233,3 +255,122 @@ steps:
       curl -fsS -X PUT -H 'Content-Type: application/vnd.cyclonedx+json' \
         --data-binary @out/sbom.json \
         "$sbom_base/daemon/qits-ci-daemon/-/$version"
+
+    # --- the pin-and-protocol jar -----------------------------------------------------------------
+    # A SECOND STEP, AND A DIFFERENT IMAGE, because this one needs maven and the one above needs
+    # buildctl. `ci-base` carries neither a JDK nor a maven, on purpose — the whole native compile
+    # happens inside the toolchain image as a build stage — so there is nowhere in that step to run
+    # a deploy from, and adding maven to it would put a toolchain in a container whose job is to
+    # drive a builder.
+    #
+    # IT IS DELIBERATELY AFTER THE BINARY PUBLISH. The jar is what tells qits-ci which binary to
+    # fetch, so a jar that resolves before its binary is in the `daemons` store is a pin pointing at
+    # nothing — briefly, but a release is exactly the moment somebody is watching. The reverse
+    # ordering is the safe one: a binary nobody has been told about yet is just bytes.
+    #
+    # It compiles the protocol module alone, which is dependency-free apart from junit, so this step
+    # is seconds and shares nothing with the native compile above. Half an hour is the resolve of a
+    # cold ~/.m2 plus the two curls, with room to spare.
+  - image: qits/build-images/maven-base:latest
+    timeout-seconds: 1800
+    script: |
+      set -eu
+      version=$(printf '%s' "$QITS_EVENT_PAYLOAD" | jq -er .version)
+      # The same CalVer guard the step above applies, and for a second reason on top of its own:
+      # this version becomes a maven version and two URL path segments, so a value carrying `/` or
+      # `:` would deploy under a coordinate nobody can resolve and PUT a document somewhere else
+      # entirely.
+      case "$version" in
+        ''|*[!0-9.]*) echo "SCMRelease carries no valid CalVer" >&2; exit 1 ;;
+      esac
+
+      # THE TAG, for the reason the step above takes it: an event-triggered run is cloned at main's
+      # head, which is where the release commit is *now*, and a later push moves that while the tag
+      # does not. Here it decides the artifact's identity outright — `${project.version}` of the
+      # released tree is what maven stamps on the jar AND what resource filtering writes into
+      # CiDaemonBinary.VERSION, so building main would publish the wrong version under the right
+      # name and name a binary that was never published.
+      git fetch "$QITS_CI_REPOSITORY_URL" "refs/tags/$version:refs/tags/$version"
+      git checkout --detach "$version"
+
+      # A published version is never republished, and re-running a deploy of the same bytes is a
+      # no-op rather than a lie — so this step SKIPS an already-published version where the binary
+      # PUT above fails hard on one. That is the maven and npm release rule, not a weakening of the
+      # rule above: the daemon store's 409 is what makes a binary version immutable, and maven's own
+      # repository is what makes a jar version immutable.
+      #
+      # BOTH POMS, AND THE `&&` IS THE POINT. The jar alone is not a resolvable artifact: a consumer
+      # reading its descriptor must also read the parent this module declares, and qits-workspace-
+      # daemon's 2026.916.172630 shipped exactly that half-publish — a jar in the registry that
+      # every consumer answered "Could not find artifact eu.wohlben:qits:pom" for. Checking one of
+      # the two would let such a half publish look complete on a re-run and never heal.
+      #
+      # The two paths look nested and are not: `eu/wohlben/qits/` is the parent artifact's own
+      # directory (groupId `eu.wohlben`, artifactId `qits`) and also the group directory of every
+      # `eu.wohlben.qits:*` jar. The version segment under it disambiguates them.
+      if curl -fsS -o /dev/null \
+        "$QITS_MAVEN_REGISTRY_URL/eu/wohlben/qits/qits-ci-daemon-protocol/$version/qits-ci-daemon-protocol-$version.pom" \
+        && curl -fsS -o /dev/null \
+          "$QITS_MAVEN_REGISTRY_URL/eu/wohlben/qits/$version/qits-$version.pom"; then
+        echo "qits-ci-daemon-protocol $version and its parent are already published — skipping"
+        exit 0
+      fi
+
+      # THE THREE VARIABLES ARE THE SETTINGS FILE'S INPUT, AND THEY ARE `export`ed RATHER THAN
+      # PREFIXED. `.qits-maven-settings.xml` reads all three out of the environment: the central
+      # pull-through profile activates only while QITS_MAVEN_CENTRAL_URL is non-empty, and the two
+      # AUTH values are what its server entries present on the mirror's 401. A `VAR=value \`
+      # continuation prefix would work too — until somebody puts a comment line inside the
+      # continuation, which terminates the command and leaves the `./mvnw` below running without
+      # any of them, resolving anonymously against stock Central. `export` cannot be broken that
+      # way and covers both invocations below.
+      #
+      # `-` rather than `:-` under set -u: a deployment that commissions nothing sends no pair at
+      # all, and that has to stay an anonymous resolve — the state every hand build is in — rather
+      # than a step that dies on an unset variable.
+      export QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}"
+      export QITS_MAVEN_AUTH_USR="${QITS_COMMISSIONED_CLIENT_ID-}"
+      export QITS_MAVEN_AUTH_PSW="${QITS_COMMISSIONED_CLIENT_SECRET-}"
+
+      # `-am` IS LOAD-BEARING AND IT IS THE PARENT POM. `ci-daemon-protocol` declares
+      # `<parent>eu.wohlben:qits:<version></parent>`, and `-pl` alone deploys the jar and not that
+      # parent — an artifact whose descriptor nobody can read ("Failed to read artifact descriptor
+      # … Could not find artifact eu.wohlben:qits:pom"), which is how qits-workspace-daemon shipped
+      # a coordinate that resolved for nobody. The module depends on nothing else in this reactor,
+      # so `-am` adds exactly one thing: the aggregator, which is what a parent is for. It does NOT
+      # drag in `ci-daemon` — that module depends on this one, not the other way round, so the
+      # native compile is not in this step's reactor at all.
+      #
+      # -Dqits.maven.repository.url is the sibling's line verbatim and is inert in this reactor
+      # today: the root pom here declares no `qits-maven` repository, so nothing reads the property
+      # and the resolve goes through the Central pull-through above. It stays because the day this
+      # reactor grows a platform-hosted dependency it has to already be here, and because the two
+      # repositories' deploy lines are read against each other.
+      ./mvnw -B -ntp -s .qits-maven-settings.xml -pl ci-daemon-protocol -am deploy -DskipTests \
+        -Dqits.maven.repository.url="$QITS_MAVEN_REGISTRY_URL" \
+        -DaltDeploymentRepository="qits::default::$QITS_MAVEN_REGISTRY_URL"
+
+      # Its own document, under its own coordinate — the closure of THIS jar, which is junit-free at
+      # runtime and therefore nearly empty. That is the point: a consumer auditing what it pulled in
+      # by pinning the daemon version should see that it pulled in nothing. The binary's document is
+      # a different closure and went up under `daemon/qits-ci-daemon` in the step above.
+      #
+      # AFTER THE DEPLOY AND BEFORE THIS STEP EXITS GREEN, which is the platform's ordering rule:
+      # qits-ci announces `SoftwareRelease` only for a green run, so no consumer is ever told about
+      # a version whose bill of materials is missing, and a store that is down fails the release ON
+      # PURPOSE rather than announcing a version nobody can audit.
+      ./mvnw -B -ntp -s .qits-maven-settings.xml -pl ci-daemon-protocol -DskipTests \
+        -Dqits.maven.repository.url="$QITS_MAVEN_REGISTRY_URL" \
+        org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeBom \
+        -DoutputFormat=json -DoutputName=sbom -DschemaVersion=1.6
+      # The SBOM store is a sibling path of the maven registry inside the qits-artifacts deployment,
+      # so its root is DERIVED from the injected maven URL rather than spelled — no repository
+      # states a deployment's addresses, and $QITS_REGISTRY is the opposite reading of "reachable
+      # from where" (the host daemon's view, which answers curl from in here with an instant
+      # refusal). The path names the DECLARED artifact identity verbatim: `artifacts:` above says
+      # `{type: maven, name: "eu.wohlben.qits:qits-ci-daemon-protocol"}`, and
+      # (packageType, packageName, version) is how the SoftwareRelease consumer will ask for it.
+      sbom_base="${QITS_MAVEN_REGISTRY_URL%%/artifacts/*}/artifacts/sboms"
+      curl -fsS -X PUT -H 'Content-Type: application/vnd.cyclonedx+json' \
+        --data-binary @ci-daemon-protocol/target/sbom.json \
+        "$sbom_base/maven/eu.wohlben.qits:qits-ci-daemon-protocol/-/$version"

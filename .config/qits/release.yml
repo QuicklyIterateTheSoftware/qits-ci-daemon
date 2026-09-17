@@ -1,0 +1,151 @@
+archetype: daemon
+artifacts:
+  - { type: daemon, name: qits-ci-daemon, sbom: out/sbom.json }
+  # THE PIN AND THE PROTOCOL, IN ONE JAR — the same artifact qits-workspace-daemon settled on, for
+  # the same reason. `ci-daemon-protocol` was already the wire contract both sides speak; what it
+  # gained is `CiDaemonBinary.VERSION`, filtered from `${project.version}` at build time, so the
+  # jar's version IS the version of the binary published beside it and cannot drift from it by an
+  # edit somebody forgot. qits-ci pins this coordinate in its pom and takes the daemon version from
+  # the constant. CiDaemonBinary's javadoc carries the whole reasoning.
+  #
+  # AND IT CARRIES NO `sbom:`, WHICH IS NOT THE DOCUMENT GOING MISSING. The composed postlude runs
+  # in ONE step — the last one that builds — and a step container shares nothing with the next: the
+  # jar's document is written by `makeBom` in the maven step below, which is not that step and whose
+  # files the builder step has never seen. So the jar submits its own document, through the same
+  # `qits` CLI and the same policy the postlude would have used, from the container that produced
+  # it. An `sbom:` here would make the builder step submit a path that does not exist in it.
+  - { type: maven, name: "eu.wohlben.qits:qits-ci-daemon-protocol" }
+
+# THE QA HALF IS THIS REPOSITORY'S, AND THE ARCHETYPE'S HEADER SAYS SO. Two things live here that
+# a compile does not: the JVM suite, and a smoke probe that really STARTS A CONTAINER on the built
+# binary and asserts it refuses to run with no environment (exit 2). That probe needs a docker
+# socket, which is why this step keeps `docker: true` — the archetype's `build: true` gives a
+# builder and no socket.
+release-request:
+  - image: qits/build-images/maven-base:latest
+    timeout-seconds: 1800
+    script: |
+      export QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}"
+      ./mvnw -B -ntp -s .qits-maven-settings.xml verify
+
+  - image: qits/build-images/ci-base:latest
+    docker: true
+    timeout-seconds: 3600
+    script: |
+      maven_root="${QITS_MAVEN_REGISTRY_URL%/}"
+      musl_url=$(sed -n 's/^ARG MUSL_URL=//p' docker/Dockerfile.musl-builder)
+      zlib_url=$(sed -n 's/^ARG ZLIB_URL=//p' docker/Dockerfile.musl-builder)
+      : "${musl_url:?docker/Dockerfile.musl-builder declares no ARG MUSL_URL}"
+      : "${zlib_url:?docker/Dockerfile.musl-builder declares no ARG ZLIB_URL}"
+      musl_url="$maven_root${musl_url#*/artifacts/maven/maven}"
+      zlib_url="$maven_root${zlib_url#*/artifacts/maven/maven}"
+      builder="$QITS_BUILD_REGISTRY/$QITS_IMAGE_REPOSITORY/graalvmce-musl-builder:jdk-25"
+      buildctl build --frontend dockerfile.v0 \
+        --local context=docker --local dockerfile=docker \
+        --opt filename=Dockerfile.musl-builder \
+        --opt build-arg:MUSL_URL="$musl_url" \
+        --opt build-arg:ZLIB_URL="$zlib_url" \
+        --output "type=image,name=$builder,push=true"
+      # BYTE-IDENTICAL TO THE RELEASE SLOT'S EXPORT. Change one, change the other.
+      buildctl build --frontend dockerfile.v0 \
+        --local context=. --local dockerfile=docker \
+        --opt target=binary \
+        --opt build-arg:BUILDER_IMAGE="$builder" \
+        --opt build-arg:QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}" \
+        --output type=local,dest=out
+      # THE EXPORT STAYS IN out/ AND MUST NOT BE "SIMPLIFIED" TO /tmp/qits-ci-daemon: that path is
+      # the RUNNING daemon of this very step's container, and writing it is ETXTBSY.
+      probe=$(docker create alpine:3 /qits-ci-daemon)
+      docker cp out/qits-ci-daemon "$probe:/qits-ci-daemon"
+      docker start -a "$probe" || true
+      code=$(docker inspect -f '{{.State.ExitCode}}' "$probe")
+      docker rm "$probe" >/dev/null
+      [ "$code" = 2 ] || { echo "a daemon run with no environment exited $code, expected 2" >&2; exit 1; }
+      echo "qits-ci-daemon built: $(sha256sum out/qits-ci-daemon | cut -d' ' -f1)"
+
+# THE RELEASE HALF IS THIS REPOSITORY'S TOO, FOR ONE REASON THE ARCHETYPE DOES NOT COVER: two
+# artifacts of two kinds leave this tree, and `daemon` publishes the binary and nothing else. The
+# first step below IS the archetype's, verbatim apart from spelling the one name it would have read
+# back out of `artifacts:`; the second is the pin-and-protocol jar, which needs maven and therefore
+# a second image. It is deliberately AFTER the binary publish: the jar is what tells qits-ci which
+# binary to fetch, so a jar that resolves before its binary is in the store is a pin pointing at
+# nothing. The reverse ordering is the safe one — a binary nobody has been told about yet is just
+# bytes.
+release:
+  - image: qits/build-images/ci-base:latest
+    build: true
+    timeout-seconds: 3600
+    script: |
+      maven_root="${QITS_MAVEN_REGISTRY_URL%/}"
+      musl_url=$(sed -n 's/^ARG MUSL_URL=//p' docker/Dockerfile.musl-builder)
+      zlib_url=$(sed -n 's/^ARG ZLIB_URL=//p' docker/Dockerfile.musl-builder)
+      : "${musl_url:?docker/Dockerfile.musl-builder declares no ARG MUSL_URL}"
+      : "${zlib_url:?docker/Dockerfile.musl-builder declares no ARG ZLIB_URL}"
+      musl_url="$maven_root${musl_url#*/artifacts/maven/maven}"
+      zlib_url="$maven_root${zlib_url#*/artifacts/maven/maven}"
+      builder="$QITS_BUILD_REGISTRY/$QITS_IMAGE_REPOSITORY/graalvmce-musl-builder:jdk-25"
+      buildctl build --frontend dockerfile.v0 \
+        --local context=docker --local dockerfile=docker \
+        --opt filename=Dockerfile.musl-builder \
+        --opt build-arg:MUSL_URL="$musl_url" \
+        --opt build-arg:ZLIB_URL="$zlib_url" \
+        --output "type=image,name=$builder,push=true"
+      # THE QA PIPELINE'S BUILD, BYTE FOR BYTE.
+      buildctl build --frontend dockerfile.v0 \
+        --local context=. --local dockerfile=docker \
+        --opt target=binary \
+        --opt build-arg:BUILDER_IMAGE="$builder" \
+        --opt build-arg:QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}" \
+        --output type=local,dest=out
+      # THE DOCUMENT COMES OUT OF THE SAME BUILD AS THE BINARY, and it has to: the reactor and its
+      # resolved dependency tree exist only in there — this step's container carries no maven at
+      # all. Build args are byte-identical to the export above, which is what makes every layer a
+      # cache hit and this seconds rather than a second native compile.
+      #
+      # GENERATED, NEVER SUBMITTED — the postlude PUTs it for the artifact that declares it.
+      buildctl build --frontend dockerfile.v0 \
+        --local context=. --local dockerfile=docker \
+        --opt target=sbom \
+        --opt build-arg:BUILDER_IMAGE="$builder" \
+        --opt build-arg:QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}" \
+        --output type=local,dest=out
+      # The export loses the mode bit, so the chmod is not optional: a static binary that cannot be
+      # executed is a green build that publishes nothing runnable.
+      chmod +x out/qits-ci-daemon
+      qits-publish daemon submit \
+        --name qits-ci-daemon --version "$QITS_VERSION" --file out/qits-ci-daemon
+
+  - image: qits/build-images/maven-base:latest
+    timeout-seconds: 1800
+    script: |
+      # ALREADY PUBLISHED IS A SKIP, NOT A FAILURE, and the parent is checked beside the child: a
+      # `-am` deploy writes both, and a run that resolved only one of them has published half a
+      # coordinate. Re-running a maven deploy is a no-op; re-running it against an occupied
+      # coordinate is not, so the guard stays.
+      if curl -fsS -o /dev/null \
+        "$QITS_MAVEN_REGISTRY_URL/eu/wohlben/qits/qits-ci-daemon-protocol/$QITS_VERSION/qits-ci-daemon-protocol-$QITS_VERSION.pom" \
+        && curl -fsS -o /dev/null \
+          "$QITS_MAVEN_REGISTRY_URL/eu/wohlben/qits/$QITS_VERSION/qits-$QITS_VERSION.pom"; then
+        echo "qits-ci-daemon-protocol $QITS_VERSION and its parent are already published — skipping"
+        exit 0
+      fi
+      # THE REACTOR ROOT RIDES ALONG ON `-am` AND IS DELIBERATELY NOT DECLARED: a `pom` parent
+      # carries no bytes worth an SBOM, and it has to be deployed or the child coordinate resolves
+      # to nothing.
+      QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}" \
+      QITS_MAVEN_AUTH_USR="${QITS_COMMISSIONED_CLIENT_ID-}" \
+      QITS_MAVEN_AUTH_PSW="${QITS_COMMISSIONED_CLIENT_SECRET-}" \
+      ./mvnw -B -ntp -s .qits-maven-settings.xml -pl ci-daemon-protocol -am deploy -DskipTests \
+        -Dqits.maven.repository.url="$QITS_MAVEN_REGISTRY_URL" \
+        -DaltDeploymentRepository="qits::default::$QITS_MAVEN_REGISTRY_URL"
+      QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}" \
+      ./mvnw -B -ntp -s .qits-maven-settings.xml -pl ci-daemon-protocol -DskipTests \
+        -Dqits.maven.repository.url="$QITS_MAVEN_REGISTRY_URL" \
+        org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeBom \
+        -DoutputFormat=json -DoutputName=sbom -DschemaVersion=1.6
+      # SUBMITTED HERE BECAUSE THE POSTLUDE CANNOT REACH IT — see the artifact's comment above. The
+      # CLI is on this step's PATH like any release step's, and its idempotency policy is the one
+      # the postlude runs, so a re-fired release resubmitting identical bytes is still green.
+      qits artifacts publish sbom submit \
+        --type maven --name "eu.wohlben.qits:qits-ci-daemon-protocol" \
+        --version "$QITS_VERSION" --file ci-daemon-protocol/target/sbom.json

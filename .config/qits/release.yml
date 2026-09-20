@@ -132,12 +132,78 @@ release:
       # THE REACTOR ROOT RIDES ALONG ON `-am` AND IS DELIBERATELY NOT DECLARED: a `pom` parent
       # carries no bytes worth an SBOM, and it has to be deployed or the child coordinate resolves
       # to nothing.
+      # THE PUBLISH CREDENTIAL, AND IT IS AN HTTP HEADER RATHER THAN A USER/PASSWORD. The deployment
+      # repository id is `qits` — what -DaltDeploymentRepository names — and no settings file on this
+      # estate declares a <server> with that id. Maven does not authenticate preemptively either, so
+      # a <username>/<password> pair would never be sent; the credential has to arrive as an
+      # Authorization header, which is what the generated -gs settings below carry.
+      #
+      # MINTED HERE rather than read from the $QITS_PUBLISH_TOKEN qits-ci also injects: that one is
+      # minted when the container starts, and the mint's TTL and this step's timeout are the same
+      # number (3600s) with a whole build in between.
+      #
+      # THE HTTP BLOCKER IS RE-DECLARED because `-gs` REPLACES Maven's own conf/settings.xml, and
+      # `maven-default-http-blocker` is the only live element in it. Leaving it out would silently
+      # drop the blocker for the whole deploy — a loosening nobody asked for.
+      #
+      # THE FILE HOLDS A BEARER, so: `umask 077`, never `cat`ed, and removed after the deploy. Do
+      # not add `-X` to these commands for the same reason — Maven's debug log prints the effective
+      # settings, token and all. A minted token is base64url and dots, so nothing in it needs XML
+      # escaping.
+      #
+      # AND IT DEGRADES TO ANONYMOUS — this script is read at main and runs against a tag on whatever
+      # qits-ci is deployed, so an absent command or a failed mint leaves the deploy byte-for-byte
+      # the one that worked yesterday rather than sending an empty bearer or aborting the step.
+      deploy_settings=""
+      deploy_token=""
+      if [ -n "${QITS_PUBLISH_TOKEN_COMMAND:-}" ] \
+        && command -v "$QITS_PUBLISH_TOKEN_COMMAND" >/dev/null 2>&1; then
+        deploy_token=$("$QITS_PUBLISH_TOKEN_COMMAND" 2>/dev/null) || deploy_token=""
+      fi
+      #
+      # `printf` AND NOT A HEREDOC, which is a YAML constraint rather than a shell preference: this
+      # script is a block scalar, its indentation is set by its first line, and a heredoc body has
+      # to sit at the emitted column zero — which is BELOW that indent and silently ends the
+      # scalar. Measured: the parser stops at `<settings` and the recipe no longer loads. Quoted
+      # printf arguments can be indented with the code around them.
+      if [ -n "$deploy_token" ]; then
+        ( umask 077
+          printf '%s\n' \
+            '<settings xmlns="http://maven.apache.org/SETTINGS/1.2.0">' \
+            '  <servers>' \
+            '    <server>' \
+            '      <id>qits</id>' \
+            '      <configuration>' \
+            '        <httpHeaders>' \
+            '          <property>' \
+            '            <name>Authorization</name>' \
+            "            <value>Bearer $deploy_token</value>" \
+            '          </property>' \
+            '        </httpHeaders>' \
+            '      </configuration>' \
+            '    </server>' \
+            '  </servers>' \
+            '  <mirrors>' \
+            '    <mirror>' \
+            '      <id>maven-default-http-blocker</id>' \
+            '      <mirrorOf>external:http:*</mirrorOf>' \
+            '      <url>http://0.0.0.0/</url>' \
+            '      <blocked>true</blocked>' \
+            '    </mirror>' \
+            '  </mirrors>' \
+            '</settings>' > /tmp/qits-deploy-settings.xml )
+        deploy_settings="-gs /tmp/qits-deploy-settings.xml"
+      fi
       QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}" \
       QITS_MAVEN_AUTH_USR="${QITS_COMMISSIONED_CLIENT_ID-}" \
       QITS_MAVEN_AUTH_PSW="${QITS_COMMISSIONED_CLIENT_SECRET-}" \
-      ./mvnw -B -ntp -s .qits-maven-settings.xml -pl ci-daemon-protocol -am deploy -DskipTests \
+      ./mvnw -B -ntp -s .qits-maven-settings.xml $deploy_settings -pl ci-daemon-protocol -am deploy -DskipTests \
         -Dqits.maven.repository.url="$QITS_MAVEN_REGISTRY_URL" \
         -DaltDeploymentRepository="qits::default::$QITS_MAVEN_REGISTRY_URL"
+      # The bearer stops existing the moment it stops being needed. Hygiene rather than a
+      # guarantee: a failed deploy aborts under the composer's `set -e` and leaves the file, and
+      # the step container is destroyed either way. The makeBom that follows publishes nothing.
+      rm -f /tmp/qits-deploy-settings.xml
       QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}" \
       ./mvnw -B -ntp -s .qits-maven-settings.xml -pl ci-daemon-protocol -DskipTests \
         -Dqits.maven.repository.url="$QITS_MAVEN_REGISTRY_URL" \

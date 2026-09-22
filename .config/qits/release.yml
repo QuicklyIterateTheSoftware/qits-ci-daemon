@@ -151,6 +151,24 @@ release:
       # settings, token and all. A minted token is base64url and dots, so nothing in it needs XML
       # escaping.
       #
+      # THE PATH IS THIS RECIPE'S OWN, AND THAT IS THE FIX FOR A LIVE FAILURE. qits-ci's container
+      # bootstrap (CiDaemonLauncher.BOOTSTRAP) writes /tmp/qits-deploy-settings.xml when the step
+      # container starts and APPENDS `-gs /tmp/qits-deploy-settings.xml` to MAVEN_ARGS, which every
+      # maven in the step then inherits. This step used to write that very path and then `rm -f` it
+      # after the deploy — deleting the platform's file — so the makeBom below started with
+      # MAVEN_ARGS still naming a file that was gone and died on:
+      #
+      #     The specified global settings file does not exist: /tmp/qits-deploy-settings.xml
+      #
+      # Every release on this recipe hit it. The collision goes away by writing somewhere the
+      # platform does not own.
+      #
+      # MAVEN_ARGS BEATS THE COMMAND LINE — measured on 3.9.12, and said so in CiDaemonLauncher — so
+      # on a current qits-ci this `-gs` is inert and the ambient file is what the deploy uses. It
+      # stays anyway: this file is read at main and runs against a tag on whatever qits-ci the
+      # estate is deployed with, and on one that injects nothing this is the deploy's only
+      # credential.
+      #
       # AND IT DEGRADES TO ANONYMOUS — this script is read at main and runs against a tag on whatever
       # qits-ci is deployed, so an absent command or a failed mint leaves the deploy byte-for-byte
       # the one that worked yesterday rather than sending an empty bearer or aborting the step.
@@ -191,8 +209,8 @@ release:
             '      <blocked>true</blocked>' \
             '    </mirror>' \
             '  </mirrors>' \
-            '</settings>' > /tmp/qits-deploy-settings.xml )
-        deploy_settings="-gs /tmp/qits-deploy-settings.xml"
+            '</settings>' > /tmp/qits-recipe-deploy-settings.xml )
+        deploy_settings="-gs /tmp/qits-recipe-deploy-settings.xml"
       fi
       QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}" \
       QITS_MAVEN_AUTH_USR="${QITS_COMMISSIONED_CLIENT_ID-}" \
@@ -203,7 +221,11 @@ release:
       # The bearer stops existing the moment it stops being needed. Hygiene rather than a
       # guarantee: a failed deploy aborts under the composer's `set -e` and leaves the file, and
       # the step container is destroyed either way. The makeBom that follows publishes nothing.
-      rm -f /tmp/qits-deploy-settings.xml
+      #
+      # ONLY THIS RECIPE'S OWN FILE. The platform's /tmp/qits-deploy-settings.xml is named by an
+      # exported MAVEN_ARGS for the whole step, so removing it here removes the makeBom's own
+      # settings file out from under it — see the block above.
+      rm -f /tmp/qits-recipe-deploy-settings.xml
       QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}" \
       ./mvnw -B -ntp -s .qits-maven-settings.xml -pl ci-daemon-protocol -DskipTests \
         -Dqits.maven.repository.url="$QITS_MAVEN_REGISTRY_URL" \

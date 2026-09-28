@@ -22,8 +22,11 @@ import eu.wohlben.qits.cidaemon.protocol.StepFinished;
 import io.vertx.core.MultiMap;
 import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpServer;
+import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.http.ServerWebSocket;
 import io.vertx.core.json.JsonObject;
+import io.vertx.core.net.PfxOptions;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -77,8 +80,98 @@ class DaemonMainTest {
     assertEquals("/ci/daemon", host.requestPath);
     assertEquals("daemon-1", host.headers.get(ControlSocket.HEADER_ID));
     assertEquals("s3cret", host.headers.get(ControlSocket.HEADER_SECRET));
-    assertEquals("qits-ci-daemon", host.headers.get("X-Qits-User"));
-    assertEquals("qits:system", host.headers.get("X-Qits-Roles"));
+    assertEquals("qits-ci-daemon", host.headers.get(ControlSocket.HEADER_USER));
+    assertEquals("qits:system", host.headers.get(ControlSocket.HEADER_ROLES));
+    // Without a token the INTERNAL handshake is exactly what it always was: no bearer at all, not
+    // an empty one.
+    assertNull(host.headers.get(ControlSocket.HEADER_AUTHORIZATION));
+  }
+
+  @Test
+  void aRunTokenIsPresentedAsABearerAndReplacesTheAssertedIdentityButNotTheSecondFactor()
+      throws Exception {
+    Host host = host((h, message) -> h.reply(message));
+
+    int code = runDaemon(tokenEnv(host.url("/ci/daemon")), 30).get(30, TimeUnit.SECONDS);
+
+    assertEquals(ExitCode.OK, code);
+    assertEquals("Bearer run-t0ken", host.headers.get(ControlSocket.HEADER_AUTHORIZATION));
+    // The edge strips asserted identity on every inbound request; a daemon that still sent it would
+    // be presenting exactly the claim the token exists to replace.
+    assertFalse(host.headers.contains(ControlSocket.HEADER_USER));
+    assertFalse(host.headers.contains(ControlSocket.HEADER_ROLES));
+    // The id and secret bind the connection to this container; the token binds it to the run.
+    // Both factors, in both modes.
+    assertEquals("daemon-1", host.headers.get(ControlSocket.HEADER_ID));
+    assertEquals("s3cret", host.headers.get(ControlSocket.HEADER_SECRET));
+    // The subject is for the daemon's own log line and is never announced.
+    assertFalse(host.headers.entries().toString().contains("run:42"));
+  }
+
+  @Test
+  void aBlankTokenIsNoTokenAndKeepsTheInternalHandshake() throws Exception {
+    Host host = host((h, message) -> h.reply(message));
+    DaemonEnv env =
+        new DaemonEnv(
+            host.url("/ci/daemon"),
+            "daemon-1",
+            "s3cret",
+            "file:///origin",
+            "main",
+            "0123456789abcdef",
+            "  ",
+            "");
+
+    int code = runDaemon(env, 30).get(30, TimeUnit.SECONDS);
+
+    assertEquals(ExitCode.OK, code);
+    assertNull(host.headers.get(ControlSocket.HEADER_AUTHORIZATION));
+    assertEquals("qits:system", host.headers.get(ControlSocket.HEADER_ROLES));
+  }
+
+  @Test
+  void aWssUrlIsDialledOverTlsAgainstTheDefaultTrustStore() throws Exception {
+    TestTls tls = TestTls.generate(workDir.resolve("tls"));
+    Host host = host((h, message) -> h.reply(message), tls);
+
+    int code;
+    String previous = System.getProperty("javax.net.ssl.trustStore");
+    // The default trust store and not a trust option on the client: that is the path the native
+    // binary takes with its embedded cacerts, and pointing the JDK's default at the stub's root is
+    // the only way to walk it with a certificate no public root signed.
+    System.setProperty("javax.net.ssl.trustStore", tls.trustStore().toString());
+    System.setProperty("javax.net.ssl.trustStorePassword", TestTls.PASSWORD);
+    System.setProperty("javax.net.ssl.trustStoreType", "PKCS12");
+    try {
+      code = runDaemon(tokenEnv(host.tlsUrl("/ci/daemon")), 5_000).get(30, TimeUnit.SECONDS);
+    } finally {
+      if (previous == null) {
+        System.clearProperty("javax.net.ssl.trustStore");
+      } else {
+        System.setProperty("javax.net.ssl.trustStore", previous);
+      }
+      System.clearProperty("javax.net.ssl.trustStorePassword");
+      System.clearProperty("javax.net.ssl.trustStoreType");
+    }
+
+    assertEquals(ExitCode.OK, code);
+    assertEquals("/ci/daemon", host.requestPath);
+    assertEquals("Bearer run-t0ken", host.headers.get(ControlSocket.HEADER_AUTHORIZATION));
+    assertNotNull(host.first(Hello.class));
+  }
+
+  @Test
+  void aWssHostWhoseCertificateIsNotTrustedIsADialFailureRatherThanAnUnverifiedConnection()
+      throws Exception {
+    TestTls tls = TestTls.generate(workDir.resolve("tls"));
+    Host host = host((h, message) -> h.reply(message), tls);
+
+    // No trust store pointed at the stub: the JDK's own roots, which never signed it. A client that
+    // quietly trusted everything would register here, and hand its bearer to whoever answered.
+    int code = runDaemon(tokenEnv(host.tlsUrl("/ci/daemon")), 400).get(30, TimeUnit.SECONDS);
+
+    assertEquals(ExitCode.DIAL_FAILED, code);
+    assertNull(host.headers);
   }
 
   @Test
@@ -341,8 +434,22 @@ class DaemonMainTest {
       DaemonMain.Initializer initializer,
       long dialBudgetMillis,
       long heartbeatMillis) {
-    DaemonEnv env =
-        new DaemonEnv(url, "daemon-1", "s3cret", "file:///origin", "main", "0123456789abcdef");
+    return runDaemon(
+        new DaemonEnv(url, "daemon-1", "s3cret", "file:///origin", "main", "0123456789abcdef"),
+        initializer,
+        dialBudgetMillis,
+        heartbeatMillis);
+  }
+
+  private CompletableFuture<Integer> runDaemon(DaemonEnv env, long dialBudgetMillis) {
+    return runDaemon(env, ready(), dialBudgetMillis, 10_000);
+  }
+
+  private CompletableFuture<Integer> runDaemon(
+      DaemonEnv env,
+      DaemonMain.Initializer initializer,
+      long dialBudgetMillis,
+      long heartbeatMillis) {
     DaemonMain daemon =
         new DaemonMain(
             vertx,
@@ -353,10 +460,67 @@ class DaemonMainTest {
     return CompletableFuture.supplyAsync(daemon::run);
   }
 
+  /** The EDGE plane's environment: the INTERNAL one plus the run's token. */
+  private static DaemonEnv tokenEnv(String url) {
+    return new DaemonEnv(
+        url,
+        "daemon-1",
+        "s3cret",
+        "file:///origin",
+        "main",
+        "0123456789abcdef",
+        "run-t0ken",
+        "run:42");
+  }
+
   private Host host(BiConsumer<Host, CiDaemonMessage> script) throws Exception {
-    Host host = new Host(script);
+    return host(script, null);
+  }
+
+  private Host host(BiConsumer<Host, CiDaemonMessage> script, TestTls tls) throws Exception {
+    Host host = new Host(script, tls);
     hosts.add(host);
     return host;
+  }
+
+  /**
+   * A self-signed certificate for 127.0.0.1 and a trust store holding it, minted by the JDK's own
+   * {@code keytool} into a temp directory. A real process rather than a committed fixture: nothing
+   * key-shaped lives in the tree, nothing expires under the suite, and no certificate library joins
+   * the test classpath.
+   */
+  private record TestTls(Path keyStore, Path trustStore) {
+
+    static final String PASSWORD = "changeit";
+
+    static TestTls generate(Path dir) throws Exception {
+      Files.createDirectories(dir);
+      Path keyStore = dir.resolve("host.p12");
+      Path cert = dir.resolve("host.crt");
+      Path trustStore = dir.resolve("trust.p12");
+      keytool(
+          "-genkeypair", "-alias", "host", "-keyalg", "EC", "-groupname", "secp256r1",
+          "-dname", "CN=127.0.0.1", "-ext", "SAN=ip:127.0.0.1,dns:localhost",
+          "-validity", "2", "-storetype", "PKCS12", "-keystore", keyStore.toString(),
+          "-storepass", PASSWORD, "-keypass", PASSWORD);
+      keytool(
+          "-exportcert", "-rfc", "-alias", "host", "-keystore", keyStore.toString(),
+          "-storepass", PASSWORD, "-file", cert.toString());
+      keytool(
+          "-importcert", "-noprompt", "-alias", "host", "-file", cert.toString(),
+          "-storetype", "PKCS12", "-keystore", trustStore.toString(), "-storepass", PASSWORD);
+      return new TestTls(keyStore, trustStore);
+    }
+
+    private static void keytool(String... args) throws Exception {
+      List<String> command = new ArrayList<>();
+      command.add(Path.of(System.getProperty("java.home"), "bin", "keytool").toString());
+      command.addAll(List.of(args));
+      Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
+      String output = new String(process.getInputStream().readAllBytes());
+      assertTrue(process.waitFor(60, TimeUnit.SECONDS), "keytool hung");
+      assertEquals(0, process.exitValue(), () -> "keytool " + args[0] + ": " + output);
+    }
   }
 
   /** qits-ci's side of the socket: a real server, with its half of the conversation scripted. */
@@ -374,11 +538,18 @@ class DaemonMainTest {
     /** Completes when the daemon's socket closes; see {@link #awaitDrained()}. */
     private final CompletableFuture<Void> closed = new CompletableFuture<>();
 
-    Host(BiConsumer<Host, CiDaemonMessage> script) throws Exception {
+    Host(BiConsumer<Host, CiDaemonMessage> script, TestTls tls) throws Exception {
       this.script = script;
+      HttpServerOptions options = new HttpServerOptions();
+      if (tls != null) {
+        options
+            .setSsl(true)
+            .setKeyCertOptions(
+                new PfxOptions().setPath(tls.keyStore().toString()).setPassword(TestTls.PASSWORD));
+      }
       this.server =
           vertx
-              .createHttpServer()
+              .createHttpServer(options)
               .webSocketHandler(this::onUpgrade)
               .listen(0)
               .toCompletionStage()
@@ -430,6 +601,10 @@ class DaemonMainTest {
 
     String url(String path) {
       return "ws://127.0.0.1:" + server.actualPort() + path;
+    }
+
+    String tlsUrl(String path) {
+      return "wss://127.0.0.1:" + server.actualPort() + path;
     }
 
     <T extends CiDaemonMessage> T first(Class<T> type) {

@@ -30,6 +30,21 @@ import org.jboss.logging.Logger;
  * validates both against its in-memory launch record before it reads anything, and closes 1008 on a
  * mismatch. The workspace control socket identifies its caller by a path parameter, which is its
  * known impersonation bug; this does not reproduce it.
+ *
+ * <p><b>Two handshakes, chosen by whether the run handed this container a token.</b> Without one —
+ * the INTERNAL plane, a step container on {@code qits-net} — the daemon asserts {@code X-Qits-User}
+ * and {@code X-Qits-Roles} as it always has. With one — the EDGE plane, a step on a remote runner —
+ * it sends {@code Authorization: Bearer $QITS_TOKEN} and <em>neither</em> assertion: the edge strips
+ * asserted identity on every inbound request, and a daemon that sent both would be presenting a
+ * claim the edge exists to refuse. The id and secret travel in both modes; they are the second
+ * factor that binds the connection to one container, where the token binds it to one run.
+ *
+ * <p>A {@code wss://} url is dialled over TLS against the default trust store, and that is a
+ * deliberate absence of options rather than an oversight. There is no trust option to set because
+ * the step image is arbitrary — its {@code /etc/ssl} may be empty, stale or absent — so the
+ * roots have to be the binary's own. In the native image they are the build JDK's {@code cacerts},
+ * which GraalVM embeds in the image heap at build time; {@code quarkus.ssl.native} in {@code
+ * application.properties} is what keeps Quarkus from substituting a disabled {@code SSLContext}.
  */
 public final class ControlSocket {
 
@@ -39,6 +54,14 @@ public final class ControlSocket {
   static final String HEADER_ID = "X-Qits-Ci-Daemon-Id";
 
   static final String HEADER_SECRET = "X-Qits-Ci-Daemon-Secret";
+
+  /** The INTERNAL plane's asserted identity, sent only when there is no token. */
+  static final String HEADER_USER = "X-Qits-User";
+
+  static final String HEADER_ROLES = "X-Qits-Roles";
+
+  /** The EDGE plane's credential: the run's own token, sent only when there is one. */
+  static final String HEADER_AUTHORIZATION = "Authorization";
 
   /**
    * What the socket tells its owner. Deliberately four events and not a message stream: three of
@@ -75,6 +98,7 @@ public final class ControlSocket {
   private final String url;
   private final String daemonId;
   private final String daemonSecret;
+  private final String token;
   private final Settings settings;
   private final Listener listener;
 
@@ -89,12 +113,14 @@ public final class ControlSocket {
       String url,
       String daemonId,
       String daemonSecret,
+      String token,
       Settings settings,
       Listener listener) {
     this.vertx = vertx;
     this.url = url;
     this.daemonId = daemonId;
     this.daemonSecret = daemonSecret;
+    this.token = token == null || token.isBlank() ? null : token;
     this.settings = settings;
     this.listener = listener;
   }
@@ -121,11 +147,14 @@ public final class ControlSocket {
       end(() -> listener.onDialFailed("malformed QITS_CI_DAEMON_URL '" + url + "'"));
       return;
     }
-    options
-        .addHeader("X-Qits-User", "qits-ci-daemon")
-        .addHeader("X-Qits-Roles", "qits:system")
-        .addHeader(HEADER_ID, daemonId)
-        .addHeader(HEADER_SECRET, daemonSecret);
+    if (token == null) {
+      options
+          .addHeader(HEADER_USER, "qits-ci-daemon")
+          .addHeader(HEADER_ROLES, "qits:system");
+    } else {
+      options.addHeader(HEADER_AUTHORIZATION, "Bearer " + token);
+    }
+    options.addHeader(HEADER_ID, daemonId).addHeader(HEADER_SECRET, daemonSecret);
     client
         .connect(options)
         .onSuccess(this::onConnected)

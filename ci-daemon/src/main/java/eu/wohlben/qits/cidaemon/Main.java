@@ -57,6 +57,14 @@ public class Main {
     @ConfigProperty(name = "qits.ci.sha")
     Optional<String> sha;
 
+    // Optional in the other sense too: absent is the INTERNAL plane and a satisfied contract, so
+    // DaemonEnv.missing() never names either of these. See DaemonEnv for what each one does.
+    @ConfigProperty(name = "qits.token")
+    Optional<String> token;
+
+    @ConfigProperty(name = "qits.token-subject")
+    Optional<String> tokenSubject;
+
     @ConfigProperty(name = "qits.ci.workspace-dir", defaultValue = "/workspace")
     String workspaceDir;
 
@@ -94,7 +102,9 @@ public class Main {
               daemonSecret.orElse(""),
               repositoryUrl.orElse(""),
               branch.orElse(""),
-              sha.orElse(""));
+              sha.orElse(""),
+              token.orElse(""),
+              tokenSubject.orElse(""));
       Path dir = Path.of(workspaceDir);
       Workspace workspace =
           new Workspace(

@@ -29,7 +29,9 @@ import java.util.function.Consumer;
  * {@code QITS_CI=true} and the repository coordinates. It also means the child can read {@code
  * QITS_CI_DAEMON_SECRET}. That is not a leak to plug here: the secret authorizes exactly "deliver
  * data about this run" and the step's own output is already the data it would deliver, so a script
- * that used it would be impersonating itself.
+ * that used it would be impersonating itself. {@code QITS_TOKEN}, where there is one, is inherited
+ * on purpose rather than tolerated: it is the run's own credential, and the clone and the step's
+ * maven, npm and registry calls are exactly what it was commissioned to open.
  *
  * <p><b>Chunking, and why it is not per line.</b> stdout and stderr are pumped as separate streams —
  * a step whose real output is on stderr must not be indistinguishable from one that failed silently

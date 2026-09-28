@@ -99,9 +99,33 @@ its own; it is handed everything before the socket exists:
 | `QITS_CI_REPOSITORY_URL`, `QITS_CI_BRANCH`, `QITS_CI_SHA` | What to clone and what to check out. |
 | `QITS_CI_REPO_ID`, `QITS_CI_PROJECT_ID`, `QITS_CI_REPO_NAME` | Which repository, in both coordinate systems: the storage id, and the public `(projectId, repoName)` pair a step's release call spells. The pair is empty — never absent — on an id-addressed run. Read by the step's script, not by the daemon. |
 | `CI`, `QITS_CI` | Both `true`, set for the step script's benefit rather than the daemon's. |
+| `QITS_TOKEN` | *Optional.* The run's own `ci-run` token, handed to a step on the EDGE plane. Present, it changes the handshake (below); absent or blank, the handshake is the INTERNAL one, byte for byte. |
+| `QITS_TOKEN_SUBJECT` | *Optional.* Names the token in one log line so a container can be matched to its run. Never sent. |
 
-Then, over one WebSocket dialled outbound with `X-Qits-Ci-Daemon-Id` and `X-Qits-Ci-Daemon-Secret` as
-handshake headers — **there is no inbound listener in the container at all, at any stage**:
+Then, over one WebSocket dialled outbound — **there is no inbound listener in the container at all,
+at any stage** — with its identity in the handshake headers:
+
+| Header | No token (INTERNAL plane) | `QITS_TOKEN` set (EDGE plane) |
+|---|---|---|
+| `X-Qits-Ci-Daemon-Id` | sent | sent |
+| `X-Qits-Ci-Daemon-Secret` | sent | sent |
+| `X-Qits-User: qits-ci-daemon` | sent | **not sent** |
+| `X-Qits-Roles: qits:system` | sent | **not sent** |
+| `Authorization: Bearer $QITS_TOKEN` | not sent | sent |
+
+The token is the run's own and opens exactly what the run may do — it is commissioned when the run
+is claimed and deleted when it closes, so it is not an identity the daemon asserts but a credential
+the edge validates. That is why the asserted pair goes: the edge strips it from every inbound
+request, and a daemon that kept sending it would be presenting the very claim the token replaces.
+The id and secret stay in both modes as the second factor, binding the connection to this container
+where the token binds it to the run.
+
+A `wss://` url is dialled over TLS against the binary's **own** trust store, never the step image's:
+the image is arbitrary and its `/etc/ssl` may be anything. In the native image that store is the
+build JDK's `cacerts`, which GraalVM embeds at build time, and `quarkus.ssl.native=true` in
+`application.properties` is what stops Quarkus substituting a disabled `SSLContext` — that file
+carries the reasoning. The edge's certificate therefore has to chain to a public root.
+
 
     dial → Hello → Ack → clone+checkout → Initialized → RunStep → StepChunk* → StepFinished → exit
 

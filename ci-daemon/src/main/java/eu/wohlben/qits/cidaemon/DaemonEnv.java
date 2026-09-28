@@ -48,13 +48,18 @@ public record DaemonEnv(
 
   /**
    * The first missing value, or {@code null} when the contract is satisfied. Checked before the
-   * dial: a container launched without its secret cannot register, and failing at startup with the
-   * name of the absent variable is the only diagnosis anyone gets — the host's own view of it is "a
-   * container that never registered".
+   * dial: a container launched without what its plane needs cannot register, and failing at startup
+   * with the name of the absent variable is the only diagnosis anyone gets — the host's own view of
+   * it is "a container that never registered".
    *
    * <p>Names the environment variable, not the config key, because that is what the launcher sets
    * and what a human reading {@code docker logs} can act on. The secret is reported as
    * <em>missing</em> and never echoed.
+   *
+   * <p>{@code QITS_CI_DAEMON_SECRET} is required only on the INTERNAL plane. An EDGE launch's
+   * container is never handed one — the run's token is what proves it to qits-ci, and the launch is
+   * named in the {@code Hello} instead (see {@link eu.wohlben.qits.cidaemon.ControlSocket}) — so its
+   * absence there is the ordinary shape and not a missing variable.
    */
   public String missing() {
     if (blank(daemonUrl)) {
@@ -63,7 +68,7 @@ public record DaemonEnv(
     if (blank(daemonId)) {
       return "QITS_CI_DAEMON_ID";
     }
-    if (blank(daemonSecret)) {
+    if (!hasToken() && blank(daemonSecret)) {
       return "QITS_CI_DAEMON_SECRET";
     }
     if (blank(repositoryUrl)) {

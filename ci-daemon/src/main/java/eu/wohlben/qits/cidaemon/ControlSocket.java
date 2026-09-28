@@ -26,18 +26,23 @@ import org.jboss.logging.Logger;
  * up, and a socket that closes after connecting is a terminal condition, because the only thing
  * behind this socket was one step's worth of conversation.
  *
- * <p>Identity travels as handshake headers, not in the path and not in the first frame. The host
- * validates both against its in-memory launch record before it reads anything, and closes 1008 on a
- * mismatch. The workspace control socket identifies its caller by a path parameter, which is its
- * known impersonation bug; this does not reproduce it.
+ * <p>Identity travels as handshake headers or, on one plane, in the first frame — never in the path.
+ * The workspace control socket identifies its caller by a path parameter, which is its known
+ * impersonation bug; this does not reproduce it.
  *
  * <p><b>Two handshakes, chosen by whether the run handed this container a token.</b> Without one —
  * the INTERNAL plane, a step container on {@code qits-net} — the daemon asserts {@code X-Qits-User}
- * and {@code X-Qits-Roles} as it always has. With one — the EDGE plane, a step on a remote runner —
- * it sends {@code Authorization: Bearer $QITS_TOKEN} and <em>neither</em> assertion: the edge strips
- * asserted identity on every inbound request, and a daemon that sent both would be presenting a
- * claim the edge exists to refuse. The id and secret travel in both modes; they are the second
- * factor that binds the connection to one container, where the token binds it to one run.
+ * and {@code X-Qits-Roles} as it always has, and presents its id and secret as {@code
+ * X-Qits-Ci-Daemon-Id}/{@code -Secret}; the host validates both against its in-memory launch record
+ * before it reads a frame and closes 1008 on a mismatch. With one — the EDGE plane, a step on a
+ * remote runner — it sends {@code Authorization: Bearer $QITS_TOKEN} and <em>nothing else</em>: no
+ * asserted identity (the edge strips it from every inbound request, and a daemon that sent it would
+ * be presenting a claim the edge exists to refuse) and no id or secret either, because the edge
+ * strips {@code X-Qits-*} headers of every shape and a header that never arrives authenticates
+ * nothing. The token already proves this container's run to qits-ci; what is left to say is only
+ * <em>which</em> launch of that run this is, and that travels in the first frame instead — the
+ * {@code Hello} every capability version already sends carries the launch id, and the host matches
+ * its launch record against the token's subject once that frame names it.
  *
  * <p>A {@code wss://} url is dialled over TLS against the default trust store, and that is a
  * deliberate absence of options rather than an oversight. There is no trust option to set because
@@ -150,11 +155,15 @@ public final class ControlSocket {
     if (token == null) {
       options
           .addHeader(HEADER_USER, "qits-ci-daemon")
-          .addHeader(HEADER_ROLES, "qits:system");
+          .addHeader(HEADER_ROLES, "qits:system")
+          .addHeader(HEADER_ID, daemonId)
+          .addHeader(HEADER_SECRET, daemonSecret);
     } else {
+      // No X-Qits-* header of any shape: qits-edge strips them all, so sending one here would only
+      // be a header this container mistakenly trusted to arrive. The token is the whole handshake;
+      // which launch this is travels in the Hello that follows instead.
       options.addHeader(HEADER_AUTHORIZATION, "Bearer " + token);
     }
-    options.addHeader(HEADER_ID, daemonId).addHeader(HEADER_SECRET, daemonSecret);
     client
         .connect(options)
         .onSuccess(this::onConnected)

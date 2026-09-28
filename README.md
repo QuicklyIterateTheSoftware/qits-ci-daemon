@@ -94,8 +94,8 @@ its own; it is handed everything before the socket exists:
 | Env | What |
 |---|---|
 | `QITS_CI_DAEMON_URL` | The control socket, dialled **verbatim**. |
-| `QITS_CI_DAEMON_ID` | The host-minted registration identity. |
-| `QITS_CI_DAEMON_SECRET` | The per-container secret, minted at launch and dead when the container is reaped. |
+| `QITS_CI_DAEMON_ID` | The host-minted registration identity — carried in the `Hello` that opens every conversation, on both planes. |
+| `QITS_CI_DAEMON_SECRET` | *Required on the INTERNAL plane only.* The per-container secret, minted at launch and dead when the container is reaped. Absent on the EDGE plane — see below. |
 | `QITS_CI_REPOSITORY_URL`, `QITS_CI_BRANCH`, `QITS_CI_SHA` | What to clone and what to check out. |
 | `QITS_CI_REPO_ID`, `QITS_CI_PROJECT_ID`, `QITS_CI_REPO_NAME` | Which repository, in both coordinate systems: the storage id, and the public `(projectId, repoName)` pair a step's release call spells. The pair is empty — never absent — on an id-addressed run. Read by the step's script, not by the daemon. |
 | `CI`, `QITS_CI` | Both `true`, set for the step script's benefit rather than the daemon's. |
@@ -103,12 +103,13 @@ its own; it is handed everything before the socket exists:
 | `QITS_TOKEN_SUBJECT` | *Optional.* Names the token in one log line so a container can be matched to its run. Never sent. |
 
 Then, over one WebSocket dialled outbound — **there is no inbound listener in the container at all,
-at any stage** — with its identity in the handshake headers:
+at any stage** — with its identity in the handshake headers, or, on the EDGE plane, in the first
+frame instead:
 
 | Header | No token (INTERNAL plane) | `QITS_TOKEN` set (EDGE plane) |
 |---|---|---|
-| `X-Qits-Ci-Daemon-Id` | sent | sent |
-| `X-Qits-Ci-Daemon-Secret` | sent | sent |
+| `X-Qits-Ci-Daemon-Id` | sent | **not sent** |
+| `X-Qits-Ci-Daemon-Secret` | sent | **not sent** |
 | `X-Qits-User: qits-ci-daemon` | sent | **not sent** |
 | `X-Qits-Roles: qits:system` | sent | **not sent** |
 | `Authorization: Bearer $QITS_TOKEN` | not sent | sent |
@@ -117,8 +118,16 @@ The token is the run's own and opens exactly what the run may do — it is commi
 is claimed and deleted when it closes, so it is not an identity the daemon asserts but a credential
 the edge validates. That is why the asserted pair goes: the edge strips it from every inbound
 request, and a daemon that kept sending it would be presenting the very claim the token replaces.
-The id and secret stay in both modes as the second factor, binding the connection to this container
-where the token binds it to the run.
+
+**The id and secret go too on the EDGE plane, and not merely because the edge would strip them.**
+qits-edge strips every inbound header carrying the reserved `X-Qits-` prefix, so a header dial on
+this plane would never arrive anyway — but the deeper reason is that the secret has nothing left to
+prove once the token is presented. The token is worth exactly one run; what remained to establish
+was only *which launch* of that run this container is, and a launch id is not a secret. So the
+`Hello` this daemon sends first — the same frame, the same `daemonId` field, on both planes — is
+what names the launch on the EDGE plane, and qits-ci matches it against the token's subject
+(`CiDaemonRegistry.admitByToken`) rather than against a header. On the INTERNAL plane nothing
+changed: the pair is still checked before a frame is read, exactly as it always was.
 
 A `wss://` url is dialled over TLS against the binary's **own** trust store, never the step image's:
 the image is arbitrary and its `/etc/ssl` may be anything. In the native image that store is the

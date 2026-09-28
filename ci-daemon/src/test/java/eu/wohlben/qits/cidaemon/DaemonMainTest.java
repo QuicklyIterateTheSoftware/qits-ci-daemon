@@ -88,8 +88,7 @@ class DaemonMainTest {
   }
 
   @Test
-  void aRunTokenIsPresentedAsABearerAndReplacesTheAssertedIdentityButNotTheSecondFactor()
-      throws Exception {
+  void aRunTokenIsPresentedAsABearerAndCarriesNoOtherHeader() throws Exception {
     Host host = host((h, message) -> h.reply(message));
 
     int code = runDaemon(tokenEnv(host.url("/ci/daemon")), 30).get(30, TimeUnit.SECONDS);
@@ -100,10 +99,11 @@ class DaemonMainTest {
     // be presenting exactly the claim the token exists to replace.
     assertFalse(host.headers.contains(ControlSocket.HEADER_USER));
     assertFalse(host.headers.contains(ControlSocket.HEADER_ROLES));
-    // The id and secret bind the connection to this container; the token binds it to the run.
-    // Both factors, in both modes.
-    assertEquals("daemon-1", host.headers.get(ControlSocket.HEADER_ID));
-    assertEquals("s3cret", host.headers.get(ControlSocket.HEADER_SECRET));
+    // And it strips X-Qits-* of every shape, so the id/secret pair travels here for nothing: the
+    // token already proves this container's run, and which launch it is travels in the Hello that
+    // follows instead — never as a header on this plane.
+    assertFalse(host.headers.contains(ControlSocket.HEADER_ID));
+    assertFalse(host.headers.contains(ControlSocket.HEADER_SECRET));
     // The subject is for the daemon's own log line and is never announced.
     assertFalse(host.headers.entries().toString().contains("run:42"));
   }
@@ -318,6 +318,31 @@ class DaemonMainTest {
             .run();
 
     assertEquals(ExitCode.MISCONFIGURED, code);
+  }
+
+  @Test
+  void anEdgePlaneEnvironmentWithNoSecretAtAllIsNotMisconfigured() throws Exception {
+    // The EDGE plane's container is never handed QITS_CI_DAEMON_SECRET at all — see
+    // StepWorkloadSpecs on the qits-ci side. Blank there is the ordinary shape, not a missing
+    // variable, because the run's token is what proves this container to qits-ci now.
+    Host host = host((h, message) -> h.reply(message));
+    DaemonEnv env =
+        new DaemonEnv(
+            host.url("/ci/daemon"),
+            "daemon-1",
+            "",
+            "file:///origin",
+            "main",
+            "0123456789abcdef",
+            "run-t0ken",
+            "run:42");
+
+    int code = runDaemon(env, 30).get(30, TimeUnit.SECONDS);
+
+    assertEquals(ExitCode.OK, code);
+    assertEquals("Bearer run-t0ken", host.headers.get(ControlSocket.HEADER_AUTHORIZATION));
+    assertFalse(host.headers.contains(ControlSocket.HEADER_ID));
+    assertFalse(host.headers.contains(ControlSocket.HEADER_SECRET));
   }
 
   @Test

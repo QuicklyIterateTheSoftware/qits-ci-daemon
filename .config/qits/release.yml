@@ -39,12 +39,25 @@ release-request:
       : "${zlib_url:?docker/Dockerfile.musl-builder declares no ARG ZLIB_URL}"
       musl_url="$maven_root${musl_url#*/artifacts/maven/maven}"
       zlib_url="$maven_root${zlib_url#*/artifacts/maven/maven}"
+      # ON THE EDGE PLANE THE TARBALL `ADD` NEEDS THE RUN'S TOKEN (qits-441): there $maven_root is
+      # the public registry, which answers an anonymous read 401. BuildKit's HTTP source sends a
+      # session secret named HTTP_AUTH_TOKEN_<url host> as `Authorization: Bearer`, so the secret is
+      # keyed by exactly that host and passed only when the step holds $QITS_TOKEN, which qits-ci
+      # sets on the EDGE plane alone. On the INTERNAL plane nothing is passed and the in-network read
+      # stays anonymous, as qits-ci intends. docker/Dockerfile.musl-builder's header has the
+      # long form.
+      tarball_auth=
+      if [ -n "${QITS_TOKEN:-}" ]; then
+        tarball_host=$(printf '%s\n' "$maven_root" | sed -E 's|^[A-Za-z]+://||; s|[/:?].*$||')
+        tarball_auth="--secret id=HTTP_AUTH_TOKEN_$tarball_host,env=QITS_TOKEN"
+      fi
       builder="$QITS_BUILD_REGISTRY/$QITS_IMAGE_REPOSITORY/graalvmce-musl-builder:jdk-25"
       buildctl build --frontend dockerfile.v0 \
         --local context=docker --local dockerfile=docker \
         --opt filename=Dockerfile.musl-builder \
         --opt build-arg:MUSL_URL="$musl_url" \
         --opt build-arg:ZLIB_URL="$zlib_url" \
+        $tarball_auth \
         --output "type=image,name=$builder,push=true"
       # BYTE-IDENTICAL TO THE RELEASE SLOT'S EXPORT. Change one, change the other.
       buildctl build --frontend dockerfile.v0 \
@@ -83,12 +96,19 @@ release:
       : "${zlib_url:?docker/Dockerfile.musl-builder declares no ARG ZLIB_URL}"
       musl_url="$maven_root${musl_url#*/artifacts/maven/maven}"
       zlib_url="$maven_root${zlib_url#*/artifacts/maven/maven}"
+      # The QA step's tarball credential, byte for byte: the run's token on the EDGE plane only.
+      tarball_auth=
+      if [ -n "${QITS_TOKEN:-}" ]; then
+        tarball_host=$(printf '%s\n' "$maven_root" | sed -E 's|^[A-Za-z]+://||; s|[/:?].*$||')
+        tarball_auth="--secret id=HTTP_AUTH_TOKEN_$tarball_host,env=QITS_TOKEN"
+      fi
       builder="$QITS_BUILD_REGISTRY/$QITS_IMAGE_REPOSITORY/graalvmce-musl-builder:jdk-25"
       buildctl build --frontend dockerfile.v0 \
         --local context=docker --local dockerfile=docker \
         --opt filename=Dockerfile.musl-builder \
         --opt build-arg:MUSL_URL="$musl_url" \
         --opt build-arg:ZLIB_URL="$zlib_url" \
+        $tarball_auth \
         --output "type=image,name=$builder,push=true"
       # THE QA PIPELINE'S BUILD, BYTE FOR BYTE.
       buildctl build --frontend dockerfile.v0 \

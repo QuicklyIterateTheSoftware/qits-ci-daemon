@@ -44,7 +44,8 @@
 #
 # The bytes are the upstream bytes, uploaded once and unmodified, under
 # `eu.wohlben.qits.toolchain` in qits-artifacts' maven repository — an ordinary artifact store
-# rather than a special case, read anonymously:
+# rather than a special case, read anonymously in-network and with the run's token through the edge
+# (see "ON THE EDGE PLANE" below):
 #
 #   x86_64-linux-musl-native.tgz  89080066 B  sha256 eb1db6f0f3c2bdbdbfb993d7ef7e2eeef82ac1259f6a6e1757c33a97dbcef3ad
 #                                 from https://more.musl.cc/11.2.1/x86_64-linux-musl/
@@ -70,6 +71,29 @@
 # image pull already lands, and the RUN below never dials anything. The stage is `scratch` because
 # nothing is executed in it, and the tarballs reach the build stage as a bind mount rather than a
 # COPY so 90 MB of tarball never becomes a layer of an image that only wants what is inside them.
+#
+# ON THE EDGE PLANE THE SAME `ADD` CARRIES THE RUN'S TOKEN, AND NOTHING IN THIS FILE CHANGES FOR IT.
+# A step on a remote CI runner (epic qits-441) builds on that runner's own buildkitd and is handed
+# the PUBLIC maven root, `https://registry.qits.<domain>/artifacts/maven/maven`, whose reads the
+# edge gates: sent anonymously, this ADD fails `invalid response status 401` (release request
+# 55aa9718, 2026-09-29). BuildKit's HTTP source — daemon side, so no `# syntax=` and no frontend
+# flag is involved; moby/buildkit source/http/source.go since v0.23, and the platform's builder and
+# every runner's run v0.33.0 — looks up two session secrets named after the URL's host on every
+# `ADD <url>`: `HTTP_AUTH_TOKEN_<host>`, sent as `Authorization: Bearer <value>`, and
+# `HTTP_AUTH_HEADER_<host>`, sent verbatim. When neither is there it sends nothing and says nothing.
+# The recipe (.config/qits/release.yml) passes `--secret id=HTTP_AUTH_TOKEN_<host>,env=QITS_TOKEN`
+# only when the step holds `$QITS_TOKEN`, which qits-ci sets on the EDGE plane alone, and the edge
+# introspects a Bearer `qits_tok_` like any other credential. So:
+#
+#   - INTERNAL: no secret, an in-network host, an anonymous read — exactly what it always was, and
+#     on purpose: qits-ci keeps every credential off the internal plane's reads (StepWorkloadSpecs).
+#   - EDGE: the secret is keyed by the public host, so the token reaches that host and no other.
+#
+# NOT `RUN --mount=type=secret … curl`, which would need a stage with curl in it (a second base to
+# pull, where this stage pulls nothing), the credential plumbed into a shell, and the download
+# re-run on every change to that stage instead of BuildKit's ETag-revalidated HTTP cache. The
+# secret never enters a layer or a cache key: an HTTP source is keyed by its URL and the bytes it
+# returned, not by the header that fetched them.
 #
 # The upstream URLs remain valid overrides, which is what a dev machine off the platform uses:
 #

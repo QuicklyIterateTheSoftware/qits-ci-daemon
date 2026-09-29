@@ -46,6 +46,11 @@ release-request:
       # sets on the EDGE plane alone. On the INTERNAL plane nothing is passed and the in-network read
       # stays anonymous, as qits-ci intends. docker/Dockerfile.musl-builder's header has the
       # long form.
+      #
+      # THE MAVEN STAGE'S CREDENTIAL IS UNCONDITIONAL, unlike the tarball's: the two files qits-ci's
+      # prelude writes become QITS_MAVEN_AUTH_USR/PSW inside the mvnw RUN (docker/Dockerfile) — the
+      # run's token on the EDGE plane, where the public mirror challenges, and the commissioned pair
+      # on the INTERNAL one, where the in-network mirror never does, so Maven never sends it.
       tarball_auth=
       if [ -n "${QITS_TOKEN:-}" ]; then
         tarball_host=$(printf '%s\n' "$maven_root" | sed -E 's|^[A-Za-z]+://||; s|[/:?].*$||')
@@ -65,6 +70,8 @@ release-request:
         --opt target=binary \
         --opt build-arg:BUILDER_IMAGE="$builder" \
         --opt build-arg:QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}" \
+        --secret id=qits-client-id,src=/tmp/qits-client-id \
+        --secret id=qits-client-secret,src=/tmp/qits-client-secret \
         --output type=local,dest=out
       # THE EXPORT STAYS IN out/ AND MUST NOT BE "SIMPLIFIED" TO /tmp/qits-ci-daemon: that path is
       # the RUNNING daemon of this very step's container, and writing it is ETXTBSY.
@@ -116,6 +123,8 @@ release:
         --opt target=binary \
         --opt build-arg:BUILDER_IMAGE="$builder" \
         --opt build-arg:QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}" \
+        --secret id=qits-client-id,src=/tmp/qits-client-id \
+        --secret id=qits-client-secret,src=/tmp/qits-client-secret \
         --output type=local,dest=out
       # THE DOCUMENT COMES OUT OF THE SAME BUILD AS THE BINARY, and it has to: the reactor and its
       # resolved dependency tree exist only in there — this step's container carries no maven at
@@ -128,6 +137,8 @@ release:
         --opt target=sbom \
         --opt build-arg:BUILDER_IMAGE="$builder" \
         --opt build-arg:QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}" \
+        --secret id=qits-client-id,src=/tmp/qits-client-id \
+        --secret id=qits-client-secret,src=/tmp/qits-client-secret \
         --output type=local,dest=out
       # The export loses the mode bit, so the chmod is not optional: a static binary that cannot be
       # executed is a green build that publishes nothing runnable.
@@ -142,9 +153,18 @@ release:
       # `-am` deploy writes both, and a run that resolved only one of them has published half a
       # coordinate. Re-running a maven deploy is a no-op; re-running it against an occupied
       # coordinate is not, so the guard stays.
-      if curl -fsS -o /dev/null \
+      # ON THE EDGE PLANE THE REGISTRY ANSWERS AN ANONYMOUS READ 401 (qits-441), which this guard
+      # would read as "not published" and so re-deploy an occupied coordinate on a retry. There the
+      # run's token rides as the Basic password — the edge introspects a qits_tok_ whatever the
+      # username; qits-ci sets $QITS_TOKEN on that plane alone — and in-network the read stays
+      # anonymous.
+      set --
+      if [ -n "${QITS_TOKEN:-}" ]; then
+        set -- -u "${QITS_TOKEN_SUBJECT:-qits-ci-run}:$QITS_TOKEN"
+      fi
+      if curl -fsS "$@" -o /dev/null \
         "$QITS_MAVEN_REGISTRY_URL/eu/wohlben/qits/qits-ci-daemon-protocol/$QITS_VERSION/qits-ci-daemon-protocol-$QITS_VERSION.pom" \
-        && curl -fsS -o /dev/null \
+        && curl -fsS "$@" -o /dev/null \
           "$QITS_MAVEN_REGISTRY_URL/eu/wohlben/qits/$QITS_VERSION/qits-$QITS_VERSION.pom"; then
         echo "qits-ci-daemon-protocol $QITS_VERSION and its parent are already published — skipping"
         exit 0
@@ -233,8 +253,12 @@ release:
         deploy_settings="-gs /tmp/qits-recipe-deploy-settings.xml"
       fi
       QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}" \
-      QITS_MAVEN_AUTH_USR="${QITS_COMMISSIONED_CLIENT_ID-}" \
-      QITS_MAVEN_AUTH_PSW="${QITS_COMMISSIONED_CLIENT_SECRET-}" \
+      # The commissioned pair where there is one (INTERNAL); otherwise what qits-ci already put in
+      # QITS_MAVEN_AUTH_USR/PSW — the run's token subject and token on the EDGE plane (qits-441),
+      # which the bare `${QITS_COMMISSIONED_CLIENT_ID-}` used to overwrite with an empty string,
+      # a 401 from the public mirror on the first Central artifact.
+      QITS_MAVEN_AUTH_USR="${QITS_COMMISSIONED_CLIENT_ID:-${QITS_MAVEN_AUTH_USR-}}" \
+      QITS_MAVEN_AUTH_PSW="${QITS_COMMISSIONED_CLIENT_SECRET:-${QITS_MAVEN_AUTH_PSW-}}" \
       ./mvnw -B -ntp -s .qits-maven-settings.xml $deploy_settings -pl ci-daemon-protocol -am deploy -DskipTests \
         -Dqits.maven.repository.url="$QITS_MAVEN_REGISTRY_URL" \
         -DaltDeploymentRepository="qits::default::$QITS_MAVEN_REGISTRY_URL"

@@ -86,14 +86,7 @@ public final class DaemonMain implements ControlSocket.Listener {
     this.initializer = initializer;
     this.steps = steps;
     this.socket =
-        new ControlSocket(
-            vertx,
-            env.daemonUrl(),
-            env.daemonId(),
-            env.daemonSecret(),
-            env.token(),
-            settings,
-            this);
+        new ControlSocket(vertx, env.daemonUrl(), env.token(), settings, this);
   }
 
   /**
@@ -110,15 +103,13 @@ public final class DaemonMain implements ControlSocket.Listener {
       LOG.errorf("ci-daemon cannot start: %s is not set. Exiting.", missing);
       return ExitCode.MISCONFIGURED;
     }
-    if (env.hasToken()) {
-      // The subject and never the token: it is what lets a human match this container to the run
-      // the token was commissioned for, and it is the only part of the credential that may be read.
-      LOG.infof(
-          "ci-daemon presents the run's token (subject %s) instead of an asserted identity.",
-          env.tokenSubject() == null || env.tokenSubject().isBlank()
-              ? "unnamed"
-              : env.tokenSubject());
-    }
+    // The subject and never the token: it is what lets a human match this container to the run
+    // the token was commissioned for, and it is the only part of the credential that may be read.
+    LOG.infof(
+        "ci-daemon presents the run's token (subject %s).",
+        env.tokenSubject() == null || env.tokenSubject().isBlank()
+            ? "unnamed"
+            : env.tokenSubject());
     socket.start();
     try {
       return exit.get();

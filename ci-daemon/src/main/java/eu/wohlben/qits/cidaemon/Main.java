@@ -45,9 +45,6 @@ public class Main {
     @ConfigProperty(name = "qits.ci.daemon-id")
     Optional<String> daemonId;
 
-    @ConfigProperty(name = "qits.ci.daemon-secret")
-    Optional<String> daemonSecret;
-
     @ConfigProperty(name = "qits.ci.repository-url")
     Optional<String> repositoryUrl;
 
@@ -57,11 +54,11 @@ public class Main {
     @ConfigProperty(name = "qits.ci.sha")
     Optional<String> sha;
 
-    // Optional in the other sense too: absent is the INTERNAL plane and a satisfied contract, so
-    // DaemonEnv.missing() never names either of these. See DaemonEnv for what each one does.
     @ConfigProperty(name = "qits.token")
     Optional<String> token;
 
+    // Optional in the other sense too: DaemonEnv.missing() never names this one. It only names the
+    // token in a log line.
     @ConfigProperty(name = "qits.token-subject")
     Optional<String> tokenSubject;
 
@@ -99,7 +96,6 @@ public class Main {
           new DaemonEnv(
               daemonUrl.orElse(""),
               daemonId.orElse(""),
-              daemonSecret.orElse(""),
               repositoryUrl.orElse(""),
               branch.orElse(""),
               sha.orElse(""),

@@ -68,23 +68,18 @@ class DaemonMainTest {
   }
 
   @Test
-  void theDialPresentsItsIdentityAsHandshakeHeadersAndNotInThePath() throws Exception {
+  void theDialCarriesNoIdentityInThePath() throws Exception {
     Host host = host((h, message) -> h.reply(message));
 
     int code = runDaemon(host.url("/ci/daemon"), ready(), 30).get(30, TimeUnit.SECONDS);
 
     assertEquals(ExitCode.OK, code);
     // The workspace control socket identifies its caller by a path parameter and that is its known
-    // impersonation bug. The path here carries no identity at all; the headers do, and the host
-    // validates them before it reads a frame.
+    // impersonation bug. The path here carries no identity at all; the bearer proves the run and
+    // the Hello names the launch.
     assertEquals("/ci/daemon", host.requestPath);
-    assertEquals("daemon-1", host.headers.get(ControlSocket.HEADER_ID));
-    assertEquals("s3cret", host.headers.get(ControlSocket.HEADER_SECRET));
-    assertEquals("qits-ci-daemon", host.headers.get(ControlSocket.HEADER_USER));
-    assertEquals("qits:system", host.headers.get(ControlSocket.HEADER_ROLES));
-    // Without a token the INTERNAL handshake is exactly what it always was: no bearer at all, not
-    // an empty one.
-    assertNull(host.headers.get(ControlSocket.HEADER_AUTHORIZATION));
+    assertEquals("Bearer run-t0ken", host.headers.get(ControlSocket.HEADER_AUTHORIZATION));
+    assertEquals("daemon-1", host.first(Hello.class).daemonId());
   }
 
   @Test
@@ -97,36 +92,18 @@ class DaemonMainTest {
     assertEquals("Bearer run-t0ken", host.headers.get(ControlSocket.HEADER_AUTHORIZATION));
     // The edge strips asserted identity on every inbound request; a daemon that still sent it would
     // be presenting exactly the claim the token exists to replace.
-    assertFalse(host.headers.contains(ControlSocket.HEADER_USER));
-    assertFalse(host.headers.contains(ControlSocket.HEADER_ROLES));
-    // And it strips X-Qits-* of every shape, so the id/secret pair travels here for nothing: the
-    // token already proves this container's run, and which launch it is travels in the Hello that
-    // follows instead — never as a header on this plane.
-    assertFalse(host.headers.contains(ControlSocket.HEADER_ID));
-    assertFalse(host.headers.contains(ControlSocket.HEADER_SECRET));
+    assertFalse(host.headers.contains("X-Qits-User"));
+    assertFalse(host.headers.contains("X-Qits-Roles"));
+    // And it strips X-Qits-* of every shape, so an id/secret pair would travel here for nothing:
+    // the token already proves this container's run, and which launch it is travels in the Hello
+    // that follows instead — never as a header. Spelled out here because the daemon no longer has
+    // a constant for a header it does not send.
+    assertFalse(host.headers.contains("X-Qits-Ci-Daemon-Id"));
+    assertFalse(host.headers.contains("X-Qits-Ci-Daemon-Secret"));
+    assertFalse(
+        host.headers.names().stream().anyMatch(name -> name.toLowerCase().startsWith("x-qits-")));
     // The subject is for the daemon's own log line and is never announced.
     assertFalse(host.headers.entries().toString().contains("run:42"));
-  }
-
-  @Test
-  void aBlankTokenIsNoTokenAndKeepsTheInternalHandshake() throws Exception {
-    Host host = host((h, message) -> h.reply(message));
-    DaemonEnv env =
-        new DaemonEnv(
-            host.url("/ci/daemon"),
-            "daemon-1",
-            "s3cret",
-            "file:///origin",
-            "main",
-            "0123456789abcdef",
-            "  ",
-            "");
-
-    int code = runDaemon(env, 30).get(30, TimeUnit.SECONDS);
-
-    assertEquals(ExitCode.OK, code);
-    assertNull(host.headers.get(ControlSocket.HEADER_AUTHORIZATION));
-    assertEquals("qits:system", host.headers.get(ControlSocket.HEADER_ROLES));
   }
 
   @Test
@@ -304,45 +281,31 @@ class DaemonMainTest {
   }
 
   @Test
-  void anEnvironmentMissingItsSecretExitsBeforeAnythingIsDialled() {
+  void anEnvironmentMissingItsTokenExitsBeforeAnythingIsDialledAndNamesTheVariable() {
     DaemonEnv env =
-        new DaemonEnv("ws://127.0.0.1:1/ci/daemon", "daemon-1", "", "file:///origin", "main", "abc123f");
+        new DaemonEnv(
+            "ws://127.0.0.1:1/ci/daemon", "daemon-1", "file:///origin", "main", "abc123f", "", "");
 
-    int code =
-        new DaemonMain(
-                vertx,
-                env,
-                new ControlSocket.Settings(10_000, 30_000, 500, 5_000),
-                ready(),
-                (request, emit) -> step(request, emit))
-            .run();
+    int code = runToExit(env);
 
     assertEquals(ExitCode.MISCONFIGURED, code);
+    assertEquals(2, code);
+    assertEquals("QITS_TOKEN", env.missing());
   }
 
   @Test
-  void anEdgePlaneEnvironmentWithNoSecretAtAllIsNotMisconfigured() throws Exception {
-    // The EDGE plane's container is never handed QITS_CI_DAEMON_SECRET at all — see
-    // StepWorkloadSpecs on the qits-ci side. Blank there is the ordinary shape, not a missing
-    // variable, because the run's token is what proves this container to qits-ci now.
-    Host host = host((h, message) -> h.reply(message));
+  void aBlankTokenIsAMissingTokenRatherThanAnEmptyBearer() {
     DaemonEnv env =
         new DaemonEnv(
-            host.url("/ci/daemon"),
-            "daemon-1",
-            "",
-            "file:///origin",
-            "main",
-            "0123456789abcdef",
-            "run-t0ken",
-            "run:42");
+            "ws://127.0.0.1:1/ci/daemon", "daemon-1", "file:///origin", "main", "abc123f", "  ", "");
 
-    int code = runDaemon(env, 30).get(30, TimeUnit.SECONDS);
+    assertEquals(ExitCode.MISCONFIGURED, runToExit(env));
+    assertEquals("QITS_TOKEN", env.missing());
+  }
 
-    assertEquals(ExitCode.OK, code);
-    assertEquals("Bearer run-t0ken", host.headers.get(ControlSocket.HEADER_AUTHORIZATION));
-    assertFalse(host.headers.contains(ControlSocket.HEADER_ID));
-    assertFalse(host.headers.contains(ControlSocket.HEADER_SECRET));
+  @Test
+  void aCompleteEnvironmentIsMissingNothing() {
+    assertNull(tokenEnv("ws://127.0.0.1:1/ci/daemon").missing());
   }
 
   @Test
@@ -459,11 +422,18 @@ class DaemonMainTest {
       DaemonMain.Initializer initializer,
       long dialBudgetMillis,
       long heartbeatMillis) {
-    return runDaemon(
-        new DaemonEnv(url, "daemon-1", "s3cret", "file:///origin", "main", "0123456789abcdef"),
-        initializer,
-        dialBudgetMillis,
-        heartbeatMillis);
+    return runDaemon(tokenEnv(url), initializer, dialBudgetMillis, heartbeatMillis);
+  }
+
+  /** Runs on the calling thread: for an environment that must end before anything is dialled. */
+  private int runToExit(DaemonEnv env) {
+    return new DaemonMain(
+            vertx,
+            env,
+            new ControlSocket.Settings(10_000, 30_000, 500, 5_000),
+            ready(),
+            (request, emit) -> step(request, emit))
+        .run();
   }
 
   private CompletableFuture<Integer> runDaemon(DaemonEnv env, long dialBudgetMillis) {
@@ -485,12 +455,11 @@ class DaemonMainTest {
     return CompletableFuture.supplyAsync(daemon::run);
   }
 
-  /** The EDGE plane's environment: the INTERNAL one plus the run's token. */
+  /** A satisfied environment: everything the launcher hands a step container. */
   private static DaemonEnv tokenEnv(String url) {
     return new DaemonEnv(
         url,
         "daemon-1",
-        "s3cret",
         "file:///origin",
         "main",
         "0123456789abcdef",

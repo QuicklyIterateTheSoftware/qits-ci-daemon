@@ -9,57 +9,32 @@ package eu.wohlben.qits.cidaemon;
  * flow is a plain class with a plain constructor — {@link Main} is the one place that resolves
  * configuration, and this is the shape it hands over.
  *
- * <p><b>{@code token} is optional, and its absence is the INTERNAL plane exactly as it always
- * was.</b> A run taken by a runner on the EDGE plane is handed {@code $QITS_TOKEN}, the run's own
- * {@code ci-run} token, and the socket then presents it as a bearer instead of asserting a user and
- * roles — the edge strips asserted identity on every inbound request, so on that plane the old
- * handshake cannot pass at all. {@code tokenSubject} names the token for a log line and is never
- * sent anywhere: a value the host minted is not a value to announce back to it.
+ * <p><b>{@code token} is required.</b> Every run is handed {@code $QITS_TOKEN}, the run's own {@code
+ * ci-run} token, and the socket presents it as a bearer — it is the only credential this daemon has.
+ * {@code tokenSubject} names the token for a log line and is never sent anywhere: a value the host
+ * minted is not a value to announce back to it.
  */
 public record DaemonEnv(
     String daemonUrl,
     String daemonId,
-    String daemonSecret,
     String repositoryUrl,
     String branch,
     String sha,
     String token,
     String tokenSubject) {
 
-  /** The INTERNAL plane's environment: no token, so the handshake asserts its identity. */
-  public DaemonEnv(
-      String daemonUrl,
-      String daemonId,
-      String daemonSecret,
-      String repositoryUrl,
-      String branch,
-      String sha) {
-    this(daemonUrl, daemonId, daemonSecret, repositoryUrl, branch, sha, "", "");
-  }
-
-  /**
-   * Whether the run handed this container a token. Blank counts as absent, so a launcher that
-   * injects an empty {@code QITS_TOKEN} gets today's handshake rather than {@code Bearer } with
-   * nothing after it.
-   */
-  public boolean hasToken() {
-    return !blank(token);
-  }
-
   /**
    * The first missing value, or {@code null} when the contract is satisfied. Checked before the
-   * dial: a container launched without what its plane needs cannot register, and failing at startup
+   * dial: a container launched without what it needs cannot register, and failing at startup
    * with the name of the absent variable is the only diagnosis anyone gets — the host's own view of
    * it is "a container that never registered".
    *
    * <p>Names the environment variable, not the config key, because that is what the launcher sets
-   * and what a human reading {@code docker logs} can act on. The secret is reported as
+   * and what a human reading {@code docker logs} can act on. The token is reported as
    * <em>missing</em> and never echoed.
    *
-   * <p>{@code QITS_CI_DAEMON_SECRET} is required only on the INTERNAL plane. An EDGE launch's
-   * container is never handed one — the run's token is what proves it to qits-ci, and the launch is
-   * named in the {@code Hello} instead (see {@link eu.wohlben.qits.cidaemon.ControlSocket}) — so its
-   * absence there is the ordinary shape and not a missing variable.
+   * <p>A blank {@code QITS_TOKEN} counts as absent, so a launcher that injects an empty one is told
+   * so here rather than dialling with {@code Bearer } and nothing after it.
    */
   public String missing() {
     if (blank(daemonUrl)) {
@@ -68,8 +43,8 @@ public record DaemonEnv(
     if (blank(daemonId)) {
       return "QITS_CI_DAEMON_ID";
     }
-    if (!hasToken() && blank(daemonSecret)) {
-      return "QITS_CI_DAEMON_SECRET";
+    if (blank(token)) {
+      return "QITS_TOKEN";
     }
     if (blank(repositoryUrl)) {
       return "QITS_CI_REPOSITORY_URL";
@@ -84,8 +59,8 @@ public record DaemonEnv(
   }
 
   /**
-   * Redacted: a record's generated {@code toString} would print the secret and the bearer into any
-   * log line that ever formats this value, and the bearer opens everything the run may do.
+   * Redacted: a record's generated {@code toString} would print the bearer into any log line that
+   * ever formats this value, and the bearer opens everything the run may do.
    */
   @Override
   public String toString() {
@@ -100,7 +75,7 @@ public record DaemonEnv(
         + ", sha="
         + sha
         + ", token="
-        + (hasToken() ? "<set>" : "<absent>")
+        + (blank(token) ? "<absent>" : "<set>")
         + ", tokenSubject="
         + tokenSubject
         + "]";

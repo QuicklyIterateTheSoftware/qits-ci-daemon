@@ -26,19 +26,14 @@ import org.jboss.logging.Logger;
  * up, and a socket that closes after connecting is a terminal condition, because the only thing
  * behind this socket was one step's worth of conversation.
  *
- * <p>Identity travels as handshake headers or, on one plane, in the first frame — never in the path.
- * The workspace control socket identifies its caller by a path parameter, which is its known
- * impersonation bug; this does not reproduce it.
+ * <p>The credential travels as a handshake header and the launch id in the first frame — never in
+ * the path. The workspace control socket identifies its caller by a path parameter, which is its
+ * known impersonation bug; this does not reproduce it.
  *
- * <p><b>Two handshakes, chosen by whether the run handed this container a token.</b> Without one —
- * the INTERNAL plane, a step container on {@code qits-net} — the daemon asserts {@code X-Qits-User}
- * and {@code X-Qits-Roles} as it always has, and presents its id and secret as {@code
- * X-Qits-Ci-Daemon-Id}/{@code -Secret}; the host validates both against its in-memory launch record
- * before it reads a frame and closes 1008 on a mismatch. With one — the EDGE plane, a step on a
- * remote runner — it sends {@code Authorization: Bearer $QITS_TOKEN} and <em>nothing else</em>: no
+ * <p><b>One handshake: {@code Authorization: Bearer $QITS_TOKEN} and <em>nothing else</em>.</b> No
  * asserted identity (the edge strips it from every inbound request, and a daemon that sent it would
- * be presenting a claim the edge exists to refuse) and no id or secret either, because the edge
- * strips {@code X-Qits-*} headers of every shape and a header that never arrives authenticates
+ * be presenting a claim the edge exists to refuse) and no id or secret header either, because the
+ * edge strips {@code X-Qits-*} headers of every shape and a header that never arrives authenticates
  * nothing. The token already proves this container's run to qits-ci; what is left to say is only
  * <em>which</em> launch of that run this is, and that travels in the first frame instead — the
  * {@code Hello} every capability version already sends carries the launch id, and the host matches
@@ -55,17 +50,7 @@ public final class ControlSocket {
 
   private static final Logger LOG = Logger.getLogger(ControlSocket.class);
 
-  /** The handshake headers qits-ci authenticates the connection with. */
-  static final String HEADER_ID = "X-Qits-Ci-Daemon-Id";
-
-  static final String HEADER_SECRET = "X-Qits-Ci-Daemon-Secret";
-
-  /** The INTERNAL plane's asserted identity, sent only when there is no token. */
-  static final String HEADER_USER = "X-Qits-User";
-
-  static final String HEADER_ROLES = "X-Qits-Roles";
-
-  /** The EDGE plane's credential: the run's own token, sent only when there is one. */
+  /** The one handshake header: it carries the run's own token. */
   static final String HEADER_AUTHORIZATION = "Authorization";
 
   /**
@@ -101,8 +86,6 @@ public final class ControlSocket {
 
   private final Vertx vertx;
   private final String url;
-  private final String daemonId;
-  private final String daemonSecret;
   private final String token;
   private final Settings settings;
   private final Listener listener;
@@ -116,16 +99,12 @@ public final class ControlSocket {
   public ControlSocket(
       Vertx vertx,
       String url,
-      String daemonId,
-      String daemonSecret,
       String token,
       Settings settings,
       Listener listener) {
     this.vertx = vertx;
     this.url = url;
-    this.daemonId = daemonId;
-    this.daemonSecret = daemonSecret;
-    this.token = token == null || token.isBlank() ? null : token;
+    this.token = token;
     this.settings = settings;
     this.listener = listener;
   }
@@ -152,18 +131,10 @@ public final class ControlSocket {
       end(() -> listener.onDialFailed("malformed QITS_CI_DAEMON_URL '" + url + "'"));
       return;
     }
-    if (token == null) {
-      options
-          .addHeader(HEADER_USER, "qits-ci-daemon")
-          .addHeader(HEADER_ROLES, "qits:system")
-          .addHeader(HEADER_ID, daemonId)
-          .addHeader(HEADER_SECRET, daemonSecret);
-    } else {
-      // No X-Qits-* header of any shape: qits-edge strips them all, so sending one here would only
-      // be a header this container mistakenly trusted to arrive. The token is the whole handshake;
-      // which launch this is travels in the Hello that follows instead.
-      options.addHeader(HEADER_AUTHORIZATION, "Bearer " + token);
-    }
+    // No X-Qits-* header of any shape: qits-edge strips them all, so sending one here would only
+    // be a header this container mistakenly trusted to arrive. The token is the whole handshake;
+    // which launch this is travels in the Hello that follows instead.
+    options.addHeader(HEADER_AUTHORIZATION, "Bearer " + token);
     client
         .connect(options)
         .onSuccess(this::onConnected)

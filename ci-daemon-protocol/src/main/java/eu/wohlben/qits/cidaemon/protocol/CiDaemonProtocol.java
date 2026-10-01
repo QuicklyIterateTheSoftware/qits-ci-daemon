@@ -17,12 +17,13 @@ package eu.wohlben.qits.cidaemon.protocol;
  * list no real run ever waits for — see its own javadoc for who does and why it costs no capability
  * bump.
  *
- * <p><b>Identity is not on the wire.</b> The daemon presents {@code X-Qits-Ci-Daemon-Id} and {@code
- * X-Qits-Ci-Daemon-Secret} as handshake headers and the host validates them before the first frame
- * is read; the {@code daemonId} in {@link Hello} is an assertion the host checks against the
- * connection it already authenticated, never the thing that identifies it. The workspace control
- * socket takes its caller's identity from a path parameter, which is its known impersonation bug
- * (migration-plan §9 item 22); this contract does not reproduce it.
+ * <p><b>One handshake, and identity travels in the frame, not a header.</b> The daemon authenticates
+ * the connection with {@code Authorization: Bearer $QITS_TOKEN} alone — the run's own token — and
+ * names its launch id in-band, in the {@code daemonId} field of the first {@link Hello} frame
+ * itself. The host binds that launch id to the token's own subject and refuses a mismatch; there is
+ * no separate id/secret handshake header pair to validate first. The workspace control socket takes
+ * its caller's identity from a path parameter, which is its known impersonation bug (migration-plan
+ * §9 item 22); this contract does not reproduce it.
  */
 public final class CiDaemonProtocol {
 

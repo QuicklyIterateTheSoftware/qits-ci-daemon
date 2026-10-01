@@ -19,7 +19,7 @@ public final class ExitCode {
   /** A step ran and its {@code StepFinished} reached the host. The only clean ending. */
   public static final int OK = 0;
 
-  /** The env contract was not satisfied — no url, id, secret, repository, branch or sha. */
+  /** The env contract was not satisfied — no url, id, token, repository, branch or sha. */
   public static final int MISCONFIGURED = 2;
 
   /** The control socket could not be reached within the dial budget. */

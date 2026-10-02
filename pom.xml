@@ -15,7 +15,7 @@
          keep. -->
     <groupId>eu.wohlben</groupId>
     <artifactId>qits</artifactId>
-    <version>2026.1002.70414</version>
+    <version>2026.1002.102242</version>
     <packaging>pom</packaging>
 
     <modules>

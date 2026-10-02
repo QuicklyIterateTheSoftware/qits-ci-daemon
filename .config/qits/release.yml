@@ -8,13 +8,9 @@ artifacts:
   # edit somebody forgot. qits-ci pins this coordinate in its pom and takes the daemon version from
   # the constant. CiDaemonBinary's javadoc carries the whole reasoning.
   #
-  # AND IT CARRIES NO `sbom:`, WHICH IS NOT THE DOCUMENT GOING MISSING. The composed postlude runs
-  # in ONE step — the last one that builds — and a step container shares nothing with the next: the
-  # jar's document is written by `makeBom` in the maven step below, which is not that step and whose
-  # files the builder step has never seen. So the jar submits its own document, through the same
-  # `qits` CLI and the same policy the postlude would have used, from the container that produced
-  # it. An `sbom:` here would make the builder step submit a path that does not exist in it.
-  - { type: maven, name: "eu.wohlben.qits:qits-ci-daemon-protocol", path: ci-daemon-protocol }
+  # qits-ci submits this `sbom:` from whichever release step holds the file — the maven step below,
+  # where `makeBom` writes it — and checks on the last step that it reached the store.
+  - { type: maven, name: "eu.wohlben.qits:qits-ci-daemon-protocol", path: ci-daemon-protocol, sbom: ci-daemon-protocol/target/sbom.json }
 
 # THE QA HALF IS THIS REPOSITORY'S, AND THE ARCHETYPE'S HEADER SAYS SO. Two things live here that
 # a compile does not: the JVM suite, and a smoke probe that really STARTS A CONTAINER on the built
@@ -157,9 +153,3 @@ release:
         -Dqits.maven.repository.url="$QITS_MAVEN_REGISTRY_URL" \
         org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeBom \
         -DoutputFormat=json -DoutputName=sbom -DschemaVersion=1.6
-      # SUBMITTED HERE BECAUSE THE POSTLUDE CANNOT REACH IT — see the artifact's comment above. The
-      # CLI is on this step's PATH like any release step's, and its idempotency policy is the one
-      # the postlude runs, so a re-fired release resubmitting identical bytes is still green.
-      qits artifacts publish sbom submit \
-        --type maven --name "eu.wohlben.qits:qits-ci-daemon-protocol" \
-        --version "$QITS_VERSION" --file ci-daemon-protocol/target/sbom.json

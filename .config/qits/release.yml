@@ -14,7 +14,7 @@ artifacts:
   # files the builder step has never seen. So the jar submits its own document, through the same
   # `qits` CLI and the same policy the postlude would have used, from the container that produced
   # it. An `sbom:` here would make the builder step submit a path that does not exist in it.
-  - { type: maven, name: "eu.wohlben.qits:qits-ci-daemon-protocol" }
+  - { type: maven, name: "eu.wohlben.qits:qits-ci-daemon-protocol", path: ci-daemon-protocol }
 
 # THE QA HALF IS THIS REPOSITORY'S, AND THE ARCHETYPE'S HEADER SAYS SO. Two things live here that
 # a compile does not: the JVM suite, and a smoke probe that really STARTS A CONTAINER on the built

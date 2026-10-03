@@ -10,10 +10,10 @@
       <mirrorOf>qits-maven</mirrorOf>
       <url>${env.QITS_MAVEN_REPOSITORY_URL}</url>
     </mirror>
-    <!-- Maven Central through qits-platform-mirror's pull-through cache. The exact repository id is
-         the same blocker exemption the entry above uses, scoped to the one repository the profile
-         below declares — so while QITS_MAVEN_CENTRAL_URL is unset or empty, nothing declares
-         qits-central, this entry matches nothing, and the unexpanded URL is never dialled. -->
+    <!-- Maven Central through qits-mirror's cache. The exact repository id is the same blocker
+         exemption the entry above uses, scoped to the one repository the profile below declares —
+         so while QITS_MAVEN_CENTRAL_URL is unset or empty, nothing declares qits-central, this
+         entry matches nothing, and the unexpanded URL is never dialled. -->
     <mirror>
       <id>qits-central-proxy</id>
       <mirrorOf>qits-central</mirrorOf>
@@ -27,11 +27,8 @@
       <username>${env.QITS_MAVEN_AUTH_USR}</username>
       <password>${env.QITS_MAVEN_AUTH_PSW}</password>
     </server>
-    <!-- Same commissioned credential, for the mirror's central pull-through. Maven presents it
-         only on the edge's 401 (a build resolving Central at
-         mirror.dev.localhost:8080/mirror/maven/central); an in-network step-plane read is anonymous
-         and never sends it. Both variables are the BuildKit secret mounts on docker/Dockerfile's
-         mvnw RUN, as for qits-maven-network. -->
+    <!-- Same commissioned credential, for the Central cache. Both variables are the BuildKit secret
+         mounts on docker/Dockerfile's mvnw RUN, as for qits-maven-network. -->
     <server>
       <id>qits-central-proxy</id>
       <username>${env.QITS_MAVEN_AUTH_USR}</username>

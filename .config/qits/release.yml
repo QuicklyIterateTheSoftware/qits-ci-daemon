@@ -21,14 +21,21 @@ release-request:
   - image: qits/build-images/maven-base:latest
     timeout-seconds: 1800
     script: |
-      export QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}"
+      # THE ADDRESS IS CODE (qits-731): Maven Central through qits-mirror's cache. `wohlben.eu`
+      # covers a qits-ci too old to inject $QITS_DOMAIN.
+      qits_domain=${QITS_DOMAIN:-wohlben.eu}
+      export QITS_MAVEN_CENTRAL_URL="https://mirror.qits.$qits_domain/mirror/maven/central"
       ./mvnw -B -ntp -s .qits-maven-settings.xml verify
 
   - image: qits/build-images/ci-base:latest
     docker: true
     timeout-seconds: 3600
     script: |
-      maven_root="${QITS_MAVEN_REGISTRY_URL%/}"
+      # THE ADDRESSES ARE CODE (qits-731): the registry is registry.qits.<domain>, the hosted maven
+      # repository and the mirror's Central constant paths under it and mirror.qits.<domain>.
+      # `wohlben.eu` covers a qits-ci too old to inject $QITS_DOMAIN.
+      qits_domain=${QITS_DOMAIN:-wohlben.eu}
+      maven_root="https://registry.qits.$qits_domain/artifacts/maven/maven"
       musl_url=$(sed -n 's/^ARG MUSL_URL=//p' docker/Dockerfile.musl-builder)
       zlib_url=$(sed -n 's/^ARG ZLIB_URL=//p' docker/Dockerfile.musl-builder)
       : "${musl_url:?docker/Dockerfile.musl-builder declares no ARG MUSL_URL}"
@@ -52,7 +59,7 @@ release-request:
         tarball_host=$(printf '%s\n' "$maven_root" | sed -E 's|^[A-Za-z]+://||; s|[/:?].*$||')
         tarball_auth="--secret id=HTTP_AUTH_TOKEN_$tarball_host,env=QITS_TOKEN"
       fi
-      builder="$QITS_BUILD_REGISTRY/$QITS_IMAGE_REPOSITORY/graalvmce-musl-builder:jdk-25"
+      builder="registry.qits.$qits_domain/$QITS_IMAGE_REPOSITORY/graalvmce-musl-builder:jdk-25"
       buildctl build --frontend dockerfile.v0 \
         --local context=docker --local dockerfile=docker \
         --opt filename=Dockerfile.musl-builder \
@@ -65,7 +72,7 @@ release-request:
         --local context=. --local dockerfile=docker \
         --opt target=binary \
         --opt build-arg:BUILDER_IMAGE="$builder" \
-        --opt build-arg:QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}" \
+        --opt build-arg:QITS_DOMAIN="$qits_domain" \
         --secret id=qits-client-id,src=/tmp/qits-client-id \
         --secret id=qits-client-secret,src=/tmp/qits-client-secret \
         --output type=local,dest=out
@@ -92,7 +99,10 @@ release:
     build: true
     timeout-seconds: 3600
     script: |
-      maven_root="${QITS_MAVEN_REGISTRY_URL%/}"
+      # THE ADDRESSES ARE CODE (qits-731): see the QA step's comment. `wohlben.eu` covers a qits-ci
+      # too old to inject $QITS_DOMAIN.
+      qits_domain=${QITS_DOMAIN:-wohlben.eu}
+      maven_root="https://registry.qits.$qits_domain/artifacts/maven/maven"
       musl_url=$(sed -n 's/^ARG MUSL_URL=//p' docker/Dockerfile.musl-builder)
       zlib_url=$(sed -n 's/^ARG ZLIB_URL=//p' docker/Dockerfile.musl-builder)
       : "${musl_url:?docker/Dockerfile.musl-builder declares no ARG MUSL_URL}"
@@ -105,7 +115,7 @@ release:
         tarball_host=$(printf '%s\n' "$maven_root" | sed -E 's|^[A-Za-z]+://||; s|[/:?].*$||')
         tarball_auth="--secret id=HTTP_AUTH_TOKEN_$tarball_host,env=QITS_TOKEN"
       fi
-      builder="$QITS_BUILD_REGISTRY/$QITS_IMAGE_REPOSITORY/graalvmce-musl-builder:jdk-25"
+      builder="registry.qits.$qits_domain/$QITS_IMAGE_REPOSITORY/graalvmce-musl-builder:jdk-25"
       buildctl build --frontend dockerfile.v0 \
         --local context=docker --local dockerfile=docker \
         --opt filename=Dockerfile.musl-builder \
@@ -118,7 +128,7 @@ release:
         --local context=. --local dockerfile=docker \
         --opt target=binary \
         --opt build-arg:BUILDER_IMAGE="$builder" \
-        --opt build-arg:QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}" \
+        --opt build-arg:QITS_DOMAIN="$qits_domain" \
         --secret id=qits-client-id,src=/tmp/qits-client-id \
         --secret id=qits-client-secret,src=/tmp/qits-client-secret \
         --output type=local,dest=out
@@ -132,7 +142,7 @@ release:
         --local context=. --local dockerfile=docker \
         --opt target=sbom \
         --opt build-arg:BUILDER_IMAGE="$builder" \
-        --opt build-arg:QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}" \
+        --opt build-arg:QITS_DOMAIN="$qits_domain" \
         --secret id=qits-client-id,src=/tmp/qits-client-id \
         --secret id=qits-client-secret,src=/tmp/qits-client-secret \
         --output type=local,dest=out
@@ -148,8 +158,11 @@ release:
       # NO LONGER A DEPLOY: the CLI publishes this coordinate from the postlude, off the jar this
       # step leaves in target/. This step only has to build it.
       ./mvnw -B -ntp -s .qits-maven-settings.xml -pl ci-daemon-protocol -am package -DskipTests
-      QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}" \
+      # THE ADDRESSES ARE CODE (qits-731). `wohlben.eu` covers a qits-ci too old to inject
+      # $QITS_DOMAIN.
+      qits_domain=${QITS_DOMAIN:-wohlben.eu}
+      QITS_MAVEN_CENTRAL_URL="https://mirror.qits.$qits_domain/mirror/maven/central" \
       ./mvnw -B -ntp -s .qits-maven-settings.xml -pl ci-daemon-protocol -DskipTests \
-        -Dqits.maven.repository.url="$QITS_MAVEN_REGISTRY_URL" \
+        -Dqits.maven.repository.url="https://registry.qits.$qits_domain/artifacts/maven/maven" \
         org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeBom \
         -DoutputFormat=json -DoutputName=sbom -DschemaVersion=1.6

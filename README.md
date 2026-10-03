@@ -228,8 +228,9 @@ do: it must print the name of the first missing variable and exit 2, not die res
 ## Other repositories build on this image
 
 CI pushes the builder image to
-`$QITS_BUILD_REGISTRY/$QITS_IMAGE_REPOSITORY/graalvmce-musl-builder:jdk-25`, and other repositories
-build `FROM` that tag:
+`registry.qits.$QITS_DOMAIN/$QITS_IMAGE_REPOSITORY/graalvmce-musl-builder:jdk-25` (`wohlben.eu` when
+a qits-ci too old to inject `$QITS_DOMAIN` runs the recipe), and other repositories build `FROM` that
+tag:
 
 - **qits-artifacts-cli** passed it as `BUILDER_IMAGE` in its recipes. That repository is retired —
   its publish client now ships inside the `qits` CLI — so nothing of it names the tag any more.

@@ -53,25 +53,14 @@ WORKDIR /qits-build
 # stale one can shadow what this stage compiles.
 COPY . .
 
-# Where Maven Central is mirrored, when it is. CI passes the platform mirror's IN-NETWORK route
-# ($QITS_MAVEN_PROXY_URL): a RUN executes in the builder's own network namespace on qits-net, where
-# the edge vhost the old `--network host` reached does not resolve. EMPTY — the default, and every
-# hand build — deactivates `.qits-maven-settings.xml`'s central-proxy profile and the resolve goes
-# to Maven Central directly, exactly as it always did.
+# Where Maven Central is mirrored: https://mirror.qits.$QITS_DOMAIN/mirror/maven/central,
+# qits-mirror's cache — derived inside the RUN below from the one ARG, and answers 401 anonymously,
+# so every build that resolves through it needs a credential (qits-731).
 #
 # THE CREDENTIAL IS TWO SECRET MOUNTS ON THE mvnw RUN BELOW, in file form like every sibling's
 # (qits-docs-service's docker/Dockerfile carries the reasons for the form), exported as the
 # QITS_MAVEN_AUTH_USR/QITS_MAVEN_AUTH_PSW `.qits-maven-settings.xml` reads for `qits-central-proxy`.
-# On a remote CI runner (the EDGE plane, epic qits-441) the proxy URL is the PUBLIC mirror, which
-# answers an anonymous read 401 (`quarkus-bom … from/to qits-central-proxy …: 401`, release
-# request 55aa9718); there the two files hold the run's token subject and token. On the INTERNAL
-# plane they hold the commissioned pair, and the in-network mirror never challenges (measured
-# 2026-09-29: 200 anonymously, 200 with any Basic header), so Maven, which sends a server's
-# credentials only on a 401, never sends them — a read that stays exactly as anonymous as it was.
-# Absent secrets, every hand build's state, leave both variables empty, which the settings read as
-# unset.
-ARG QITS_MAVEN_CENTRAL_URL=
-ENV QITS_MAVEN_CENTRAL_URL=$QITS_MAVEN_CENTRAL_URL
+ARG QITS_DOMAIN=wohlben.eu
 
 # `quarkus.native.container-build=false`: we are already inside the container it would have launched,
 # and it has no docker to launch another with.
@@ -98,6 +87,7 @@ RUN --mount=type=secret,id=qits-client-id \
     --mount=type=secret,id=qits-client-secret \
     export QITS_MAVEN_AUTH_USR="$(cat /run/secrets/qits-client-id 2>/dev/null || true)"; \
     export QITS_MAVEN_AUTH_PSW="$(cat /run/secrets/qits-client-secret 2>/dev/null || true)"; \
+    export QITS_MAVEN_CENTRAL_URL="https://mirror.qits.$QITS_DOMAIN/mirror/maven/central"; \
     ./mvnw -B -ntp -s .qits-maven-settings.xml -pl ci-daemon -am package -Dnative -DskipTests \
       -Dquarkus.native.container-build=false \
       org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeBom \

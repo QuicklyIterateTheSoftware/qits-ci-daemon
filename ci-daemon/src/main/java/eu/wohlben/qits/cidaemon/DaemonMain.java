@@ -43,7 +43,8 @@ import org.jboss.logging.Logger;
  * Initialized} that failed to send, the step's chunks (bounded, oldest dropped first) and the
  * terminal frame. On the new socket the daemon says {@code Hello} again, and the host's {@code Ack}
  * is what releases the held frames, in order — {@code Initialized}, chunks by {@code seq}, then the
- * terminal frame. Every {@code seq} keeps the number it was minted with, so a host that already saw
+ * terminal frame. An {@code Initialized} that was written but never answered by a {@code RunStep}
+ * is sent again too. Every {@code seq} keeps the number it was minted with, so a host that already saw
  * one drops the copy. Only a reconnect budget that runs out ends the process, as exit 6.
  *
  * <p>A plain class with a plain constructor, not a bean: {@link Main} is the one place that resolves
@@ -106,6 +107,9 @@ public final class DaemonMain implements ControlSocket.Listener {
   private boolean live;
 
   private boolean initializedPending;
+
+  /** The checkout succeeded and {@code Initialized} was sent at least once. */
+  private boolean initializedSent;
   private final TreeMap<Long, StepChunk> heldChunks = new TreeMap<>();
   private long heldChars;
   private long droppedChunks;
@@ -251,7 +255,10 @@ public final class DaemonMain implements ControlSocket.Listener {
           new InitFailed(preparation.failure(), preparation.detail()), ExitCode.INIT_FAILED_SENT);
       return;
     }
-    deliver(new Initialized());
+    synchronized (outbox) {
+      initializedSent = true;
+      deliver(new Initialized());
+    }
   }
 
   private void onRunStep(RunStep request) {
@@ -363,7 +370,10 @@ public final class DaemonMain implements ControlSocket.Listener {
       heldChunks.clear();
       heldChars = 0;
       live = true;
-      if (initializedPending) {
+      // Also re-sent when the first copy was written but no RunStep has come back: a write the
+      // socket accepted is not a frame the host read, and a host still waiting for Initialized
+      // would otherwise wait out its own init deadline. The host ignores a duplicate.
+      if (initializedPending || (initializedSent && !stepStarted.get())) {
         initializedPending = false;
         transmit(new Initialized());
       }

@@ -309,6 +309,35 @@ class DaemonMainTest {
   }
 
   @Test
+  void anInitializedTheHostNeverAnsweredIsSentAgainOnTheNewSocket() throws Exception {
+    Host host =
+        host(
+            (h, message) -> {
+              if (message instanceof Hello) {
+                h.send(new Ack(CiDaemonProtocol.CAPABILITY_VERSION));
+              } else if (message instanceof Initialized) {
+                if (h.upgrades.get() == 1) {
+                  // Written and read here, but the socket goes before any RunStep: from the host's
+                  // side the frame may as well have been lost with the edge.
+                  h.socket.close();
+                } else {
+                  h.send(new RunStep("c1", "echo resumed", 300));
+                }
+              }
+            });
+
+    int code =
+        runDaemon(tokenEnv(host.url("/ci/daemon")), ready(), 30, 10_000, 10_000)
+            .get(30, TimeUnit.SECONDS);
+    host.awaitDrained();
+
+    assertEquals(ExitCode.OK, code);
+    assertEquals(2, host.upgrades.get());
+    assertEquals(1, host.receivedOn(2).stream().filter(Initialized.class::isInstance).count());
+    assertNotNull(host.first(StepFinished.class));
+  }
+
+  @Test
   void aSocketThatCannotBeReEstablishedWithinTheReconnectBudgetExitsSocketClosedEarly()
       throws Exception {
     Host host =

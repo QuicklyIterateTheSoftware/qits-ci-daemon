@@ -243,20 +243,168 @@ class DaemonMainTest {
   }
 
   @Test
-  void aSocketClosedBeforeRunStepIsAnExitAndNotARetry() throws Exception {
+  void aSocketDroppedMidStepIsReDialledAndTheStepFinishesOnTheNewSocket() throws Exception {
+    AtomicInteger initializations = new AtomicInteger();
+    Host host =
+        host(
+            (h, message) -> {
+              if (message instanceof Hello) {
+                if (h.upgrades.get() == 1) {
+                  h.send(new Ack(CiDaemonProtocol.CAPABILITY_VERSION));
+                } else {
+                  // Re-admit late, as a host behind a redeploying edge does: the step finishes
+                  // while the daemon is waiting, so its last output and its result are both held.
+                  ServerWebSocket ws = h.socket;
+                  vertx.setTimer(
+                      1_000,
+                      id ->
+                          ws.writeTextMessage(
+                              new JsonObject(
+                                      CiDaemonCodec.encode(
+                                          new Ack(CiDaemonProtocol.CAPABILITY_VERSION)))
+                                  .encode()));
+                }
+              } else if (message instanceof Initialized) {
+                h.send(new RunStep("c1", "echo before; sleep 0.3; echo during; exit 3", 300));
+              } else if (message instanceof StepChunk && h.upgrades.get() == 1) {
+                h.socket.close(); // the edge goes away with the step demonstrably running
+              }
+            });
+
+    int code =
+        runDaemon(
+                tokenEnv(host.url("/ci/daemon")),
+                () -> {
+                  initializations.incrementAndGet();
+                  return Workspace.Preparation.READY;
+                },
+                30,
+                10_000,
+                10_000)
+            .get(30, TimeUnit.SECONDS);
+    host.awaitDrained();
+
+    assertEquals(ExitCode.OK, code);
+    assertEquals(2, host.upgrades.get(), "one re-dial");
+    assertEquals(2, host.all(Hello.class).size(), "a Hello on each socket");
+    assertEquals(1, initializations.get(), "a second Ack must not clone again");
+    assertEquals(1, host.all(Initialized.class).size());
+    assertEquals(1, host.all(AckReceived.class).size());
+    StringBuilder out = new StringBuilder();
+    host.all(StepChunk.class).forEach(chunk -> out.append(chunk.text()));
+    assertTrue(out.toString().contains("before"), out::toString);
+    assertTrue(out.toString().contains("during"), out::toString);
+    // The held output reached the new socket, in seq order and ahead of the result.
+    List<CiDaemonMessage> second = host.receivedOn(2);
+    assertEquals(Hello.class, second.get(0).getClass(), () -> "Hello first: " + second);
+    assertEquals(StepFinished.class, second.get(second.size() - 1).getClass(), second::toString);
+    List<Long> seqs =
+        second.stream()
+            .filter(StepChunk.class::isInstance)
+            .map(m -> ((StepChunk) m).seq())
+            .toList();
+    assertFalse(seqs.isEmpty(), () -> "expected held chunks replayed on the new socket: " + second);
+    assertEquals(seqs.stream().sorted().toList(), seqs);
+    assertEquals(3, host.first(StepFinished.class).exitCode());
+  }
+
+  @Test
+  void aSocketThatCannotBeReEstablishedWithinTheReconnectBudgetExitsSocketClosedEarly()
+      throws Exception {
     Host host =
         host(
             (h, message) -> {
               if (message instanceof Hello) {
                 h.send(new Ack(CiDaemonProtocol.CAPABILITY_VERSION));
               } else if (message instanceof Initialized) {
-                h.socket.close(); // the host has reaped us; there is nothing to reconnect to
+                h.closeServer(); // the host has reaped us; nothing answers the re-dial
               }
             });
 
-    int code = runDaemon(host.url("/ci/daemon"), ready(), 30).get(30, TimeUnit.SECONDS);
+    long startedAt = System.nanoTime();
+    int code =
+        runDaemon(tokenEnv(host.url("/ci/daemon")), ready(), 30, 10_000, 600)
+            .get(30, TimeUnit.SECONDS);
+    long elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000L;
 
     assertEquals(ExitCode.SOCKET_CLOSED_EARLY, code);
+    assertTrue(elapsedMillis >= 500, () -> "the close ended the daemon before any re-dial: " + elapsedMillis + "ms");
+    assertTrue(elapsedMillis < 10_000, () -> "the reconnect budget did not bound the retry: " + elapsedMillis + "ms");
+  }
+
+  @Test
+  void aHostThatAcceptsTheReDialButNeverSpeaksDoesNotResetTheReconnectBudget() throws Exception {
+    Host host =
+        host(
+            (h, message) -> {
+              if (h.upgrades.get() > 1) {
+                h.socket.close(); // upgrade, then hang up on the Hello: not a re-admission
+              } else if (message instanceof Hello) {
+                h.send(new Ack(CiDaemonProtocol.CAPABILITY_VERSION));
+              } else if (message instanceof Initialized) {
+                h.socket.close();
+              }
+            });
+
+    int code =
+        runDaemon(tokenEnv(host.url("/ci/daemon")), ready(), 30, 10_000, 600)
+            .get(30, TimeUnit.SECONDS);
+
+    assertEquals(ExitCode.SOCKET_CLOSED_EARLY, code);
+    assertTrue(host.upgrades.get() >= 2, () -> "expected a re-dial, saw " + host.upgrades.get());
+  }
+
+  @Test
+  void aCloseTheDaemonAsksForItselfIsNeverReDialled() throws Exception {
+    Host host = host((h, message) -> {});
+    CompletableFuture<Void> connected = new CompletableFuture<>();
+    AtomicInteger outages = new AtomicInteger();
+    ControlSocket socket =
+        new ControlSocket(
+            vertx,
+            host.url("/ci/daemon"),
+            "run-t0ken",
+            new ControlSocket.Settings(10_000, 5_000, 50, 200, 5_000),
+            new ControlSocket.Listener() {
+              @Override
+              public void onConnected() {
+                connected.complete(null);
+              }
+
+              @Override
+              public void onReconnected() {
+                outages.incrementAndGet();
+              }
+
+              @Override
+              public void onDisconnected() {
+                outages.incrementAndGet();
+              }
+
+              @Override
+              public void onMessage(CiDaemonMessage message) {}
+
+              @Override
+              public void onClosed() {
+                outages.incrementAndGet();
+              }
+
+              @Override
+              public void onDialFailed(String detail) {}
+            });
+    try {
+      socket.start();
+      connected.get(10, TimeUnit.SECONDS);
+      socket.close().toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
+      host.awaitDrained();
+      // Several backoffs' worth: a re-dial would have upgraded again by now.
+      Thread.sleep(600);
+
+      assertEquals(1, host.upgrades.get());
+      assertEquals(0, outages.get());
+    } finally {
+      socket.shutdown();
+    }
   }
 
   @Test
@@ -430,7 +578,7 @@ class DaemonMainTest {
     return new DaemonMain(
             vertx,
             env,
-            new ControlSocket.Settings(10_000, 30_000, 500, 5_000),
+            new ControlSocket.Settings(10_000, 30_000, 500, 5_000, 90_000),
             ready(),
             (request, emit) -> step(request, emit))
         .run();
@@ -445,11 +593,21 @@ class DaemonMainTest {
       DaemonMain.Initializer initializer,
       long dialBudgetMillis,
       long heartbeatMillis) {
+    return runDaemon(env, initializer, dialBudgetMillis, heartbeatMillis, 2_000);
+  }
+
+  private CompletableFuture<Integer> runDaemon(
+      DaemonEnv env,
+      DaemonMain.Initializer initializer,
+      long dialBudgetMillis,
+      long heartbeatMillis,
+      long reconnectBudgetMillis) {
     DaemonMain daemon =
         new DaemonMain(
             vertx,
             env,
-            new ControlSocket.Settings(heartbeatMillis, dialBudgetMillis, 50, 200),
+            new ControlSocket.Settings(
+                heartbeatMillis, dialBudgetMillis, 50, 200, reconnectBudgetMillis),
             initializer,
             this::step);
     return CompletableFuture.supplyAsync(daemon::run);
@@ -524,13 +682,16 @@ class DaemonMainTest {
     private final BiConsumer<Host, CiDaemonMessage> script;
 
     final List<CiDaemonMessage> received = Collections.synchronizedList(new ArrayList<>());
+    /** Which upgrade (1-based) each entry of {@link #received} arrived on. */
+    private final List<Integer> receivedOn = Collections.synchronizedList(new ArrayList<>());
+    final AtomicInteger upgrades = new AtomicInteger();
     volatile MultiMap headers;
     volatile String requestPath;
     volatile String requestUri;
     volatile ServerWebSocket socket;
 
-    /** Completes when the daemon's socket closes; see {@link #awaitDrained()}. */
-    private final CompletableFuture<Void> closed = new CompletableFuture<>();
+    /** Completes when the daemon's latest socket closes; see {@link #awaitDrained()}. */
+    private volatile CompletableFuture<Void> closed = new CompletableFuture<>();
 
     Host(BiConsumer<Host, CiDaemonMessage> script, TestTls tls) throws Exception {
       this.script = script;
@@ -555,12 +716,18 @@ class DaemonMainTest {
       headers = ws.headers();
       requestPath = ws.path();
       requestUri = ws.uri();
+      int upgrade = upgrades.incrementAndGet();
+      CompletableFuture<Void> thisClosed = upgrade == 1 ? closed : new CompletableFuture<>();
+      closed = thisClosed;
       socket = ws;
-      ws.closeHandler(v -> closed.complete(null));
+      ws.closeHandler(v -> thisClosed.complete(null));
       ws.textMessageHandler(
           json -> {
             CiDaemonMessage message = CiDaemonCodec.decode(new JsonObject(json).getMap());
-            received.add(message);
+            synchronized (received) {
+              received.add(message);
+              receivedOn.add(upgrade);
+            }
             script.accept(this, message);
           });
     }
@@ -605,6 +772,23 @@ class DaemonMainTest {
       synchronized (received) {
         return received.stream().filter(type::isInstance).map(type::cast).findFirst().orElse(null);
       }
+    }
+
+    List<CiDaemonMessage> receivedOn(int upgrade) {
+      synchronized (received) {
+        List<CiDaemonMessage> on = new ArrayList<>();
+        for (int i = 0; i < received.size(); i++) {
+          if (receivedOn.get(i) == upgrade) {
+            on.add(received.get(i));
+          }
+        }
+        return on;
+      }
+    }
+
+    /** Stop answering altogether: the open socket goes, and nothing accepts a re-dial. */
+    void closeServer() {
+      server.close();
     }
 
     <T extends CiDaemonMessage> List<T> all(Class<T> type) {

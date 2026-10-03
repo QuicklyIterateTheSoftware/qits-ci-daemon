@@ -77,6 +77,9 @@ public class Main {
     @ConfigProperty(name = "qits.ci.dial-max-backoff-ms", defaultValue = "5000")
     long dialMaxBackoffMillis;
 
+    @ConfigProperty(name = "qits.ci.reconnect-budget-ms", defaultValue = "90000")
+    long reconnectBudgetMillis;
+
     @ConfigProperty(name = "qits.ci.git-timeout-seconds", defaultValue = "600")
     long gitTimeoutSeconds;
 
@@ -116,7 +119,8 @@ public class Main {
                   heartbeatMillis,
                   dialBudgetMillis,
                   dialInitialBackoffMillis,
-                  dialMaxBackoffMillis),
+                  dialMaxBackoffMillis,
+                  reconnectBudgetMillis),
               workspace::prepare,
               (request, emit) ->
                   new StepProcess(

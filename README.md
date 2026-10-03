@@ -131,6 +131,13 @@ with a `StepFinished` like any other ending. Failure to clone or check out repla
 with `InitFailed`, whose `reason` is the structured signal that retired qits-ci's old
 prelude-sentinel inference.
 
+A socket that drops after connecting — every step's does when qits-edge is redeployed — is
+re-dialled with the same token within `qits.ci.reconnect-budget-ms`. The step keeps running; the
+daemon says `Hello` again on the new socket, and the host's `Ack` releases what the outage held: an
+`Initialized` that failed to send, the step's chunks (about 1 MiB, oldest dropped first, `seq`
+unchanged) and the terminal frame. A second `Ack` does not clone again and a resent `RunStep` is
+ignored.
+
 **The workspace daemon never exits; this daemon always exits.** That is the one deliberate inversion
 of the precedent it otherwise mirrors. Any terminal condition — result delivered, `InitFailed` sent,
 an `Ack` carrying a capability version this binary does not know, or dial failure after a short
@@ -144,7 +151,7 @@ container reads honestly:
 | 3 | No connection within the dial budget (~30s total, not infinite). |
 | 4 | The `Ack` carried a capability version this binary does not know. |
 | 5 | `InitFailed` delivered — the daemon did its job, the container did not run its step. |
-| 6 | The socket closed before a `RunStep`; the host has reaped us. |
+| 6 | The socket dropped and the reconnect budget (~90s) ran out before the result was delivered; the host has reaped us. |
 | 7 | `Cancel` with no step running. |
 
 The socket already carried whether the daemon behaved; the exit code is about whether the

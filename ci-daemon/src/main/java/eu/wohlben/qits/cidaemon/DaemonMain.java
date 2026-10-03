@@ -10,7 +10,10 @@ import eu.wohlben.qits.cidaemon.protocol.InitFailed;
 import eu.wohlben.qits.cidaemon.protocol.Initialized;
 import eu.wohlben.qits.cidaemon.protocol.RunStep;
 import eu.wohlben.qits.cidaemon.protocol.StepFinished;
+import eu.wohlben.qits.cidaemon.protocol.StepChunk;
 import io.vertx.core.Vertx;
+import java.util.List;
+import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -34,6 +37,14 @@ import org.jboss.logging.Logger;
  * daemon that fell through to "keep waiting" would leave a container alive with nothing to do,
  * holding a slot the host has already accounted for. See {@link ExitCode} for which ending is which,
  * and why only a delivered {@code StepFinished} is a zero.
+ *
+ * <p><b>A dropped socket is not an ending</b> while {@link ControlSocket} is re-dialling it. The
+ * step keeps running through the outage, and what it must not lose is held here: an {@code
+ * Initialized} that failed to send, the step's chunks (bounded, oldest dropped first) and the
+ * terminal frame. On the new socket the daemon says {@code Hello} again, and the host's {@code Ack}
+ * is what releases the held frames, in order — {@code Initialized}, chunks by {@code seq}, then the
+ * terminal frame. Every {@code seq} keeps the number it was minted with, so a host that already saw
+ * one drops the copy. Only a reconnect budget that runs out ends the process, as exit 6.
  *
  * <p>A plain class with a plain constructor, not a bean: {@link Main} is the one place that resolves
  * configuration, and everything here arrives as an argument. That is also what lets the suite drive
@@ -72,9 +83,37 @@ public final class DaemonMain implements ControlSocket.Listener {
             return thread;
           });
 
+  /**
+   * How much chunk text an outage may hold before the oldest is dropped. About a megabyte: an edge
+   * redeploy is seconds, and a step that prints faster than this across one loses its oldest output
+   * rather than the daemon its memory.
+   */
+  static final int MAX_HELD_CHUNK_CHARS = 1 << 20;
+
   private final CompletableFuture<Integer> exit = new CompletableFuture<>();
+  private final AtomicBoolean acked = new AtomicBoolean();
   private final AtomicBoolean stepStarted = new AtomicBoolean();
   private volatile Step step;
+
+  /**
+   * Guards everything below. One lock across the decision to send and the send itself is what keeps
+   * a chunk from the step's thread overtaking the replay of the ones held before it — and a host
+   * that drops {@code seq <= lastSeq} would discard the held ones if it did.
+   */
+  private final Object outbox = new Object();
+
+  /** True from the host's Ack on a socket until that socket drops. Frames go out only while true. */
+  private boolean live;
+
+  private boolean initializedPending;
+  private final TreeMap<Long, StepChunk> heldChunks = new TreeMap<>();
+  private long heldChars;
+  private long droppedChunks;
+
+  /** The terminal frame and the exit it ends in, once there is one; kept until it is written. */
+  private CiDaemonMessage terminal;
+  private int terminalCode;
+  private boolean terminalInFlight;
 
   public DaemonMain(
       Vertx vertx,
@@ -128,9 +167,30 @@ public final class DaemonMain implements ControlSocket.Listener {
   @Override
   public void onConnected() {
     LOG.infof("ci-daemon registered as %s; awaiting Ack.", env.daemonId());
+    hello();
+  }
+
+  @Override
+  public void onReconnected() {
+    LOG.infof("ci-daemon re-registering as %s; awaiting Ack.", env.daemonId());
+    hello();
+  }
+
+  @Override
+  public void onDisconnected() {
+    synchronized (outbox) {
+      live = false;
+    }
+  }
+
+  /**
+   * A Hello that fails to send needs no handling of its own: the socket it was written to is gone,
+   * and the re-dial that follows says it again.
+   */
+  private void hello() {
     socket
         .send(new Hello(env.daemonId(), CiDaemonProtocol.CAPABILITY_VERSION))
-        .onFailure(t -> finish(ExitCode.SOCKET_CLOSED_EARLY, "Hello could not be sent"));
+        .onFailure(t -> LOG.debugf("ci-daemon could not send Hello: %s", t.getMessage()));
   }
 
   @Override
@@ -155,14 +215,19 @@ public final class DaemonMain implements ControlSocket.Listener {
       closeAndFinish(ExitCode.CAPABILITY_MISMATCH);
       return;
     }
-    // Confirms host→daemon delivery, which Hello never did — see AckReceived's javadoc. Fired
-    // before the clone starts and best-effort: a container probe is the only caller that waits for
-    // it, and a probe that never sees it is REJECTED at its own deadline rather than this daemon
-    // retrying a send the socket has already told it is gone.
-    socket
-        .send(new AckReceived())
-        .onFailure(t -> LOG.debugf("ci-daemon could not confirm the Ack: %s", t.getMessage()));
-    workers.execute(this::initialize);
+    if (acked.compareAndSet(false, true)) {
+      // Confirms host→daemon delivery, which Hello never did — see AckReceived's javadoc. Fired
+      // before the clone starts and best-effort: a container probe is the only caller that waits
+      // for it, and a probe that never sees it is REJECTED at its own deadline rather than this
+      // daemon retrying a send the socket has already told it is gone. Only for the first Ack: the
+      // one a reconnect earns re-admits a launch that was confirmed long ago, and a second clone
+      // into the same checkout would be a second initialization of one container.
+      socket
+          .send(new AckReceived())
+          .onFailure(t -> LOG.debugf("ci-daemon could not confirm the Ack: %s", t.getMessage()));
+      workers.execute(this::initialize);
+    }
+    release();
   }
 
   /**
@@ -186,21 +251,20 @@ public final class DaemonMain implements ControlSocket.Listener {
           new InitFailed(preparation.failure(), preparation.detail()), ExitCode.INIT_FAILED_SENT);
       return;
     }
-    socket
-        .send(new Initialized())
-        .onFailure(t -> finish(ExitCode.SOCKET_CLOSED_EARLY, "Initialized could not be sent"));
+    deliver(new Initialized());
   }
 
   private void onRunStep(RunStep request) {
     if (!stepStarted.compareAndSet(false, true)) {
-      // Exactly one per container lifetime. A second one is a host bug or a hostile frame; running
-      // it would give one container's results two identities.
-      LOG.warnf("ci-daemon ignored a second RunStep (%s)", request.correlationId());
+      // Exactly one per container lifetime. A host re-admitting this launch after an outage may send
+      // it again; anything else is a host bug or a hostile frame. Running it would give one
+      // container's results two identities.
+      LOG.infof("ci-daemon ignored a second RunStep (%s)", request.correlationId());
       return;
     }
     workers.execute(
         () -> {
-          Step running = steps.create(request, this::sendChunk);
+          Step running = steps.create(request, this::deliver);
           step = running;
           StepFinished finished = running.run();
           // The step's terminal frame, then the close, then the exit — in that order, each waiting
@@ -224,8 +288,9 @@ public final class DaemonMain implements ControlSocket.Listener {
 
   @Override
   public void onClosed() {
-    // Already ending (the terminal frame's close, or a race with it) — nothing to say.
-    finish(ExitCode.SOCKET_CLOSED_EARLY, "the control socket closed before a step could finish");
+    finish(
+        ExitCode.SOCKET_CLOSED_EARLY,
+        "the control socket dropped and could not be re-established before a step could finish");
   }
 
   @Override
@@ -234,17 +299,124 @@ public final class DaemonMain implements ControlSocket.Listener {
     finish(ExitCode.DIAL_FAILED, detail);
   }
 
-  /** Chunks are best-effort: if the socket is gone, {@link #onClosed} is already ending us. */
-  private void sendChunk(CiDaemonMessage chunk) {
-    socket.send(chunk);
+  /**
+   * Send a frame that must survive an outage — {@code Initialized} or a step chunk — or hold it
+   * until the host has re-admitted this launch. Anything else that arrives here (there is nothing
+   * else today) is sent best-effort.
+   */
+  private void deliver(CiDaemonMessage message) {
+    synchronized (outbox) {
+      if (live) {
+        transmit(message);
+      } else {
+        hold(message);
+      }
+    }
   }
 
-  private void sendAndFinish(CiDaemonMessage message, int code) {
+  /** Under {@link #outbox}. A write that fails means the socket is going; keep the frame. */
+  private void transmit(CiDaemonMessage message) {
     socket
         .send(message)
-        .onFailure(t -> LOG.errorf("ci-daemon could not deliver its terminal frame: %s", t.getMessage()))
-        .eventually(socket::close)
-        .onComplete(v -> finish(code, null));
+        .onFailure(
+            t -> {
+              synchronized (outbox) {
+                live = false;
+                hold(message);
+              }
+            });
+  }
+
+  /** Under {@link #outbox}. */
+  private void hold(CiDaemonMessage message) {
+    switch (message) {
+      case Initialized initialized -> initializedPending = true;
+      case StepChunk chunk -> {
+        if (heldChunks.put(chunk.seq(), chunk) == null) {
+          heldChars += chunk.text().length();
+        }
+        while (heldChars > MAX_HELD_CHUNK_CHARS && heldChunks.size() > 1) {
+          heldChars -= heldChunks.pollFirstEntry().getValue().text().length();
+          if (droppedChunks++ == 0) {
+            LOG.warnf(
+                "ci-daemon holds more than %d characters of output for the control socket's"
+                    + " return; dropping the oldest",
+                MAX_HELD_CHUNK_CHARS);
+          }
+        }
+      }
+      default -> {}
+    }
+  }
+
+  /**
+   * The host has Acked on this socket: send what the outage held, in the order it was produced, and
+   * go live. On the first Ack there is nothing held and this only opens the gate.
+   */
+  private void release() {
+    synchronized (outbox) {
+      if (droppedChunks > 0) {
+        LOG.warnf("ci-daemon dropped %d chunk(s) of output during the outage", droppedChunks);
+        droppedChunks = 0;
+      }
+      List<StepChunk> replay = List.copyOf(heldChunks.values());
+      heldChunks.clear();
+      heldChars = 0;
+      live = true;
+      if (initializedPending) {
+        initializedPending = false;
+        transmit(new Initialized());
+      }
+      if (!replay.isEmpty()) {
+        LOG.infof("ci-daemon replaying %d chunk(s) held through the outage", replay.size());
+      }
+      replay.forEach(this::transmit);
+      if (terminal != null && !terminalInFlight) {
+        transmitTerminal();
+      }
+    }
+  }
+
+  /**
+   * The terminal frame, then the close, then the exit — each waiting on the last, so the result
+   * cannot be lost to a process that exited while the write was still queued. A write that fails
+   * keeps the frame for the reconnect; only the reconnect budget running out gives up on it.
+   */
+  private void sendAndFinish(CiDaemonMessage message, int code) {
+    synchronized (outbox) {
+      terminal = message;
+      terminalCode = code;
+      if (live) {
+        transmitTerminal();
+      } else {
+        LOG.infof(
+            "ci-daemon holding its %s until the control socket is back",
+            message.getClass().getSimpleName());
+      }
+    }
+  }
+
+  /** Under {@link #outbox}. */
+  private void transmitTerminal() {
+    CiDaemonMessage message = terminal;
+    int code = terminalCode;
+    terminalInFlight = true;
+    socket
+        .send(message)
+        .onComplete(
+            written -> {
+              if (written.succeeded()) {
+                closeAndFinish(code);
+                return;
+              }
+              LOG.warnf(
+                  "ci-daemon could not deliver its %s (%s); holding it for the reconnect",
+                  message.getClass().getSimpleName(), written.cause().getMessage());
+              synchronized (outbox) {
+                terminalInFlight = false;
+                live = false;
+              }
+            });
   }
 
   private void closeAndFinish(int code) {

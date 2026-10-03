@@ -36,8 +36,10 @@ public final class ExitCode {
   public static final int INIT_FAILED_SENT = 5;
 
   /**
-   * The socket closed before a {@code RunStep} arrived. Not a reason to re-dial: the host has
-   * reaped us, or decided not to give us work, and either way there is nothing to reconnect to.
+   * The socket dropped and could not be re-established within the reconnect budget before the step's
+   * result was delivered. A drop alone is not this ending — an edge redeploy drops every socket and
+   * the daemon re-dials through it; a host that has not taken the launch back by the end of the
+   * budget has reaped it, and then there is nothing to reconnect to.
    */
   public static final int SOCKET_CLOSED_EARLY = 6;
 

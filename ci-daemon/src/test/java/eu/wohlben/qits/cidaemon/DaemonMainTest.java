@@ -31,10 +31,13 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
+import java.util.logging.Handler;
+import java.util.logging.LogRecord;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledOnOs;
@@ -63,6 +66,9 @@ class DaemonMainTest {
   void tearDown() throws Exception {
     for (Host host : List.copyOf(hosts)) {
       host.close();
+    }
+    for (FakeCollector collector : List.copyOf(collectors)) {
+      collector.close();
     }
     vertx.close().toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
   }
@@ -570,7 +576,362 @@ class DaemonMainTest {
     assertNotNull(host.first(StepFinished.class));
   }
 
+  // --- telemetry: flushed before the terminal frame ----------------------------------------------
+
+  @Test
+  void aStepThatExitsRightAfterItsLastLineStillExportsItBeforeTheHostSeesStepFinished()
+      throws Exception {
+    FakeCollector collector = collector();
+    Host host = host((h, message) -> h.reply(message, "echo last words; echo complaint >&2; exit 3"));
+    Telemetry telemetry = telemetry(collector.endpoint(), 3_000);
+
+    int code =
+        withTelemetryHandler(
+            telemetry,
+            () -> runDaemon(tokenEnv(host.url("/ci/daemon")), telemetry).get(30, TimeUnit.SECONDS));
+    host.awaitDrained();
+
+    assertEquals(ExitCode.OK, code);
+    assertEquals(3, host.first(StepFinished.class).exitCode());
+    assertTrue(
+        collector.lastAnsweredAtNanos() < host.stepFinishedAtNanos,
+        "every telemetry request must be answered before the host sees StepFinished");
+
+    List<OtlpDecode.Line> lines = collector.lines();
+    OtlpDecode.Line last = only(lines, "last words");
+    assertEquals(Map.of(Telemetry.STREAM_ATTRIBUTE, "out"), last.attributes());
+    assertEquals("INFO", last.severityText());
+    OtlpDecode.Line complaint = only(lines, "complaint");
+    assertEquals(Map.of(Telemetry.STREAM_ATTRIBUTE, "err"), complaint.attributes());
+    assertEquals("WARN", complaint.severityText());
+
+    List<OtlpDecode.Span> spans = collector.spans();
+    assertEquals(
+        List.of(Spans.ROOT, "dial", "checkout", "script"),
+        spans.stream().map(OtlpDecode.Span::name).toList());
+    OtlpDecode.Span script = spans.get(3);
+    assertEquals(3L, script.attributes().get("qits.ci.exit_code"));
+    assertEquals(false, script.attributes().get("qits.ci.timed_out"));
+    assertFalse(script.attributes().containsKey("qits.ci.cancelled"));
+    assertEquals(Otlp.STATUS_ERROR, script.statusCode());
+    assertEquals("the script exited 3", script.statusMessage());
+    assertEquals(Otlp.STATUS_ERROR, spans.getFirst().statusCode());
+    assertEquals(Otlp.STATUS_OK, spans.get(1).statusCode());
+    assertEquals(script.spanId(), last.spanId(), "output carries the script span's ids");
+    assertEquals(script.traceId(), last.traceId());
+    // The resource travels on every request, and names the run.
+    assertEquals(
+        "run-9", OtlpDecode.traces(collector.to(Telemetry.TRACES_PATH).getFirst().body()).resource().get("qits.ci.run_id"));
+    assertTrue(
+        lines.stream().anyMatch(l -> l.body().startsWith("ci-daemon registered as daemon-1")),
+        "the daemon's own lines are exported too");
+    assertTrue(telemetry.outcome().startsWith("telemetry: submitted "), telemetry::outcome);
+  }
+
+  @Test
+  void aCollectorThatNeverAnswersDelaysStepFinishedByAtMostTheFlushBoundAndChangesNothing()
+      throws Exception {
+    FakeCollector collector = collector();
+    collector.silent = true;
+    Host host = host((h, message) -> h.reply(message, "echo hi; exit 5"));
+    Telemetry telemetry = telemetry(collector.endpoint(), 500);
+    List<String> logged = Collections.synchronizedList(new ArrayList<>());
+
+    long startedAt = System.nanoTime();
+    int code =
+        withTelemetryHandler(
+            telemetry,
+            logged,
+            () -> runDaemon(tokenEnv(host.url("/ci/daemon")), telemetry).get(30, TimeUnit.SECONDS));
+    long elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000L;
+    host.awaitDrained();
+
+    assertEquals(ExitCode.OK, code);
+    assertEquals(5, host.first(StepFinished.class).exitCode(), "the step's real exit code");
+    assertTrue(elapsedMillis >= 500, () -> "the flush did not wait at all: " + elapsedMillis + "ms");
+    assertTrue(elapsedMillis < 500 + 5_000, () -> "the flush bound did not hold: " + elapsedMillis + "ms");
+    assertEquals(
+        "telemetry: NOT submitted (timeout after 500 ms)", lineBeforeExit(logged, "ci-daemon exiting 0"));
+  }
+
+  @Test
+  void aCollectorWithNoListenerIsNotSubmittedAndTheStepEndsAsIfThereWereNone() throws Exception {
+    Host host = host((h, message) -> h.reply(message, "exit 0"));
+    Telemetry telemetry = telemetry("http://127.0.0.1:1/otel", 3_000);
+    List<String> logged = Collections.synchronizedList(new ArrayList<>());
+
+    int code =
+        withTelemetryHandler(
+            telemetry,
+            logged,
+            () -> runDaemon(tokenEnv(host.url("/ci/daemon")), telemetry).get(30, TimeUnit.SECONDS));
+    host.awaitDrained();
+
+    assertEquals(ExitCode.OK, code);
+    assertEquals(0, host.first(StepFinished.class).exitCode());
+    String last = lineBeforeExit(logged, "ci-daemon exiting 0");
+    assertTrue(last.startsWith("telemetry: NOT submitted ("), last);
+  }
+
+  @Test
+  void aThousandLinesOfOutputExportOnlyTheLatestTwoHundredAndNoneOfTheDaemonsOwn()
+      throws Exception {
+    FakeCollector collector = collector();
+    Host host =
+        host((h, message) -> h.reply(message, "for i in $(seq 1 1000); do echo \"line $i\"; done"));
+    Telemetry telemetry = telemetry(collector.endpoint(), 3_000);
+    List<String> logged = Collections.synchronizedList(new ArrayList<>());
+
+    int code =
+        withTelemetryHandler(
+            telemetry,
+            logged,
+            () -> runDaemon(tokenEnv(host.url("/ci/daemon")), telemetry).get(30, TimeUnit.SECONDS));
+    host.awaitDrained();
+
+    assertEquals(ExitCode.OK, code);
+    List<OtlpDecode.Line> lines = collector.lines();
+    List<String> output =
+        lines.stream()
+            .filter(l -> l.attributes().containsKey(Telemetry.STREAM_ATTRIBUTE))
+            .map(OtlpDecode.Line::body)
+            .toList();
+    List<String> expected = new ArrayList<>();
+    for (int i = 801; i <= 1000; i++) {
+      expected.add("line " + i);
+    }
+    assertEquals(expected, output);
+    assertEquals(
+        1,
+        lines.stream()
+            .filter(l -> l.body().equals("step output: 1000 lines, 800 not exported"))
+            .count());
+    // Every line the daemon logged before the flush began is there — the output has a buffer of
+    // its own and cannot displace one of them.
+    List<String> exported = lines.stream().map(OtlpDecode.Line::body).toList();
+    List<String> beforeFlush;
+    synchronized (logged) {
+      int flushLine = logged.indexOf(telemetry.outcome());
+      beforeFlush = List.copyOf(logged.subList(0, flushLine));
+    }
+    assertFalse(beforeFlush.isEmpty());
+    for (String own : beforeFlush) {
+      assertTrue(exported.contains(own), () -> "not exported: " + own);
+    }
+  }
+
+  @Test
+  void anInitFailedIsFlushedBeforeItIsSentAndItsCheckoutSpanSaysWhy() throws Exception {
+    FakeCollector collector = collector();
+    Host host = host((h, message) -> h.reply(message));
+    Telemetry telemetry = telemetry(collector.endpoint(), 3_000);
+
+    int code =
+        withTelemetryHandler(
+            telemetry,
+            () ->
+                runDaemon(
+                        tokenEnv(host.url("/ci/daemon")),
+                        () -> new Workspace.Preparation(InitFailed.Reason.SHA_GONE, "gone"),
+                        telemetry)
+                    .get(30, TimeUnit.SECONDS));
+    host.awaitDrained();
+
+    assertEquals(ExitCode.INIT_FAILED_SENT, code);
+    assertTrue(collector.lastAnsweredAtNanos() < host.initFailedAtNanos);
+    OtlpDecode.Span checkout =
+        collector.spans().stream().filter(s -> s.name().equals("checkout")).findFirst().orElseThrow();
+    assertEquals(Otlp.STATUS_ERROR, checkout.statusCode());
+    assertEquals("InitFailed SHA_GONE: gone", checkout.statusMessage());
+  }
+
+  @Test
+  void aDialThatFailsStillFlushesWhatItHasBeforeExiting() throws Exception {
+    FakeCollector collector = collector();
+    Telemetry telemetry = telemetry(collector.endpoint(), 3_000);
+
+    int code =
+        withTelemetryHandler(
+            telemetry,
+            () ->
+                runDaemon(tokenEnv("ws://127.0.0.1:1/ci/daemon"), ready(), telemetry, 300)
+                    .get(30, TimeUnit.SECONDS));
+
+    assertEquals(ExitCode.DIAL_FAILED, code);
+    List<OtlpDecode.Span> spans = collector.spans();
+    assertEquals(List.of(Spans.ROOT, "dial"), spans.stream().map(OtlpDecode.Span::name).toList());
+    assertEquals(Otlp.STATUS_ERROR, spans.get(1).statusCode());
+    assertTrue(spans.getFirst().statusMessage().startsWith("dial failed: "));
+  }
+
+  @Test
+  void aMisconfiguredDaemonExportsNothing() throws Exception {
+    FakeCollector collector = collector();
+    Telemetry telemetry = telemetry(collector.endpoint(), 3_000);
+    DaemonEnv env =
+        new DaemonEnv(
+            "ws://127.0.0.1:1/ci/daemon", "daemon-1", "file:///origin", "main", "abc123f", "", "");
+
+    int code =
+        withTelemetryHandler(
+            telemetry,
+            () ->
+                new DaemonMain(
+                        vertx,
+                        env,
+                        new ControlSocket.Settings(10_000, 30_000, 500, 5_000, 90_000),
+                        ready(),
+                        this::step,
+                        telemetry)
+                    .run());
+    // The shutdown hook's path: a flush after a misconfigured run sends nothing either.
+    telemetry.shutdownHook().run();
+
+    assertEquals(ExitCode.MISCONFIGURED, code);
+    assertEquals(List.of(), collector.requests);
+  }
+
+  @Test
+  void aTerminalFrameHeldThroughAnOutageIsNotFlushedTwice() throws Exception {
+    FakeCollector collector = collector();
+    Host host =
+        host(
+            (h, message) -> {
+              if (message instanceof Hello) {
+                if (h.upgrades.get() == 1) {
+                  h.send(new Ack(CiDaemonProtocol.CAPABILITY_VERSION));
+                } else {
+                  ServerWebSocket ws = h.socket;
+                  vertx.setTimer(
+                      1_000,
+                      id ->
+                          ws.writeTextMessage(
+                              new JsonObject(
+                                      CiDaemonCodec.encode(
+                                          new Ack(CiDaemonProtocol.CAPABILITY_VERSION)))
+                                  .encode()));
+                }
+              } else if (message instanceof Initialized) {
+                h.send(new RunStep("c1", "echo before; sleep 0.3; echo during; exit 3", 300));
+              } else if (message instanceof StepChunk && h.upgrades.get() == 1) {
+                h.socket.close();
+              }
+            });
+    Telemetry telemetry = telemetry(collector.endpoint(), 3_000);
+
+    int code =
+        withTelemetryHandler(
+            telemetry,
+            () ->
+                runDaemon(tokenEnv(host.url("/ci/daemon")), ready(), telemetry, 30)
+                    .get(30, TimeUnit.SECONDS));
+    host.awaitDrained();
+
+    assertEquals(ExitCode.OK, code);
+    assertEquals(2, host.upgrades.get());
+    assertEquals(3, host.first(StepFinished.class).exitCode());
+    assertEquals(1, collector.to(Telemetry.TRACES_PATH).size(), "one flush, not one per socket");
+    assertTrue(collector.lastAnsweredAtNanos() < host.stepFinishedAtNanos);
+  }
+
   // --- harness ------------------------------------------------------------------------------------
+
+  private final List<FakeCollector> collectors = Collections.synchronizedList(new ArrayList<>());
+
+  private FakeCollector collector() throws Exception {
+    FakeCollector collector = new FakeCollector(vertx);
+    collectors.add(collector);
+    return collector;
+  }
+
+  private Telemetry telemetry(String endpoint, long flushMillis) {
+    return new Telemetry(
+        vertx,
+        endpoint,
+        "run-t0ken",
+        Telemetry.resource("run-9", "0", "repo-1", "r", "p", "main", "0123456789abcdef", null),
+        "run-9",
+        new Telemetry.Settings(4096, 512, 60_000, 200, flushMillis),
+        Telemetry::nowNanos);
+  }
+
+  private interface Run<T> {
+    T run() throws Exception;
+  }
+
+  private static <T> T withTelemetryHandler(Telemetry telemetry, Run<T> body) throws Exception {
+    return withTelemetryHandler(telemetry, Collections.synchronizedList(new ArrayList<>()), body);
+  }
+
+  /**
+   * The handler on the root logger, as {@link Main} installs it, plus one that keeps every message
+   * this test's daemon logged — the {@code docker logs} a runner would tail. Both are removed after.
+   */
+  private static <T> T withTelemetryHandler(Telemetry telemetry, List<String> logged, Run<T> body)
+      throws Exception {
+    java.util.logging.Logger root = java.util.logging.Logger.getLogger("");
+    Handler capture =
+        new Handler() {
+          @Override
+          public void publish(LogRecord record) {
+            if (record.getLoggerName() != null
+                && record.getLoggerName().startsWith("eu.wohlben.qits.cidaemon")
+                && record.getLevel().intValue() >= java.util.logging.Level.INFO.intValue()) {
+              logged.add(new java.util.logging.SimpleFormatter().formatMessage(record));
+            }
+          }
+
+          @Override
+          public void flush() {}
+
+          @Override
+          public void close() {}
+        };
+    root.addHandler(telemetry);
+    root.addHandler(capture);
+    try {
+      return body.run();
+    } finally {
+      root.removeHandler(telemetry);
+      root.removeHandler(capture);
+    }
+  }
+
+  private static String lineBeforeExit(List<String> logged, String exitLine) {
+    synchronized (logged) {
+      int at = logged.indexOf(exitLine);
+      assertTrue(at > 0, () -> "no '" + exitLine + "' in " + logged);
+      return logged.get(at - 1);
+    }
+  }
+
+  private static OtlpDecode.Line only(List<OtlpDecode.Line> lines, String body) {
+    List<OtlpDecode.Line> found = lines.stream().filter(l -> l.body().equals(body)).toList();
+    assertEquals(1, found.size(), () -> "'" + body + "' in " + lines);
+    return found.getFirst();
+  }
+
+  private CompletableFuture<Integer> runDaemon(DaemonEnv env, Telemetry telemetry) {
+    return runDaemon(env, ready(), telemetry);
+  }
+
+  private CompletableFuture<Integer> runDaemon(
+      DaemonEnv env, DaemonMain.Initializer initializer, Telemetry telemetry) {
+    return runDaemon(env, initializer, telemetry, 30);
+  }
+
+  private CompletableFuture<Integer> runDaemon(
+      DaemonEnv env, DaemonMain.Initializer initializer, Telemetry telemetry, long dialBudgetMillis) {
+    DaemonMain daemon =
+        new DaemonMain(
+            vertx,
+            env,
+            new ControlSocket.Settings(10_000, dialBudgetMillis, 50, 200, 10_000),
+            initializer,
+            this::step,
+            telemetry);
+    return CompletableFuture.supplyAsync(daemon::run);
+  }
 
   private DaemonMain.Initializer ready() {
     return () -> Workspace.Preparation.READY;
@@ -718,6 +1079,10 @@ class DaemonMainTest {
     volatile String requestPath;
     volatile String requestUri;
     volatile ServerWebSocket socket;
+    /** When this side read the terminal frame, to order it against the telemetry's requests. */
+    volatile long stepFinishedAtNanos = Long.MIN_VALUE;
+
+    volatile long initFailedAtNanos = Long.MIN_VALUE;
 
     /** Completes when the daemon's latest socket closes; see {@link #awaitDrained()}. */
     private volatile CompletableFuture<Void> closed = new CompletableFuture<>();
@@ -753,6 +1118,11 @@ class DaemonMainTest {
       ws.textMessageHandler(
           json -> {
             CiDaemonMessage message = CiDaemonCodec.decode(new JsonObject(json).getMap());
+            if (message instanceof StepFinished && stepFinishedAtNanos == Long.MIN_VALUE) {
+              stepFinishedAtNanos = System.nanoTime();
+            } else if (message instanceof InitFailed && initFailedAtNanos == Long.MIN_VALUE) {
+              initFailedAtNanos = System.nanoTime();
+            }
             synchronized (received) {
               received.add(message);
               receivedOn.add(upgrade);

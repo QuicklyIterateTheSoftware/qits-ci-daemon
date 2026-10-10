@@ -7,6 +7,7 @@ import io.vertx.core.Vertx;
 import jakarta.inject.Inject;
 import java.nio.file.Path;
 import java.util.Optional;
+import org.jboss.logging.Logger;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 
 /**
@@ -26,6 +27,16 @@ import org.eclipse.microprofile.config.inject.ConfigProperty;
  */
 @QuarkusMain
 public class Main {
+
+  private static final Logger LOG = Logger.getLogger(Main.class);
+
+  /**
+   * Read raw rather than through config, because its empty value means something: set and empty
+   * switches the telemetry export off, where unset derives it (see {@link Telemetry#endpoint}) —
+   * and SmallRye reads an empty value as no value at all. The config key {@code
+   * qits.ci.telemetry-url} is the fallback when the variable is absent.
+   */
+  static final String TELEMETRY_URL = "QITS_CI_TELEMETRY_URL";
 
   public static void main(String... args) {
     Quarkus.run(DaemonApplication.class, args);
@@ -93,6 +104,35 @@ public class Main {
     @ConfigProperty(name = "qits.ci.step-chunk-flush-ms", defaultValue = "100")
     long stepChunkFlushMillis;
 
+    @ConfigProperty(name = "qits.ci.telemetry-url")
+    Optional<String> telemetryUrl;
+
+    @ConfigProperty(name = "qits.ci.telemetry-flush-ms", defaultValue = "3000")
+    long telemetryFlushMillis;
+
+    @ConfigProperty(name = "qits.ci.telemetry-output-max-lines", defaultValue = "200")
+    int telemetryOutputMaxLines;
+
+    // Labels on the telemetry and nothing else — see application.properties. All optional: a value
+    // the launcher did not hand over is an attribute left out, never a reason not to run.
+    @ConfigProperty(name = "qits.ci.run-id")
+    Optional<String> runId;
+
+    @ConfigProperty(name = "qits.ci.step-index")
+    Optional<String> stepIndex;
+
+    @ConfigProperty(name = "qits.ci.repo-id")
+    Optional<String> repoId;
+
+    @ConfigProperty(name = "qits.ci.repo-name")
+    Optional<String> repoName;
+
+    @ConfigProperty(name = "qits.ci.project-id")
+    Optional<String> projectId;
+
+    @ConfigProperty(name = "qits.domain")
+    Optional<String> domain;
+
     @Override
     public int run(String... args) {
       DaemonEnv env =
@@ -104,6 +144,13 @@ public class Main {
               sha.orElse(""),
               token.orElse(""),
               tokenSubject.orElse(""));
+      Telemetry telemetry = telemetry(env);
+      // On the root logger, so every line this process writes is shipped — queued from here, sent
+      // once the environment is known to be complete.
+      java.util.logging.Logger.getLogger("").addHandler(telemetry);
+      if (telemetry.enabled()) {
+        Runtime.getRuntime().addShutdownHook(telemetry.shutdownHook());
+      }
       Path dir = Path.of(workspaceDir);
       Workspace workspace =
           new Workspace(
@@ -132,8 +179,43 @@ public class Main {
                       stepKillGraceMillis,
                       // Read here rather than captured above: initialization decides it, and it has
                       // always completed by the time a RunStep is accepted.
-                      workspace.shell()))
+                      workspace.shell()),
+              telemetry)
           .run();
+    }
+
+    /**
+     * The export, or {@link Telemetry#off()}. A malformed override switches it off with one line
+     * rather than failing the step: telemetry is never allowed to change a step's outcome.
+     */
+    private Telemetry telemetry(DaemonEnv env) {
+      String raw = System.getenv(TELEMETRY_URL);
+      String endpoint;
+      try {
+        endpoint = Telemetry.endpoint(raw != null ? raw : telemetryUrl.orElse(null), env.daemonUrl());
+      } catch (IllegalArgumentException malformed) {
+        LOG.warnf("ci-daemon exports no telemetry: %s", malformed.getMessage());
+        return Telemetry.off();
+      }
+      if (endpoint == null) {
+        return Telemetry.off();
+      }
+      return new Telemetry(
+          vertx,
+          endpoint,
+          env.token(),
+          Telemetry.resource(
+              runId.orElse(null),
+              stepIndex.orElse(null),
+              repoId.orElse(null),
+              repoName.orElse(null),
+              projectId.orElse(null),
+              env.branch(),
+              env.sha(),
+              domain.orElse(null)),
+          runId.orElse(null),
+          Telemetry.Settings.defaults(telemetryOutputMaxLines, telemetryFlushMillis),
+          Telemetry::nowNanos);
     }
   }
 }

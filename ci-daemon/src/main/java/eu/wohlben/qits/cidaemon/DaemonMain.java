@@ -26,7 +26,7 @@ import org.jboss.logging.Logger;
  *
  * <pre>
  *   dial → Hello → Ack → AckReceived → clone+checkout → Initialized → RunStep → StepChunk* →
- *   StepFinished → exit
+ *   flush telemetry → StepFinished → exit
  * </pre>
  *
  * with {@code Heartbeat} underneath from dial to close, {@code InitFailed} standing in for {@code
@@ -46,6 +46,17 @@ import org.jboss.logging.Logger;
  * terminal frame. An {@code Initialized} that was written but never answered by a {@code RunStep}
  * is sent again too. Every {@code seq} keeps the number it was minted with, so a host that already saw
  * one drops the copy. Only a reconnect budget that runs out ends the process, as exit 6.
+ *
+ * <p><b>Telemetry is flushed before the terminal frame, never after it.</b> qits-ci {@code docker rm
+ * -f}s the container the moment {@code StepFinished} arrives, so whatever this process still had to
+ * say after that frame would race a SIGKILL. Every ending therefore runs {@link Telemetry#flush}
+ * first — bounded by {@code qits.ci.telemetry-flush-ms}, never failing — and only its completion
+ * hands the terminal frame to the socket. The flush is a future composed in front of the send rather
+ * than a wait: {@code sendAndFinish} runs on a worker, but the flush's own HTTP calls and the
+ * terminal write both need an event loop, and nothing here may park one. A frame held through an
+ * outage was flushed before it was held, and the flush runs once, so the replay does not flush
+ * again. The endings without a terminal frame (exits 3, 4, 6, 7) flush the same way before they
+ * finish; a misconfigured daemon (exit 2) exports nothing.
  *
  * <p>A plain class with a plain constructor, not a bean: {@link Main} is the one place that resolves
  * configuration, and everything here arrives as an argument. That is also what lets the suite drive
@@ -71,6 +82,7 @@ public final class DaemonMain implements ControlSocket.Listener {
   private final ControlSocket socket;
   private final Initializer initializer;
   private final Steps steps;
+  private final Telemetry telemetry;
 
   /**
    * Off-event-loop pool for the two blocking things this daemon does — the clone and the step.
@@ -95,6 +107,13 @@ public final class DaemonMain implements ControlSocket.Listener {
   private final AtomicBoolean acked = new AtomicBoolean();
   private final AtomicBoolean stepStarted = new AtomicBoolean();
   private volatile Step step;
+  private volatile boolean cancelRequested;
+
+  /**
+   * First connect to first {@code Ack}; see {@link Spans}. The other children live on the worker
+   * that runs them, so only this one, which ends on the event loop, is a field.
+   */
+  private volatile Spans.Span dialSpan;
 
   /**
    * Guards everything below. One lock across the decision to send and the send itself is what keeps
@@ -119,15 +138,27 @@ public final class DaemonMain implements ControlSocket.Listener {
   private int terminalCode;
   private boolean terminalInFlight;
 
+  /** A daemon whose telemetry is off. */
   public DaemonMain(
       Vertx vertx,
       DaemonEnv env,
       ControlSocket.Settings settings,
       Initializer initializer,
       Steps steps) {
+    this(vertx, env, settings, initializer, steps, Telemetry.off());
+  }
+
+  public DaemonMain(
+      Vertx vertx,
+      DaemonEnv env,
+      ControlSocket.Settings settings,
+      Initializer initializer,
+      Steps steps,
+      Telemetry telemetry) {
     this.env = env;
     this.initializer = initializer;
     this.steps = steps;
+    this.telemetry = telemetry;
     this.socket =
         new ControlSocket(vertx, env.daemonUrl(), env.token(), settings, this);
   }
@@ -153,6 +184,8 @@ public final class DaemonMain implements ControlSocket.Listener {
         env.tokenSubject() == null || env.tokenSubject().isBlank()
             ? "unnamed"
             : env.tokenSubject());
+    telemetry.start();
+    dialSpan = telemetry.span("dial");
     socket.start();
     try {
       return exit.get();
@@ -165,6 +198,7 @@ public final class DaemonMain implements ControlSocket.Listener {
     } finally {
       workers.shutdownNow();
       socket.shutdown();
+      telemetry.shutdown();
     }
   }
 
@@ -216,10 +250,17 @@ public final class DaemonMain implements ControlSocket.Listener {
           "ci-daemon speaks capability version %d, the host answered %d — exiting rather than"
               + " guessing.",
           CiDaemonProtocol.CAPABILITY_VERSION, ack.capabilityVersion());
-      closeAndFinish(ExitCode.CAPABILITY_MISMATCH);
+      String why =
+          "the host answered capability version "
+              + ack.capabilityVersion()
+              + ", this binary speaks "
+              + CiDaemonProtocol.CAPABILITY_VERSION;
+      endSpan(dialSpan, why);
+      closeAndFinish(ExitCode.CAPABILITY_MISMATCH, why);
       return;
     }
     if (acked.compareAndSet(false, true)) {
+      endSpan(dialSpan, null);
       // Confirms host→daemon delivery, which Hello never did — see AckReceived's javadoc. Fired
       // before the clone starts and best-effort: a container probe is the only caller that waits
       // for it, and a probe that never sees it is REJECTED at its own deadline rather than this
@@ -241,6 +282,7 @@ public final class DaemonMain implements ControlSocket.Listener {
    * than a recorded failure against a commit nobody can look at.
    */
   private void initialize() {
+    Spans.Span checkout = telemetry.span("checkout");
     Workspace.Preparation preparation;
     try {
       preparation = initializer.prepare();
@@ -251,10 +293,15 @@ public final class DaemonMain implements ControlSocket.Listener {
     }
     if (!preparation.ready()) {
       LOG.errorf("ci-daemon initialization failed: %s", preparation.failure());
+      String why = "InitFailed " + preparation.failure() + ": " + preparation.detail();
+      checkout.end(why);
       sendAndFinish(
-          new InitFailed(preparation.failure(), preparation.detail()), ExitCode.INIT_FAILED_SENT);
+          new InitFailed(preparation.failure(), preparation.detail()),
+          ExitCode.INIT_FAILED_SENT,
+          why);
       return;
     }
+    checkout.end();
     synchronized (outbox) {
       initializedSent = true;
       deliver(new Initialized());
@@ -271,13 +318,29 @@ public final class DaemonMain implements ControlSocket.Listener {
     }
     workers.execute(
         () -> {
-          Step running = steps.create(request, this::deliver);
+          Spans.Span script = telemetry.span("script");
+          Step running =
+              steps.create(
+                  request,
+                  message -> {
+                    if (message instanceof StepChunk chunk) {
+                      telemetry.output(chunk);
+                    }
+                    deliver(message);
+                  });
           step = running;
           StepFinished finished = running.run();
-          // The step's terminal frame, then the close, then the exit — in that order, each waiting
-          // on the last, so the result cannot be lost to a process that exited while the write was
-          // still queued.
-          sendAndFinish(finished, ExitCode.OK);
+          String why = failure(finished);
+          script.attribute("qits.ci.exit_code", (long) finished.exitCode());
+          script.attribute("qits.ci.timed_out", finished.timedOut());
+          if (cancelRequested) {
+            script.attribute("qits.ci.cancelled", true);
+          }
+          script.end(why);
+          // The telemetry flush, then the step's terminal frame, then the close, then the exit — in
+          // that order, each waiting on the last, so neither the result nor the telemetry can be
+          // lost to a container reaped while a write was still queued.
+          sendAndFinish(finished, ExitCode.OK, why);
         });
   }
 
@@ -285,25 +348,27 @@ public final class DaemonMain implements ControlSocket.Listener {
     Step running = step;
     if (running == null) {
       LOG.warnf("ci-daemon received Cancel (%s) with no step running — exiting.", cancel.correlationId());
-      closeAndFinish(ExitCode.CANCELLED_BEFORE_STEP);
+      closeAndFinish(ExitCode.CANCELLED_BEFORE_STEP, "cancelled before a step ran");
       return;
     }
     LOG.infof("ci-daemon cancelling step %s", cancel.correlationId());
+    cancelRequested = true;
     // Off the event loop: the kill waits out its own grace period.
     workers.execute(running::cancel);
   }
 
   @Override
   public void onClosed() {
-    finish(
-        ExitCode.SOCKET_CLOSED_EARLY,
-        "the control socket dropped and could not be re-established before a step could finish");
+    String why =
+        "the control socket dropped and could not be re-established before a step could finish";
+    flushAndFinish(ExitCode.SOCKET_CLOSED_EARLY, why, "socket lost: " + why);
   }
 
   @Override
   public void onDialFailed(String detail) {
     LOG.errorf("ci-daemon could not reach qits-ci: %s", detail);
-    finish(ExitCode.DIAL_FAILED, detail);
+    endSpan(dialSpan, detail);
+    flushAndFinish(ExitCode.DIAL_FAILED, detail, "dial failed: " + detail);
   }
 
   /**
@@ -388,21 +453,52 @@ public final class DaemonMain implements ControlSocket.Listener {
   }
 
   /**
-   * The terminal frame, then the close, then the exit — each waiting on the last, so the result
-   * cannot be lost to a process that exited while the write was still queued. A write that fails
-   * keeps the frame for the reconnect; only the reconnect budget running out gives up on it.
+   * The telemetry flush, then the terminal frame, then the close, then the exit — each waiting on
+   * the last, so the result cannot be lost to a process that exited while the write was still
+   * queued, and the telemetry cannot be lost to a container reaped on the frame's arrival. A write
+   * that fails keeps the frame for the reconnect; only the reconnect budget running out gives up on
+   * it.
+   *
+   * <p>Composed, not awaited: this runs on a worker, the flush's requests and the frame's write run
+   * on event loops, and the flush's bound is a Vert.x timer — so no thread parks, and the frame goes
+   * out on whichever thread completes the flush. The frame is not the terminal one until then, which
+   * is what keeps a re-Ack arriving mid-flush ({@link #release()}) from sending it early.
    */
-  private void sendAndFinish(CiDaemonMessage message, int code) {
-    synchronized (outbox) {
-      terminal = message;
-      terminalCode = code;
-      if (live) {
-        transmitTerminal();
-      } else {
-        LOG.infof(
-            "ci-daemon holding its %s until the control socket is back",
-            message.getClass().getSimpleName());
-      }
+  private void sendAndFinish(CiDaemonMessage message, int code, String rootError) {
+    telemetry
+        .flush(rootError)
+        .onComplete(
+            flushed -> {
+              synchronized (outbox) {
+                terminal = message;
+                terminalCode = code;
+                if (live) {
+                  transmitTerminal();
+                } else {
+                  LOG.infof(
+                      "ci-daemon holding its %s until the control socket is back",
+                      message.getClass().getSimpleName());
+                }
+              }
+            });
+  }
+
+  /** Why a finished step is an ERROR span, or null when it is not. */
+  private String failure(StepFinished finished) {
+    if (finished.timedOut()) {
+      return "the script timed out (exit " + finished.exitCode() + ")";
+    }
+    if (finished.exitCode() != 0) {
+      return "the script exited "
+          + finished.exitCode()
+          + (cancelRequested ? " (cancelled)" : "");
+    }
+    return null;
+  }
+
+  private static void endSpan(Spans.Span span, String error) {
+    if (span != null) {
+      span.end(error);
     }
   }
 
@@ -416,7 +512,8 @@ public final class DaemonMain implements ControlSocket.Listener {
         .onComplete(
             written -> {
               if (written.succeeded()) {
-                closeAndFinish(code);
+                // Already flushed, before the frame: the flush below returns that same outcome.
+                closeAndFinish(code, null);
                 return;
               }
               LOG.warnf(
@@ -429,17 +526,36 @@ public final class DaemonMain implements ControlSocket.Listener {
             });
   }
 
-  private void closeAndFinish(int code) {
-    socket.close().onComplete(v -> finish(code, null));
+  /** An ending with nothing more to send: flush (bounded, once), close, exit. */
+  private void closeAndFinish(int code, String rootError) {
+    telemetry
+        .flush(rootError)
+        .onComplete(flushed -> socket.close().onComplete(v -> finish(code, null)));
   }
 
+  /** An ending whose socket is already gone: flush (bounded, once), exit. */
+  private void flushAndFinish(int code, String why, String rootError) {
+    telemetry.flush(rootError).onComplete(flushed -> finish(code, why));
+  }
+
+  /**
+   * The exit, announced by two lines: what became of the telemetry, then the code. The first is
+   * the last thing a runner's {@code docker logs} tail of a reaped container can show about it.
+   */
   private void finish(int code, String why) {
-    if (exit.complete(code)) {
+    // Under one lock, so two endings racing each other (a socket that drops while the terminal
+    // frame's close completes) print one pair of lines, adjacent, rather than interleaved ones.
+    synchronized (exit) {
+      if (exit.isDone()) {
+        return;
+      }
+      LOG.info(telemetry.outcome());
       if (why != null) {
         LOG.warnf("ci-daemon exiting %d: %s", code, why);
       } else {
         LOG.infof("ci-daemon exiting %d", code);
       }
+      exit.complete(code);
     }
   }
 }

@@ -21,7 +21,8 @@ pipeline config, persisting runs and steps — belongs to
 
 Inside `ci-daemon/`, `Main` is the only CDI bean: it resolves configuration and news up plain
 classes with plain constructors — `DaemonMain` (the flow), `ControlSocket` (the dial),
-`Workspace` (clone + checkout), `StepProcess` (the child). One reader per setting, which is what
+`Workspace` (clone + checkout), `StepProcess` (the child), `Telemetry` (the export to
+qits-observability, below). One reader per setting, which is what
 stops two components from resolving the same key differently, and a suite that can drive the whole
 flow against a real socket without a container.
 
@@ -95,7 +96,9 @@ its own; it is handed everything before the socket exists:
 | `QITS_CI_DAEMON_URL` | The control socket, dialled **verbatim**. |
 | `QITS_CI_DAEMON_ID` | The host-minted registration identity — carried in the `Hello` that opens every conversation. |
 | `QITS_CI_REPOSITORY_URL`, `QITS_CI_BRANCH`, `QITS_CI_SHA` | What to clone and what to check out. |
-| `QITS_CI_REPO_ID`, `QITS_CI_PROJECT_ID`, `QITS_CI_REPO_NAME` | Which repository, in both coordinate systems: the storage id, and the public `(projectId, repoName)` pair a step's release call spells. The pair is empty — never absent — on an id-addressed run. Read by the step's script, not by the daemon. |
+| `QITS_CI_REPO_ID`, `QITS_CI_PROJECT_ID`, `QITS_CI_REPO_NAME` | Which repository, in both coordinate systems: the storage id, and the public `(projectId, repoName)` pair a step's release call spells. The pair is empty — never absent — on an id-addressed run. For the step's script; the daemon reads them only as telemetry labels. |
+| `QITS_CI_RUN_ID`, `QITS_CI_STEP_INDEX`, `QITS_DOMAIN` | *Optional.* Telemetry labels only (below); the run id also seeds the trace id. Absent, the label is left out. |
+| `QITS_CI_TELEMETRY_URL` | *Optional.* The OTLP endpoint (below). Unset derives it; set but empty switches the export off. |
 | `CI`, `QITS_CI` | Both `true`, set for the step script's benefit rather than the daemon's. |
 | `QITS_TOKEN` | The run's own `ci-run` token, presented as the handshake's bearer (below). Absent or blank, the daemon exits 2 naming it. |
 | `QITS_TOKEN_SUBJECT` | *Optional.* Names the token in one log line so a container can be matched to its run. Never sent. |
@@ -124,7 +127,7 @@ build JDK's `cacerts`, which GraalVM embeds at build time, and `quarkus.ssl.nati
 carries the reasoning. The edge's certificate therefore has to chain to a public root.
 
 
-    dial → Hello → Ack → clone+checkout → Initialized → RunStep → StepChunk* → StepFinished → exit
+    dial → Hello → Ack → clone+checkout → Initialized → RunStep → StepChunk* → flush telemetry → StepFinished → exit
 
 `Heartbeat` runs underneath from dial to close. `Cancel` may arrive after `RunStep` and is answered
 with a `StepFinished` like any other ending. Failure to clone or check out replaces `Initialized`
@@ -156,6 +159,90 @@ container reads honestly:
 
 The socket already carried whether the daemon behaved; the exit code is about whether the
 *container* did what it was started for, which is why 5 is not a zero.
+
+## Telemetry
+
+The daemon ships its own log, its step's output and the step's spans to qits-observability, so a
+step's work can be found in `qits observe --filter 'service=qits-ci-daemon'` rather than only in the
+output tail qits-ci keeps. OTLP/HTTP protobuf, hand-encoded (`Otlp`, copied from
+qits-ci-runner-daemon's `OtlpLogs` and extended to traces): the SDK and a protobuf runtime are
+megabytes and reflection configuration in a static musl binary, and qits-observability takes nothing
+but protobuf. No new dependency — the POSTs ride the vertx-core client the socket already brings,
+and `quarkus.ssl.native=true` already covers `https`.
+
+**Where.** A step runs on a runner's default docker bridge, outside the swarm, so the platform's
+internal aliases are unreachable; the route is the public edge. The endpoint is resolved once:
+
+| `QITS_CI_TELEMETRY_URL` | Endpoint |
+|---|---|
+| unset | derived from `QITS_CI_DAEMON_URL`: `wss://ci.<rest>/ci/daemon` → `https://observability.<rest>/observability/api/otel` (`ws://` → `http://`); a daemon url whose host is not `ci.…` derives none, and the export is off |
+| set | that url |
+| set but empty | off |
+| not an http(s) url | off, with one line saying so — telemetry never fails a step |
+
+`/v1/logs` and `/v1/traces` are appended. The variable is read raw, not through config, because
+SmallRye reads an empty value as no value and "empty means off" would be lost; the config key
+`qits.ci.telemetry-url` is the fallback when the variable is absent. The bearer is `$QITS_TOKEN`:
+the edge admits it like every platform token, the ingest route asks for no role, and it lives as long
+as the run, so there is nothing to rotate.
+
+**What.**
+
+- *The daemon's own log*, through a JUL handler on the root logger: `publish` is a bounded `offer`
+  and nothing else, a full queue drops its oldest line and ships the count as a line, a body is cut
+  at 16 KiB keeping its head, and a timer sends one batch at a time, dropping (not retrying) a batch
+  that fails.
+- *The step's output*, one record per line — INFO for stdout, WARN for stderr, attribute
+  `qits.ci.stream=out|err` — split out of the chunks (which are not lines) with partial lines carried
+  over. Only the **latest** `qits.ci.telemetry-output-max-lines` (200) are kept, because the failure
+  is at the end, and `step output: N lines, M not exported` is shipped when the cap bit. This is
+  load-bearing: every step on the estate shares one `qits-ci-daemon` bucket of a few thousand
+  records, and one chatty build must not evict everyone else's. Output has a buffer of its own and is
+  sent only at the flush, so it can never displace one of the daemon's own lines. qits-ci still gets
+  all of it as chunks.
+- *Spans*: a root `ci-daemon step` from the daemon's start to the flush, and children `dial` (first
+  connect → `Ack`), `checkout` (clone + checkout) and `script` (spawn → exit, with
+  `qits.ci.exit_code`, `qits.ci.timed_out` and, when it was, `qits.ci.cancelled`). ERROR, with the
+  reason as the status message, on a non-zero exit, a timeout, `InitFailed`, a failed dial, a
+  capability mismatch and a lost socket. The trace id is the first 16 bytes of SHA-256 over
+  `QITS_CI_RUN_ID`, so every step of a run — each its own container — lands in one trace with no
+  protocol change. Log records carry the ids of the span they were written in. There is no `deliver`
+  span: the terminal frame is handed over *after* the flush, so such a span could never be exported.
+- *Resource*: `service.name=qits-ci-daemon`, `service.version` (the binary's version),
+  `qits.ci.run_id`, `qits.ci.step_index`, `qits.ci.repo_id`, `qits.ci.repo_name`,
+  `qits.ci.project_id`, `vcs.ref.head.name`, `vcs.ref.head.revision`, `qits.domain` — each left out
+  when its variable is absent or blank.
+
+**No metrics.** One process runs one step, so a series would have one point; the `script` span
+already carries the duration and the exit code; and a series per run would churn
+qits-observability's 500-series bucket for nothing.
+
+**When: before the terminal frame, bounded.** qits-ci `docker rm -f`s the container the moment
+`StepFinished` arrives — a SIGKILL, with no grace — so anything sent after that frame races the
+kill, and the end of a step is exactly what it would lose. So every ending flushes **first**: the
+spans are ended, both buffers drained, the final requests sent and their responses awaited — and
+only then is `StepFinished` or `InitFailed` handed to the socket. The flush is bounded by
+`qits.ci.telemetry-flush-ms` (3000): an unreachable, silent or failing collector delays the terminal
+frame by at most that, and never changes the step's result or the exit code. It is a future composed
+in front of the send, bounded by a Vert.x timer, not a wait — the flush's own requests and the
+frame's write need the event loop, and nothing parks it. It runs once: a terminal frame held through
+a socket outage was flushed before it was held and is not flushed again on the replay. The endings
+with no terminal frame (exits 3, 4, 6, 7) flush the same way before they exit; nothing waits for
+those, so best effort is the contract. A misconfigured daemon (exit 2) exports nothing, because the
+address may be the thing that is missing.
+
+The daemon's last line before `ci-daemon exiting N` says how it went — it is what a runner's
+`docker logs` tail of the reaped container shows:
+
+    telemetry: submitted 37 logs, 4 spans (0 dropped)
+    telemetry: NOT submitted (timeout after 3000 ms)
+    telemetry: off
+
+A JVM shutdown hook runs the same bounded flush if none has run, which covers a SIGTERM or SIGINT (a
+manual `docker stop`, a Ctrl-C). It is not the mechanism and cannot be: Quarkus closes Vert.x from
+its own hook concurrently, so it is best effort, and **`docker rm -f` is a SIGKILL that no hook
+sees** — anything the daemon has not flushed by the time the host reaps it is gone. That is why the
+flush sits in front of the terminal frame rather than behind the exit.
 
 ## The image contract
 

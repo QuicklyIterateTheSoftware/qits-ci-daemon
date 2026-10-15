@@ -7,12 +7,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import eu.wohlben.qits.cidaemon.protocol.InitFailed;
 import java.io.File;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledOnOs;
 import org.junit.jupiter.api.condition.OS;
@@ -90,6 +94,110 @@ class WorkspaceTest {
 
     assertFalse(preparation.ready());
     assertEquals(InitFailed.Reason.CLONE_FAILED, preparation.failure());
+  }
+
+  // --- clone retry (qits-1253) -----------------------------------------------------------------
+  // A real git cannot be made to answer with a host-side 503 on demand, so these use a scripted
+  // CommandRunner, same as the tooling-probe cases above. All pass zero delays: the retry logic
+  // under test is which attempts happen and in what order, not how long anything actually sleeps.
+
+  @Test
+  void aTransientCloneFailureFollowedByASuccessPreparesTheWorkspaceAfterClearingStaleContents()
+      throws Exception {
+    Path dir = Files.createDirectories(tmp.resolve("workspace"));
+    Files.writeString(dir.resolve("stale.txt"), "left over from the failed attempt");
+
+    List<String[]> cloneAttempts = new ArrayList<>();
+    boolean[] dirWasEmptyBeforeSecondClone = {false};
+    CommandRunner scripted =
+        (d, argv) -> {
+          if (argv.length > 1 && "clone".equals(argv[1])) {
+            cloneAttempts.add(argv);
+            if (cloneAttempts.size() == 1) {
+              return new CommandRunner.Result(
+                  128, "fatal: The requested URL returned error: 503 Service Unavailable");
+            }
+            try (Stream<Path> entries = Files.list(dir)) {
+              dirWasEmptyBeforeSecondClone[0] = entries.findAny().isEmpty();
+            } catch (IOException e) {
+              throw new UncheckedIOException(e);
+            }
+          }
+          return new CommandRunner.Result(0, "");
+        };
+
+    Workspace.Preparation preparation =
+        new Workspace(
+                dir,
+                "file:///origin",
+                "main",
+                "0123456789abcdef0123456789abcdef01234567",
+                scripted,
+                List.of(Duration.ZERO))
+            .prepare();
+
+    assertTrue(preparation.ready(), () -> String.valueOf(preparation.detail()));
+    assertEquals(2, cloneAttempts.size());
+    assertTrue(
+        dirWasEmptyBeforeSecondClone[0],
+        "the stale contents left by the failed attempt should have been cleared first");
+  }
+
+  @Test
+  void threeTransientCloneFailuresGiveCloneFailedWithTheLastOutputAfterThreeAttempts() {
+    String fiveOhThree = "fatal: The requested URL returned error: 503 Service Unavailable";
+    List<String[]> cloneAttempts = new ArrayList<>();
+    CommandRunner scripted =
+        (d, argv) -> {
+          if (argv.length > 1 && "clone".equals(argv[1])) {
+            cloneAttempts.add(argv);
+            return new CommandRunner.Result(128, fiveOhThree);
+          }
+          return new CommandRunner.Result(0, "");
+        };
+
+    Workspace.Preparation preparation =
+        new Workspace(
+                tmp.resolve("workspace"),
+                "file:///origin",
+                "main",
+                "0123456789abcdef0123456789abcdef01234567",
+                scripted,
+                List.of(Duration.ZERO, Duration.ZERO))
+            .prepare();
+
+    assertFalse(preparation.ready());
+    assertEquals(InitFailed.Reason.CLONE_FAILED, preparation.failure());
+    assertTrue(preparation.detail().contains("503"), preparation.detail());
+    assertEquals(3, cloneAttempts.size());
+  }
+
+  @Test
+  void aNonTransientCloneFailureGivesCloneFailedAfterOneAttemptRatherThanRetrying() {
+    List<String[]> cloneAttempts = new ArrayList<>();
+    CommandRunner scripted =
+        (d, argv) -> {
+          if (argv.length > 1 && "clone".equals(argv[1])) {
+            cloneAttempts.add(argv);
+            return new CommandRunner.Result(
+                128, "fatal: Remote branch no-such-branch not found in upstream origin");
+          }
+          return new CommandRunner.Result(0, "");
+        };
+
+    Workspace.Preparation preparation =
+        new Workspace(
+                tmp.resolve("workspace"),
+                "file:///origin",
+                "no-such-branch",
+                "0123456789abcdef0123456789abcdef01234567",
+                scripted,
+                List.of(Duration.ZERO, Duration.ZERO))
+            .prepare();
+
+    assertFalse(preparation.ready());
+    assertEquals(InitFailed.Reason.CLONE_FAILED, preparation.failure());
+    assertEquals(1, cloneAttempts.size());
   }
 
   @Test

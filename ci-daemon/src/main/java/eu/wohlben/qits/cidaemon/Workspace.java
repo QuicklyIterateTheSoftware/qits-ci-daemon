@@ -2,8 +2,15 @@ package eu.wohlben.qits.cidaemon;
 
 import eu.wohlben.qits.cidaemon.protocol.InitFailed;
 import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.List;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
+import org.jboss.logging.Logger;
 
 /**
  * The checkout half of initialization: a shallow clone of the pushed branch, then a checkout of the
@@ -36,11 +43,38 @@ import java.util.regex.Pattern;
  */
 public final class Workspace {
 
+  private static final Logger LOG = Logger.getLogger(Workspace.class);
+
   /**
    * Deep enough that a sha a few pushes behind the tip is present, shallow enough that the clone
    * stays cheap. See the class javadoc for why 1 is wrong.
    */
   static final int CLONE_DEPTH = 50;
+
+  /**
+   * qits-1253: two delays, so three attempts total — a git host blip (a 503, a dropped connection)
+   * otherwise fails the run for good, even though the same clone would have succeeded moments
+   * later. See {@link #cloneWithRetry()} for why the retry lives here rather than in qits-ci.
+   */
+  static final List<Duration> DEFAULT_CLONE_RETRY_DELAYS =
+      List.of(Duration.ofSeconds(2), Duration.ofSeconds(5));
+
+  /**
+   * What makes a clone failure worth retrying: a transient git-host condition rather than something
+   * a retry cannot fix (a bad branch name, a 4xx, a malformed url). Matched case-insensitively
+   * against the clone's combined output — see {@link #cloneWithRetry()}.
+   */
+  private static final List<Pattern> TRANSIENT_CLONE_FAILURES =
+      List.of(
+          Pattern.compile("The requested URL returned error: 5\\d\\d", Pattern.CASE_INSENSITIVE),
+          Pattern.compile("Could not resolve host", Pattern.CASE_INSENSITIVE),
+          Pattern.compile("Connection refused", Pattern.CASE_INSENSITIVE),
+          Pattern.compile("Connection reset", Pattern.CASE_INSENSITIVE),
+          Pattern.compile("Connection timed out", Pattern.CASE_INSENSITIVE),
+          Pattern.compile("Operation timed out", Pattern.CASE_INSENSITIVE),
+          Pattern.compile("early EOF", Pattern.CASE_INSENSITIVE),
+          Pattern.compile("RPC failed", Pattern.CASE_INSENSITIVE),
+          Pattern.compile("unexpected disconnect", Pattern.CASE_INSENSITIVE));
 
   /**
    * The {@code detail} budget, matching a {@link eu.wohlben.qits.cidaemon.protocol.StepChunk}'s. Git
@@ -61,6 +95,7 @@ public final class Workspace {
   private final String branch;
   private final String sha;
   private final CommandRunner runner;
+  private final List<Duration> cloneRetryDelays;
 
   /**
    * The shell the step's script will be run under, decided by {@link #probeTooling()}.
@@ -78,11 +113,26 @@ public final class Workspace {
 
   public Workspace(
       Path dir, String repositoryUrl, String branch, String sha, CommandRunner runner) {
+    this(dir, repositoryUrl, branch, sha, runner, DEFAULT_CLONE_RETRY_DELAYS);
+  }
+
+  /**
+   * @param cloneRetryDelays how long to wait before each re-clone after a transient failure; {@code
+   *     n} delays give {@code n + 1} clone attempts total. See {@link #cloneWithRetry()}.
+   */
+  public Workspace(
+      Path dir,
+      String repositoryUrl,
+      String branch,
+      String sha,
+      CommandRunner runner,
+      List<Duration> cloneRetryDelays) {
     this.dir = dir;
     this.repositoryUrl = repositoryUrl;
     this.branch = branch;
     this.sha = sha;
     this.runner = runner;
+    this.cloneRetryDelays = List.copyOf(cloneRetryDelays);
   }
 
   /**
@@ -113,21 +163,7 @@ public final class Workspace {
       return new Preparation(
           InitFailed.Reason.SHA_GONE, "QITS_CI_SHA is not a commit id: " + tail(sha));
     }
-    CommandRunner.Result clone =
-        runner.run(
-            null,
-            "git",
-            "clone",
-            "--depth",
-            String.valueOf(CLONE_DEPTH),
-            "--branch",
-            branch,
-            // Everything after `--` is a positional, so a repository url or path that begins with a
-            // dash cannot be read as an option. The branch is safe without it: --branch consumes
-            // the next argument whatever it looks like.
-            "--",
-            repositoryUrl,
-            dir.toString());
+    CommandRunner.Result clone = cloneWithRetry();
     if (!clone.ok()) {
       return new Preparation(InitFailed.Reason.CLONE_FAILED, tail(clone.output()));
     }
@@ -139,6 +175,122 @@ public final class Workspace {
       return new Preparation(InitFailed.Reason.SHA_GONE, tail(checkout.output()));
     }
     return Preparation.READY;
+  }
+
+  /**
+   * qits-1253: a git host that answers a clone with a transient condition — a 503, a dropped
+   * connection — otherwise fails the run for good, even though the identical clone would likely
+   * succeed moments later. qits-ci deliberately does <b>not</b> auto-retry a {@code CLONE_FAILED}
+   * run itself, because that same reason also drives runner quarantine (a runner whose clones keep
+   * failing is pulled from rotation) — so retrying a run-level failure there would blur "the host
+   * blipped" with "this runner is sick". Retrying here, below that classifier, lets a blip stay a
+   * blip instead of either failing the run or muddying quarantine.
+   *
+   * <p>Only a failure whose output matches {@link #TRANSIENT_CLONE_FAILURES} is retried; anything
+   * else — a bad branch name, a 4xx — fails after one attempt, exactly as before this existed.
+   */
+  private CommandRunner.Result cloneWithRetry() {
+    CommandRunner.Result result = runClone();
+    int totalAttempts = cloneRetryDelays.size() + 1;
+    for (int attempt = 1; attempt <= cloneRetryDelays.size(); attempt++) {
+      String reason = transientReason(result.output());
+      if (reason == null) {
+        return result;
+      }
+      Duration delay = cloneRetryDelays.get(attempt - 1);
+      LOG.warnf(
+          "ci-daemon clone attempt %d/%d failed with a transient error (%s); retrying in %s",
+          attempt, totalAttempts, reason, delay);
+      if (!sleep(delay)) {
+        // Interrupted: stop retrying and report what the last attempt said, same as any other exit.
+        return result;
+      }
+      try {
+        clearDirectoryContents(dir);
+      } catch (IOException e) {
+        // Best effort: a directory git refuses to clone into reports its own git error, which is
+        // still a usable CLONE_FAILED detail, so there is nothing better to do here than give up on
+        // the retry and let that error surface on the next attempt below.
+        LOG.warnf(
+            "ci-daemon could not clear %s before retrying the clone: %s", dir, e.getMessage());
+      }
+      result = runClone();
+    }
+    return result;
+  }
+
+  private CommandRunner.Result runClone() {
+    return runner.run(
+        null,
+        "git",
+        "clone",
+        "--depth",
+        String.valueOf(CLONE_DEPTH),
+        "--branch",
+        branch,
+        // Everything after `--` is a positional, so a repository url or path that begins with a
+        // dash cannot be read as an option. The branch is safe without it: --branch consumes
+        // the next argument whatever it looks like.
+        "--",
+        repositoryUrl,
+        dir.toString());
+  }
+
+  /** The matched text naming why {@code output} is worth retrying, or {@code null} if it is not. */
+  private static String transientReason(String output) {
+    if (output == null) {
+      return null;
+    }
+    for (Pattern pattern : TRANSIENT_CLONE_FAILURES) {
+      Matcher matcher = pattern.matcher(output);
+      if (matcher.find()) {
+        return matcher.group();
+      }
+    }
+    return null;
+  }
+
+  /**
+   * {@code false} if interrupted, with the interrupt flag restored, so a shutdown mid-retry stops
+   * retrying rather than blocking on a sleep nobody asked for.
+   */
+  private static boolean sleep(Duration delay) {
+    try {
+      if (!delay.isZero() && !delay.isNegative()) {
+        Thread.sleep(delay.toMillis());
+      }
+      return true;
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      return false;
+    }
+  }
+
+  /**
+   * Empties {@code dir} without removing {@code dir} itself — it may be a mount point the container
+   * runtime set up, not a directory this process is free to recreate. A dir that does not exist
+   * (the common case: nothing has cloned into it yet) is left alone rather than treated as an error.
+   */
+  private static void clearDirectoryContents(Path dir) throws IOException {
+    if (!Files.isDirectory(dir)) {
+      return;
+    }
+    try (Stream<Path> entries = Files.list(dir)) {
+      for (Path entry : entries.toList()) {
+        deleteRecursively(entry);
+      }
+    }
+  }
+
+  private static void deleteRecursively(Path path) throws IOException {
+    if (Files.isDirectory(path) && !Files.isSymbolicLink(path)) {
+      try (Stream<Path> entries = Files.list(path)) {
+        for (Path entry : entries.toList()) {
+          deleteRecursively(entry);
+        }
+      }
+    }
+    Files.deleteIfExists(path);
   }
 
   /**

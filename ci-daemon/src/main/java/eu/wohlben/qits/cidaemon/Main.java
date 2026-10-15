@@ -6,6 +6,9 @@ import io.quarkus.runtime.annotations.QuarkusMain;
 import io.vertx.core.Vertx;
 import jakarta.inject.Inject;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import org.jboss.logging.Logger;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
@@ -94,6 +97,14 @@ public class Main {
     @ConfigProperty(name = "qits.ci.git-timeout-seconds", defaultValue = "600")
     long gitTimeoutSeconds;
 
+    // qits-1253: how long to wait before each re-clone after the git host answers with a transient
+    // failure (a 503, a dropped connection) — see Workspace.cloneWithRetry(). Comma-separated,
+    // ISO-8601-ish with the `PT` prefix implied: "2S,5S" means two attempts after the first, after
+    // 2s and then 5s. Not a List<Duration> ConfigProperty: SmallRye's Duration converter demands the
+    // full "PT2S" form, and the point of writing it here is that it does not.
+    @ConfigProperty(name = "qits.ci.clone-retry-delays", defaultValue = "2S,5S")
+    String cloneRetryDelays;
+
     @ConfigProperty(name = "qits.ci.step-kill-grace-ms", defaultValue = "5000")
     long stepKillGraceMillis;
 
@@ -158,7 +169,8 @@ public class Main {
               env.repositoryUrl(),
               env.branch(),
               env.sha(),
-              CommandRunner.forking(gitTimeoutSeconds));
+              CommandRunner.forking(gitTimeoutSeconds),
+              parseCloneRetryDelays(cloneRetryDelays));
       return new DaemonMain(
               vertx,
               env,
@@ -182,6 +194,23 @@ public class Main {
                       workspace.shell()),
               telemetry)
           .run();
+    }
+
+    /**
+     * qits-1253: {@code "2S,5S"} to {@code [PT2S, PT5S]}. The {@code PT} prefix is implied rather
+     * than written in config because every other duration-shaped setting here is a bare number of
+     * seconds or millis — spelling one entry {@code PT2S} and the rest {@code 2000} would be the
+     * inconsistency, not the fix.
+     */
+    private static List<Duration> parseCloneRetryDelays(String raw) {
+      List<Duration> delays = new ArrayList<>();
+      for (String token : raw.split(",")) {
+        String trimmed = token.trim();
+        if (!trimmed.isEmpty()) {
+          delays.add(Duration.parse("PT" + trimmed));
+        }
+      }
+      return delays;
     }
 
     /**

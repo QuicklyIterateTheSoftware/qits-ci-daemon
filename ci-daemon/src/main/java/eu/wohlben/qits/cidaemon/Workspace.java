@@ -181,10 +181,9 @@ public final class Workspace {
    * qits-1253: a git host that answers a clone with a transient condition — a 503, a dropped
    * connection — otherwise fails the run for good, even though the identical clone would likely
    * succeed moments later. qits-ci deliberately does <b>not</b> auto-retry a {@code CLONE_FAILED}
-   * run itself, because that same reason also drives runner quarantine (a runner whose clones keep
-   * failing is pulled from rotation) — so retrying a run-level failure there would blur "the host
-   * blipped" with "this runner is sick". Retrying here, below that classifier, lets a blip stay a
-   * blip instead of either failing the run or muddying quarantine.
+   * run itself: a deleted branch fails it identically on every attempt, and the classifier that
+   * picks runs to retry also decides runner quarantine, so widening it would quarantine runners for
+   * the git host's outage. Retrying here, below that classifier, lets a blip stay a blip.
    *
    * <p>Only a failure whose output matches {@link #TRANSIENT_CLONE_FAILURES} is retried; anything
    * else — a bad branch name, a 4xx — fails after one attempt, exactly as before this existed.
@@ -193,7 +192,7 @@ public final class Workspace {
     CommandRunner.Result result = runClone();
     int totalAttempts = cloneRetryDelays.size() + 1;
     for (int attempt = 1; attempt <= cloneRetryDelays.size(); attempt++) {
-      String reason = transientReason(result.output());
+      String reason = result.ok() ? null : transientReason(result.output());
       if (reason == null) {
         return result;
       }

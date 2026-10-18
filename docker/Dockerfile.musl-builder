@@ -30,7 +30,7 @@
 # pipeline config declares is alpine-family. The static musl binary costs +4.8% in size over the
 # glibc-dynamic one. That is the trade, and it is not close.
 #
-# `mirror.dev.localhost:8080/quay/…` is qits-platform-mirror's pull-through mirror of quay.io: the
+# `mirror.qits.$QITS_DOMAIN/quay/…` is qits-mirror's pull-through mirror of quay.io: the
 # first build fetches the image from upstream and caches it, every later build is served from local
 # disk. The tag is upstream's, unchanged — the mirror revalidates it, so `jdk-25` still moves when
 # quay moves it.
@@ -57,17 +57,18 @@
 # the last two released versions of every artifact whatever their age, and each of these is the only
 # version of its coordinate.
 #
-# THE FETCH IS AN `ADD` IN A `scratch` STAGE, AND THAT IS THE LOAD-BEARING PART. `registry.dev.localhost`
+# THE FETCH IS AN `ADD` IN A `scratch` STAGE, AND THAT IS THE LOAD-BEARING PART. `registry.qits.$QITS_DOMAIN`
 # is an edge vhost, on the same host plane the `FROM` above resolves on — and a `RUN` cannot reach
 # that plane. A build container gets its own netns and its own /etc/hosts, and glibc answers any
 # *.localhost name from RFC 6761 as the container's OWN loopback, where nothing listens; the measured
-# failure is `curl: (7) Failed to connect to registry.dev.localhost port 8080 after 0 ms`. Nor does
+# failure, back when the default pointed at `registry.dev.localhost`, was `curl: (7) Failed to
+# connect to registry.dev.localhost port 8080 after 0 ms`. Nor does
 # `docker build --network host` fix it, and it is not worth reaching for: the pipeline that builds
 # this file is read from main's head while the Dockerfile comes from the fold, so a flag added there
 # cannot be exercised by the change that needs it.
 #
 # BuildKit resolves an `ADD <url>` itself, in the daemon's own network context — the same one that
-# resolves the `FROM` line and pushes to `registry.dev.localhost:8080`. So the fetch lands where the
+# resolves the `FROM` line and pushes to `registry.qits.$QITS_DOMAIN`. So the fetch lands where the
 # image pull already lands, and the RUN below never dials anything. The stage is `scratch` because
 # nothing is executed in it, and the tarballs reach the build stage as a bind mount rather than a
 # COPY so 90 MB of tarball never becomes a layer of an image that only wants what is inside them.
@@ -100,8 +101,13 @@
 #   docker build --build-arg MUSL_URL=https://more.musl.cc/11.2.1/x86_64-linux-musl/x86_64-linux-musl-native.tgz \
 #                --build-arg ZLIB_URL=https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz \
 #                -t qits/graalvmce-musl-builder:jdk-25 -f docker/Dockerfile.musl-builder docker/
-ARG MUSL_URL=http://registry.dev.localhost:8080/artifacts/maven/maven/eu/wohlben/qits/toolchain/x86_64-linux-musl-native/11.2.1/x86_64-linux-musl-native-11.2.1.tgz
-ARG ZLIB_URL=http://registry.dev.localhost:8080/artifacts/maven/maven/eu/wohlben/qits/toolchain/zlib/1.3.1/zlib-1.3.1.tar.gz
+# The platform's public domain. The release recipes pass `--opt build-arg:QITS_DOMAIN`; global
+# because the FROM line below has to read it, and an ARG before the first FROM is the only kind a
+# FROM line can see.
+ARG QITS_DOMAIN=wohlben.eu
+
+ARG MUSL_URL=https://registry.qits.${QITS_DOMAIN}/artifacts/maven/maven/eu/wohlben/qits/toolchain/x86_64-linux-musl-native/11.2.1/x86_64-linux-musl-native-11.2.1.tgz
+ARG ZLIB_URL=https://registry.qits.${QITS_DOMAIN}/artifacts/maven/maven/eu/wohlben/qits/toolchain/zlib/1.3.1/zlib-1.3.1.tar.gz
 
 FROM scratch AS tarballs
 # Re-declared: an ARG before the first FROM is global, and a stage that wants to read one has to name
@@ -111,7 +117,7 @@ ARG ZLIB_URL
 ADD $MUSL_URL /musl.tgz
 ADD $ZLIB_URL /zlib.tar.gz
 
-FROM mirror.dev.localhost:8080/quay/quarkus/ubi10-quarkus-graalvmce-builder-image:jdk-25
+FROM mirror.qits.${QITS_DOMAIN}/quay/quarkus/ubi10-quarkus-graalvmce-builder-image:jdk-25
 USER root
 
 RUN --mount=type=bind,from=tarballs,target=/tarballs \

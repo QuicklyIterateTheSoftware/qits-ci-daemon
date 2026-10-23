@@ -9,11 +9,11 @@ package eu.wohlben.qits.cidaemon.protocol;
  * to/from a Vert.x {@code JsonObject} field-by-field — both against these constants, so a rename is
  * caught in one place.
  *
- * <p>The contract is one step's worth of conversation, because that is a container's whole life:
- * {@link Hello}/{@link Ack}/{@link AckReceived}, then {@link Initialized} or {@link InitFailed},
- * then exactly one {@link RunStep} answered by {@link StepChunk}* and a terminal {@link
- * StepFinished}, with {@link Cancel} as the only other thing the host may send and {@link
- * Heartbeat} running underneath from dial to close. {@link AckReceived} is the one frame in that
+ * <p>The contract is one run's worth of conversation, because that is a lease container's whole
+ * life: {@link Hello}/{@link Ack}/{@link AckReceived}, then {@link Initialized} or {@link
+ * InitFailed}, then any number of {@link RunStep}s, each answered by {@link StepChunk}* and a
+ * terminal {@link StepFinished}, and finally {@link Close}. {@link Cancel} kills the step that is
+ * running, and {@link Heartbeat} runs underneath from dial to close. {@link AckReceived} is the one frame in that
  * list no real run ever waits for — see its own javadoc for who does and why it costs no capability
  * bump.
  *
@@ -31,14 +31,17 @@ public final class CiDaemonProtocol {
    * The capability version {@code ci-daemon} announces in its {@link Hello} and the host echoes in
    * its {@link Ack}. Bumped when the wire contract changes in a way either side must branch on.
    *
-   * <p>There is no compat mode at version 1 and no soft landing planned for version 2: a daemon
-   * that reads an {@link Ack} carrying a version it does not know exits nonzero rather than
-   * guessing, because a container's whole life is one step and a half-understood protocol has
-   * nothing to degrade to. The daemon binary is pinned per run by qits-ci (the run row records
-   * which version produced its results), so a version mismatch means a deploy landed between run
-   * creation and container start — rare, loud, and cheap to retry.
+   * <p>Version 2 (qits-1541) is one daemon per CI lease: {@link RunStep} gained {@code stepIndex}
+   * and {@code env}, {@link StepFinished} gained {@code stepIndex}, and {@link Close} ends the
+   * lease. Version 1 — one container, one step, one shallow clone — is gone, not kept beside it.
+   *
+   * <p>There is no compat mode: a daemon that reads an {@link Ack} carrying a version it does not
+   * know exits nonzero rather than guessing, because a half-understood protocol has nothing to
+   * degrade to. The daemon binary is pinned per run by qits-ci (the protocol jar's version is the
+   * binary's), so a version mismatch means a deploy landed between run creation and container
+   * start — rare, loud, and cheap to retry.
    */
-  public static final int CAPABILITY_VERSION = 1;
+  public static final int CAPABILITY_VERSION = 2;
 
   private CiDaemonProtocol() {}
 
@@ -56,6 +59,7 @@ public final class CiDaemonProtocol {
     public static final String ACK = "ack";
     public static final String RUN_STEP = "runStep";
     public static final String CANCEL = "cancel";
+    public static final String CLOSE = "close";
 
     private Type() {}
   }
@@ -75,6 +79,8 @@ public final class CiDaemonProtocol {
     public static final String TIMED_OUT = "timedOut";
     public static final String SCRIPT = "script";
     public static final String TIMEOUT_SECONDS = "timeoutSeconds";
+    public static final String STEP_INDEX = "stepIndex";
+    public static final String ENV = "env";
 
     private Field() {}
   }

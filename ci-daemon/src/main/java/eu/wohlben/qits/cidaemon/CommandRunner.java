@@ -6,7 +6,7 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * A one-shot command invocation seam: runs an argv to completion and returns its exit code plus its
- * combined stdout+stderr. {@link Workspace} is the only caller; the seam exists so its failure
+ * combined stdout+stderr. {@link MirrorWorktree} is the only caller; the seam exists so its failure
  * mapping — which is load-bearing, since {@code SHA_GONE} drives the host's commit-gone discard —
  * can be tested without arranging every failure against a real git.
  *

@@ -22,8 +22,8 @@ gets pipes, not a terminal).
 **An empty `defaultValue` is not a default.** SmallRye reads `@ConfigProperty(name = "…",
 defaultValue = "")` as *no value* and then fails to resolve a plain `String`, so the binary dies at
 startup with `Failed to load config value of type class java.lang.String for: <key>`. Optional
-settings are `Optional<String>`. The suite cannot see this — `docker run` on the image with no
-environment is what catches it.
+settings are `Optional<String>`. The suite cannot see this — running the built binary with no
+environment (`env -i out/qits-ci-daemon`, the release's QA step) is what catches it.
 
 ## Module conventions
 
@@ -34,12 +34,13 @@ The capability modules — today `ci-daemon-protocol`, and anything extracted be
 news them up.
 
 **`Main` is the only CDI bean**, and the application module holds itself to the same standard the
-capability modules are held to: `DaemonMain`, `ControlSocket`, `Workspace` and `StepProcess` are
+capability modules are held to: `DaemonMain`, `ControlSocket`, `MirrorWorktree` and `StepProcess` are
 plain classes taking everything they need as constructor arguments. `Main` resolves configuration,
 constructs them, and hands its exit code back to the runtime. (The workspace daemon keeps its socket
-and its API as beans; it has more of them and a longer life. Here there is one flow and it ends, so
-there is nothing a bean would buy — and the whole flow being constructible by hand is what lets
-`DaemonMainTest` drive it against a real socket with no container.)
+and its API as beans; it has more of them and a longer life. Here there is one flow — one lease, one
+run's steps — and it ends, so there is nothing a bean would buy — and the whole flow being
+constructible by hand is what lets `DaemonMainTest` drive it against a real socket with no
+container.)
 
 That has a consequence worth stating plainly: **a capability module cannot read configuration.** Every
 setting it needs arrives as a constructor argument from the one class that resolves it. Do not reach
@@ -92,10 +93,12 @@ Prefer extending an existing message to minting a new one, and prefer an enum co
 field: `InitFailed.reason` is the shape to copy — three values the host branches on, with the human
 detail in a separate bounded string that nothing parses.
 
-Neither direction of a version skew degrades gracefully here, and that is deliberate. A container
-lives for one step; there is nothing to fall back to and no session to preserve. A daemon that reads
-an `Ack` carrying a version it does not know exits nonzero, the run records that, and the operator
-reads one honest log line instead of debugging a half-understood conversation. qits-ci pins the
+Neither direction of a version skew degrades gracefully here, and that is deliberate. A lease lives
+for one run; there is nothing to fall back to and no session to preserve. Capability 2 (one daemon
+per lease, `RunStep{stepIndex, env}`, `StepFinished{stepIndex}`, `Close`) replaced capability 1
+outright, with no dual mode, for the same reason. A daemon that reads an `Ack` carrying a version it
+does not know exits nonzero, the run records that, and the operator reads one honest log line
+instead of debugging a half-understood conversation. qits-ci pins the
 daemon version per run, so the only way to see a skew at all is a deploy racing a run.
 
 ## Untrusted input
@@ -105,9 +108,14 @@ over the socket, and this daemon runs it on purpose. That is the design, not a h
 from it:
 
 - The script is passed to `<shell> -c` as **one argv element**, never assembled into a shell line
-  with anything else interpolated around it. The shell is `bash` when the image has it and `sh`
-  otherwise — `Workspace.probeTooling` decides once, at initialization, and `StepProcess` is told
-  rather than probing again.
+  with anything else interpolated around it (behind `setsid -w` when the image has it). The shell is
+  `bash` when the image has it and `sh` otherwise — `MirrorWorktree.probeTooling` decides once, at
+  initialization, and `StepProcess` is told rather than probing again.
+- A step's `env` is laid over the lease env through `ProcessBuilder.environment()`, never through a
+  shell line; a key the OS cannot hold fails the spawn (exit 127), it is not escaped.
+- Everything that becomes a path — the run id, the project id, a repository or submodule name — is
+  checked as one path segment (`MirrorWorktree.SEGMENT`) before it is joined onto `/cache/git` or
+  `/work`. A submodule's name comes from the checkout's `.gitmodules`, so it is untrusted.
 - Nothing the script writes is read back as instructions. Output is bytes to be chunked and
   forwarded, bounded at the source; a marker string in stdout must never mean anything to this
   daemon or to the host. (qits-ci's old runner inferred setup failure from a sentinel in the output
@@ -118,6 +126,14 @@ from it:
   reason, and re-sending a value the host already knows is not a favour.
 - Values that cross from the checkout into a path or an argv are validated at the boundary, with a
   comment saying why.
+
+## The lease's shared state
+
+The mirrors in `/cache/git` outlive the lease and are shared by every lease on the target, so they
+are written only under `GitLock` (a `FileChannel` lock on `<repo>.lock`, plus an in-process lock for
+the same path). Never delete a lock file, never take a submodule's lock while holding the parent's
+(`MirrorWorktree` creates submodule mirrors after releasing it), and remove the worktree on every
+ending after initialization — `DaemonMain.teardown` does, on the lane behind the last step.
 
 ## Formatting
 

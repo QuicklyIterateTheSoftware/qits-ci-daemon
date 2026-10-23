@@ -12,6 +12,7 @@ import eu.wohlben.qits.cidaemon.protocol.Cancel;
 import eu.wohlben.qits.cidaemon.protocol.CiDaemonCodec;
 import eu.wohlben.qits.cidaemon.protocol.CiDaemonMessage;
 import eu.wohlben.qits.cidaemon.protocol.CiDaemonProtocol;
+import eu.wohlben.qits.cidaemon.protocol.Close;
 import eu.wohlben.qits.cidaemon.protocol.Heartbeat;
 import eu.wohlben.qits.cidaemon.protocol.Hello;
 import eu.wohlben.qits.cidaemon.protocol.InitFailed;
@@ -234,7 +235,10 @@ class DaemonMainTest {
     int code =
         runDaemon(
                 host.url("/ci/daemon"),
-                () -> new Workspace.Preparation(InitFailed.Reason.SHA_GONE, "fatal: reference is not a tree"),
+                worktree(
+                    () ->
+                        new MirrorWorktree.Preparation(
+                            InitFailed.Reason.SHA_GONE, "fatal: reference is not a tree")),
                 30)
             .get(30, TimeUnit.SECONDS);
     host.awaitDrained();
@@ -271,7 +275,9 @@ class DaemonMainTest {
                                   .encode()));
                 }
               } else if (message instanceof Initialized) {
-                h.send(new RunStep("c1", "echo before; sleep 0.3; echo during; exit 3", 300));
+                h.send(
+                    new RunStep(
+                        "c1", 0, "echo before; sleep 0.3; echo during; exit 3", 300, Map.of()));
               } else if (message instanceof StepChunk && h.upgrades.get() == 1) {
                 h.socket.close(); // the edge goes away with the step demonstrably running
               }
@@ -280,10 +286,11 @@ class DaemonMainTest {
     int code =
         runDaemon(
                 tokenEnv(host.url("/ci/daemon")),
-                () -> {
-                  initializations.incrementAndGet();
-                  return Workspace.Preparation.READY;
-                },
+                worktree(
+                    () -> {
+                      initializations.incrementAndGet();
+                      return MirrorWorktree.Preparation.READY;
+                    }),
                 30,
                 10_000,
                 10_000)
@@ -327,7 +334,7 @@ class DaemonMainTest {
                   // side the frame may as well have been lost with the edge.
                   h.socket.close();
                 } else {
-                  h.send(new RunStep("c1", "echo resumed", 300));
+                  h.send(new RunStep("c1", 0, "echo resumed", 300, Map.of()));
                 }
               }
             });
@@ -467,7 +474,7 @@ class DaemonMainTest {
   void anEnvironmentMissingItsTokenExitsBeforeAnythingIsDialledAndNamesTheVariable() {
     DaemonEnv env =
         new DaemonEnv(
-            "ws://127.0.0.1:1/ci/daemon", "daemon-1", "file:///origin", "main", "abc123f", "", "");
+            "ws://127.0.0.1:1/ci/daemon", "daemon-1", "file:///origin", "main", "abc123f", "", "", "run-9");
 
     int code = runToExit(env);
 
@@ -480,7 +487,7 @@ class DaemonMainTest {
   void aBlankTokenIsAMissingTokenRatherThanAnEmptyBearer() {
     DaemonEnv env =
         new DaemonEnv(
-            "ws://127.0.0.1:1/ci/daemon", "daemon-1", "file:///origin", "main", "abc123f", "  ", "");
+            "ws://127.0.0.1:1/ci/daemon", "daemon-1", "file:///origin", "main", "abc123f", "  ", "", "run-9");
 
     assertEquals(ExitCode.MISCONFIGURED, runToExit(env));
     assertEquals("QITS_TOKEN", env.missing());
@@ -499,7 +506,7 @@ class DaemonMainTest {
               if (message instanceof Hello) {
                 h.send(new Ack(CiDaemonProtocol.CAPABILITY_VERSION));
               } else if (message instanceof Initialized) {
-                h.send(new RunStep("c1", "echo started; sleep 60", 300));
+                h.send(new RunStep("c1", 0, "echo started; sleep 60", 300, Map.of()));
               } else if (message instanceof StepChunk) {
                 // The step is demonstrably running; cancel it.
                 h.send(new Cancel("c1"));
@@ -563,7 +570,7 @@ class DaemonMainTest {
                 h.socket.writeTextMessage("not json at all");
                 h.send(new Ack(CiDaemonProtocol.CAPABILITY_VERSION));
               } else if (message instanceof Initialized) {
-                h.send(new RunStep("c1", "echo survived", 30));
+                h.send(new RunStep("c1", 0, "echo survived", 30, Map.of()));
               }
             });
 
@@ -576,10 +583,104 @@ class DaemonMainTest {
     assertNotNull(host.first(StepFinished.class));
   }
 
-  // --- telemetry: flushed before the terminal frame ----------------------------------------------
+  // --- the lease: many steps, one worktree, Close ends it ------------------------------------------
 
   @Test
-  void aStepThatExitsRightAfterItsLastLineStillExportsItBeforeTheHostSeesStepFinished()
+  void aCloseRemovesTheWorktreeAndIsTheOnlyCleanEnding() throws Exception {
+    Host host = host((h, message) -> h.reply(message));
+    ScriptedWorktree worktree = worktree(() -> MirrorWorktree.Preparation.READY);
+
+    int code = runDaemon(tokenEnv(host.url("/ci/daemon")), worktree, 30, 10_000).get(30, TimeUnit.SECONDS);
+    host.awaitDrained();
+
+    assertEquals(ExitCode.OK, code);
+    assertEquals(1, worktree.removals.get());
+  }
+
+  @Test
+  void aRunStepRepeatedAfterAnOutageIsNotRunTwiceButTheNextIndexIs() throws Exception {
+    Host host =
+        host(
+            (h, message) -> {
+              if (message instanceof Hello) {
+                h.send(new Ack(CiDaemonProtocol.CAPABILITY_VERSION));
+              } else if (message instanceof Initialized) {
+                h.send(new RunStep("c1", 0, "echo first", 30, Map.of()));
+                h.send(new RunStep("c1", 0, "echo first again", 30, Map.of()));
+                h.send(new RunStep("c2", 1, "echo second", 30, Map.of()));
+              } else if (message instanceof StepFinished finished && finished.stepIndex() == 1) {
+                h.send(new Close());
+              }
+            });
+    host.closeAfterStep = false;
+
+    int code = runDaemon(host.url("/ci/daemon"), ready(), 30).get(30, TimeUnit.SECONDS);
+    host.awaitDrained();
+
+    assertEquals(ExitCode.OK, code);
+    assertEquals(
+        List.of(0, 1), host.all(StepFinished.class).stream().map(StepFinished::stepIndex).toList());
+    StringBuilder out = new StringBuilder();
+    host.all(StepChunk.class).forEach(chunk -> out.append(chunk.text()));
+    assertEquals("first\nsecond\n", out.toString());
+  }
+
+  @Test
+  void aCloseWhileAStepRunsKillsItStillReportsItAndThenRemovesTheWorktree() throws Exception {
+    Host host =
+        host(
+            (h, message) -> {
+              if (message instanceof Hello) {
+                h.send(new Ack(CiDaemonProtocol.CAPABILITY_VERSION));
+              } else if (message instanceof Initialized) {
+                h.send(new RunStep("c1", 0, "echo started; sleep 60", 300, Map.of()));
+              } else if (message instanceof StepChunk) {
+                h.send(new Close());
+              }
+            });
+    host.closeAfterStep = false;
+    ScriptedWorktree worktree = worktree(() -> MirrorWorktree.Preparation.READY);
+
+    int code =
+        runDaemon(tokenEnv(host.url("/ci/daemon")), worktree, 30, 10_000).get(60, TimeUnit.SECONDS);
+    host.awaitDrained();
+
+    assertEquals(ExitCode.OK, code);
+    assertNotNull(host.first(StepFinished.class), "the killed step still has a result");
+    assertEquals(1, worktree.removals.get());
+  }
+
+  @Test
+  void anInitFailedAndALostSocketBothRemoveWhatTheWorktreeMade() throws Exception {
+    Host failing = host((h, message) -> h.reply(message));
+    ScriptedWorktree broken =
+        worktree(() -> new MirrorWorktree.Preparation(InitFailed.Reason.CLONE_FAILED, "no"));
+    assertEquals(
+        ExitCode.INIT_FAILED_SENT,
+        runDaemon(tokenEnv(failing.url("/ci/daemon")), broken, 30, 10_000).get(30, TimeUnit.SECONDS));
+    assertEquals(1, broken.removals.get());
+
+    Host vanishing =
+        host(
+            (h, message) -> {
+              if (message instanceof Hello) {
+                h.send(new Ack(CiDaemonProtocol.CAPABILITY_VERSION));
+              } else if (message instanceof Initialized) {
+                h.closeServer();
+              }
+            });
+    ScriptedWorktree orphaned = worktree(() -> MirrorWorktree.Preparation.READY);
+    assertEquals(
+        ExitCode.SOCKET_CLOSED_EARLY,
+        runDaemon(tokenEnv(vanishing.url("/ci/daemon")), orphaned, 30, 10_000, 600)
+            .get(30, TimeUnit.SECONDS));
+    assertEquals(1, orphaned.removals.get());
+  }
+
+  // --- telemetry: flushed before the socket closes -----------------------------------------------
+
+  @Test
+  void aStepThatExitsRightAfterItsLastLineStillExportsItBeforeTheDaemonClosesTheLease()
       throws Exception {
     FakeCollector collector = collector();
     Host host = host((h, message) -> h.reply(message, "echo last words; echo complaint >&2; exit 3"));
@@ -594,8 +695,8 @@ class DaemonMainTest {
     assertEquals(ExitCode.OK, code);
     assertEquals(3, host.first(StepFinished.class).exitCode());
     assertTrue(
-        collector.lastAnsweredAtNanos() < host.stepFinishedAtNanos,
-        "every telemetry request must be answered before the host sees StepFinished");
+        collector.lastAnsweredAtNanos() < host.closedAtNanos,
+        "every telemetry request must be answered before the daemon closes the socket");
 
     List<OtlpDecode.Line> lines = collector.lines();
     OtlpDecode.Line last = only(lines, "last words");
@@ -629,7 +730,7 @@ class DaemonMainTest {
   }
 
   @Test
-  void aCollectorThatNeverAnswersDelaysStepFinishedByAtMostTheFlushBoundAndChangesNothing()
+  void aCollectorThatNeverAnswersDelaysTheExitByAtMostTheFlushBoundAndChangesNothing()
       throws Exception {
     FakeCollector collector = collector();
     collector.silent = true;
@@ -732,7 +833,8 @@ class DaemonMainTest {
             () ->
                 runDaemon(
                         tokenEnv(host.url("/ci/daemon")),
-                        () -> new Workspace.Preparation(InitFailed.Reason.SHA_GONE, "gone"),
+                        worktree(
+                            () -> new MirrorWorktree.Preparation(InitFailed.Reason.SHA_GONE, "gone")),
                         telemetry)
                     .get(30, TimeUnit.SECONDS));
     host.awaitDrained();
@@ -770,7 +872,7 @@ class DaemonMainTest {
     Telemetry telemetry = telemetry(collector.endpoint(), 3_000);
     DaemonEnv env =
         new DaemonEnv(
-            "ws://127.0.0.1:1/ci/daemon", "daemon-1", "file:///origin", "main", "abc123f", "", "");
+            "ws://127.0.0.1:1/ci/daemon", "daemon-1", "file:///origin", "main", "abc123f", "", "", "run-9");
 
     int code =
         withTelemetryHandler(
@@ -812,7 +914,9 @@ class DaemonMainTest {
                                   .encode()));
                 }
               } else if (message instanceof Initialized) {
-                h.send(new RunStep("c1", "echo before; sleep 0.3; echo during; exit 3", 300));
+                h.send(
+                    new RunStep(
+                        "c1", 0, "echo before; sleep 0.3; echo during; exit 3", 300, Map.of()));
               } else if (message instanceof StepChunk && h.upgrades.get() == 1) {
                 h.socket.close();
               }
@@ -831,7 +935,7 @@ class DaemonMainTest {
     assertEquals(2, host.upgrades.get());
     assertEquals(3, host.first(StepFinished.class).exitCode());
     assertEquals(1, collector.to(Telemetry.TRACES_PATH).size(), "one flush, not one per socket");
-    assertTrue(collector.lastAnsweredAtNanos() < host.stepFinishedAtNanos);
+    assertTrue(collector.lastAnsweredAtNanos() < host.closedAtNanos);
   }
 
   // --- harness ------------------------------------------------------------------------------------
@@ -916,12 +1020,12 @@ class DaemonMainTest {
   }
 
   private CompletableFuture<Integer> runDaemon(
-      DaemonEnv env, DaemonMain.Initializer initializer, Telemetry telemetry) {
+      DaemonEnv env, DaemonMain.Worktree initializer, Telemetry telemetry) {
     return runDaemon(env, initializer, telemetry, 30);
   }
 
   private CompletableFuture<Integer> runDaemon(
-      DaemonEnv env, DaemonMain.Initializer initializer, Telemetry telemetry, long dialBudgetMillis) {
+      DaemonEnv env, DaemonMain.Worktree initializer, Telemetry telemetry, long dialBudgetMillis) {
     DaemonMain daemon =
         new DaemonMain(
             vertx,
@@ -933,8 +1037,37 @@ class DaemonMainTest {
     return CompletableFuture.supplyAsync(daemon::run);
   }
 
-  private DaemonMain.Initializer ready() {
-    return () -> Workspace.Preparation.READY;
+  private DaemonMain.Worktree ready() {
+    return worktree(() -> MirrorWorktree.Preparation.READY);
+  }
+
+  /** Every worktree a test made, so a test can ask whether the ending removed it. */
+  private final List<ScriptedWorktree> worktrees = Collections.synchronizedList(new ArrayList<>());
+
+  private ScriptedWorktree worktree(java.util.function.Supplier<MirrorWorktree.Preparation> prepare) {
+    ScriptedWorktree worktree = new ScriptedWorktree(prepare);
+    worktrees.add(worktree);
+    return worktree;
+  }
+
+  /** A worktree that is only its outcome, counting how often it was removed. */
+  private static final class ScriptedWorktree implements DaemonMain.Worktree {
+    private final java.util.function.Supplier<MirrorWorktree.Preparation> prepare;
+    final AtomicInteger removals = new AtomicInteger();
+
+    ScriptedWorktree(java.util.function.Supplier<MirrorWorktree.Preparation> prepare) {
+      this.prepare = prepare;
+    }
+
+    @Override
+    public MirrorWorktree.Preparation prepare() {
+      return prepare.get();
+    }
+
+    @Override
+    public void remove() {
+      removals.incrementAndGet();
+    }
   }
 
   private static int indexOfFirst(List<CiDaemonMessage> messages, Class<?> type) {
@@ -946,18 +1079,20 @@ class DaemonMainTest {
     return -1;
   }
 
+  private final java.util.concurrent.atomic.AtomicLong seq = new java.util.concurrent.atomic.AtomicLong();
+
   private Step step(RunStep request, java.util.function.Consumer<CiDaemonMessage> emit) {
-    return new StepProcess(workDir, request, emit, 8192, 100, 2000, "bash");
+    return new StepProcess(workDir, request, emit, seq, 8192, 100, 2000, "bash", true);
   }
 
   private CompletableFuture<Integer> runDaemon(
-      String url, DaemonMain.Initializer initializer, long dialBudgetMillis) {
+      String url, DaemonMain.Worktree initializer, long dialBudgetMillis) {
     return runDaemon(url, initializer, dialBudgetMillis, 10_000);
   }
 
   private CompletableFuture<Integer> runDaemon(
       String url,
-      DaemonMain.Initializer initializer,
+      DaemonMain.Worktree initializer,
       long dialBudgetMillis,
       long heartbeatMillis) {
     return runDaemon(tokenEnv(url), initializer, dialBudgetMillis, heartbeatMillis);
@@ -980,7 +1115,7 @@ class DaemonMainTest {
 
   private CompletableFuture<Integer> runDaemon(
       DaemonEnv env,
-      DaemonMain.Initializer initializer,
+      DaemonMain.Worktree initializer,
       long dialBudgetMillis,
       long heartbeatMillis) {
     return runDaemon(env, initializer, dialBudgetMillis, heartbeatMillis, 2_000);
@@ -988,7 +1123,7 @@ class DaemonMainTest {
 
   private CompletableFuture<Integer> runDaemon(
       DaemonEnv env,
-      DaemonMain.Initializer initializer,
+      DaemonMain.Worktree initializer,
       long dialBudgetMillis,
       long heartbeatMillis,
       long reconnectBudgetMillis) {
@@ -1012,7 +1147,8 @@ class DaemonMainTest {
         "main",
         "0123456789abcdef",
         "run-t0ken",
-        "run:42");
+        "run:42",
+        "run-9");
   }
 
   private Host host(BiConsumer<Host, CiDaemonMessage> script) throws Exception {
@@ -1084,6 +1220,15 @@ class DaemonMainTest {
 
     volatile long initFailedAtNanos = Long.MIN_VALUE;
 
+    /** When the daemon's socket closed here — after the flush, which precedes the close. */
+    volatile long closedAtNanos = Long.MIN_VALUE;
+
+    /**
+     * Answer every StepFinished with Close, after the script has had its say — what qits-ci does
+     * once a run's last step is done. A test that wants more steps turns it off.
+     */
+    volatile boolean closeAfterStep = true;
+
     /** Completes when the daemon's latest socket closes; see {@link #awaitDrained()}. */
     private volatile CompletableFuture<Void> closed = new CompletableFuture<>();
 
@@ -1114,7 +1259,11 @@ class DaemonMainTest {
       CompletableFuture<Void> thisClosed = upgrade == 1 ? closed : new CompletableFuture<>();
       closed = thisClosed;
       socket = ws;
-      ws.closeHandler(v -> thisClosed.complete(null));
+      ws.closeHandler(
+          v -> {
+            closedAtNanos = System.nanoTime();
+            thisClosed.complete(null);
+          });
       ws.textMessageHandler(
           json -> {
             CiDaemonMessage message = CiDaemonCodec.decode(new JsonObject(json).getMap());
@@ -1128,6 +1277,9 @@ class DaemonMainTest {
               receivedOn.add(upgrade);
             }
             script.accept(this, message);
+            if (message instanceof StepFinished && closeAfterStep) {
+              send(new Close());
+            }
           });
     }
 
@@ -1151,7 +1303,7 @@ class DaemonMainTest {
       if (message instanceof Hello) {
         send(new Ack(CiDaemonProtocol.CAPABILITY_VERSION));
       } else if (message instanceof Initialized) {
-        send(new RunStep("c1", script, 300));
+        send(new RunStep("c1", 0, script, 300, Map.of()));
       }
     }
 

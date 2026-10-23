@@ -5,6 +5,7 @@ import eu.wohlben.qits.cidaemon.protocol.AckReceived;
 import eu.wohlben.qits.cidaemon.protocol.Cancel;
 import eu.wohlben.qits.cidaemon.protocol.CiDaemonMessage;
 import eu.wohlben.qits.cidaemon.protocol.CiDaemonProtocol;
+import eu.wohlben.qits.cidaemon.protocol.Close;
 import eu.wohlben.qits.cidaemon.protocol.Hello;
 import eu.wohlben.qits.cidaemon.protocol.InitFailed;
 import eu.wohlben.qits.cidaemon.protocol.Initialized;
@@ -12,7 +13,6 @@ import eu.wohlben.qits.cidaemon.protocol.RunStep;
 import eu.wohlben.qits.cidaemon.protocol.StepFinished;
 import eu.wohlben.qits.cidaemon.protocol.StepChunk;
 import io.vertx.core.Vertx;
-import java.util.List;
 import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
@@ -22,57 +22,56 @@ import java.util.function.Consumer;
 import org.jboss.logging.Logger;
 
 /**
- * The whole life of a step container, in one flow:
+ * The whole life of a CI lease's container, in one flow:
  *
  * <pre>
- *   dial → Hello → Ack → AckReceived → clone+checkout → Initialized → RunStep → StepChunk* →
- *   flush telemetry → StepFinished → exit
+ *   dial → Hello → Ack → AckReceived → mirror + worktree → Initialized →
+ *     (RunStep → StepChunk* → StepFinished)* → Close → worktree remove → flush telemetry → exit 0
  * </pre>
  *
  * with {@code Heartbeat} underneath from dial to close, {@code InitFailed} standing in for {@code
- * Initialized} when the checkout fails, and {@code Cancel} as the only other thing the host may say.
+ * Initialized} when the worktree cannot be made, and {@code Cancel} killing the step that is
+ * running. Steps run one at a time, in the order they arrive, on one lane that also runs the
+ * initialization and the {@code Close} — so a {@code RunStep} that arrives early waits for the
+ * worktree, and the worktree is removed only after the last step on the lane is done.
  *
- * <p><b>Every ending is an exit.</b> That is the inversion of the qits-workspace-daemon shape this
- * class otherwise follows, and it is the reason the endings are enumerated rather than handled: a
- * daemon that fell through to "keep waiting" would leave a container alive with nothing to do,
- * holding a slot the host has already accounted for. See {@link ExitCode} for which ending is which,
- * and why only a delivered {@code StepFinished} is a zero.
+ * <p><b>Every ending is an exit</b>, and every ending after initialization removes the worktree
+ * first: the mirror lives on the target's cache volume and outlives this container, so a worktree
+ * left registered in it is bookkeeping the next run's {@code worktree prune} has to find. See {@link
+ * ExitCode} for which ending is which; only a {@code Close} answered is a zero.
  *
  * <p><b>A dropped socket is not an ending</b> while {@link ControlSocket} is re-dialling it. The
- * step keeps running through the outage, and what it must not lose is held here: an {@code
- * Initialized} that failed to send, the step's chunks (bounded, oldest dropped first) and the
- * terminal frame. On the new socket the daemon says {@code Hello} again, and the host's {@code Ack}
- * is what releases the held frames, in order — {@code Initialized}, chunks by {@code seq}, then the
- * terminal frame. An {@code Initialized} that was written but never answered by a {@code RunStep}
- * is sent again too. Every {@code seq} keeps the number it was minted with, so a host that already saw
- * one drops the copy. Only a reconnect budget that runs out ends the process, as exit 6.
+ * steps keep running through the outage, and what they must not lose is held here, in the order it
+ * was produced: an {@code Initialized} that failed to send, every step's chunks (bounded, oldest
+ * dropped first) and every {@code StepFinished} (never dropped). On the new socket the daemon says
+ * {@code Hello} again, and the host's {@code Ack} releases the held frames in order. An {@code
+ * Initialized} that was written but never answered by a {@code RunStep} is sent again too. Only a
+ * reconnect budget that runs out ends the process, as exit 6.
  *
- * <p><b>Telemetry is flushed before the terminal frame, never after it.</b> qits-ci {@code docker rm
- * -f}s the container the moment {@code StepFinished} arrives, so whatever this process still had to
- * say after that frame would race a SIGKILL. Every ending therefore runs {@link Telemetry#flush}
- * first — bounded by {@code qits.ci.telemetry-flush-ms}, never failing — and only its completion
- * hands the terminal frame to the socket. The flush is a future composed in front of the send rather
- * than a wait: {@code sendAndFinish} runs on a worker, but the flush's own HTTP calls and the
- * terminal write both need an event loop, and nothing here may park one. A frame held through an
- * outage was flushed before it was held, and the flush runs once, so the replay does not flush
- * again. The endings without a terminal frame (exits 3, 4, 6, 7) flush the same way before they
- * finish; a misconfigured daemon (exit 2) exports nothing.
+ * <p><b>Telemetry is flushed once, at the ending, before the socket is closed.</b> A {@code
+ * StepFinished} no longer ends the container, so there is no reaping to race until qits-ci deletes
+ * the lease after {@code Close}; the flush is composed in front of the close for the same reason it
+ * used to sit in front of the terminal frame. An {@code InitFailed} is still flushed before it is
+ * sent, because the host ends the lease the moment it reads one.
  *
  * <p>A plain class with a plain constructor, not a bean: {@link Main} is the one place that resolves
  * configuration, and everything here arrives as an argument. That is also what lets the suite drive
- * this flow against a real in-JVM Vert.x server with a scripted checkout and a scripted step.
+ * this flow against a real in-JVM Vert.x server with a scripted worktree and real steps.
  */
 public final class DaemonMain implements ControlSocket.Listener {
 
   private static final Logger LOG = Logger.getLogger(DaemonMain.class);
 
-  /** Prepares the checkout. {@link Workspace#prepare()} in production. */
-  @FunctionalInterface
-  public interface Initializer {
-    Workspace.Preparation prepare();
+  /** The run's checkout. {@link MirrorWorktree} in production. */
+  public interface Worktree {
+    /** Make the worktree, or say why not. */
+    MirrorWorktree.Preparation prepare();
+
+    /** Remove it again; idempotent, never throws, a no-op when nothing was made. */
+    void remove();
   }
 
-  /** Builds the step's execution. {@link StepProcess}'s constructor in production. */
+  /** Builds one step's execution. {@link StepProcess}'s constructor in production. */
   @FunctionalInterface
   public interface Steps {
     Step create(RunStep request, Consumer<CiDaemonMessage> emit);
@@ -80,18 +79,28 @@ public final class DaemonMain implements ControlSocket.Listener {
 
   private final DaemonEnv env;
   private final ControlSocket socket;
-  private final Initializer initializer;
+  private final Worktree worktree;
   private final Steps steps;
   private final Telemetry telemetry;
 
-  /**
-   * Off-event-loop pool for the two blocking things this daemon does — the clone and the step.
-   * Frames are handled on a Vert.x event loop, so neither may run there.
-   */
+  /** Off-event-loop pool for what must not wait behind the lane: a cancel's kill and its grace. */
   private final ExecutorService workers =
       Executors.newCachedThreadPool(
           runnable -> {
             Thread thread = new Thread(runnable, "ci-daemon-worker");
+            thread.setDaemon(true);
+            return thread;
+          });
+
+  /**
+   * The lane: initialization, every step and the teardown, one after another. One thread is the
+   * whole ordering guarantee — two steps cannot share the worktree at once, and the worktree is not
+   * removed under a step.
+   */
+  private final ExecutorService lane =
+      Executors.newSingleThreadExecutor(
+          runnable -> {
+            Thread thread = new Thread(runnable, "ci-daemon-lane");
             thread.setDaemon(true);
             return thread;
           });
@@ -105,20 +114,30 @@ public final class DaemonMain implements ControlSocket.Listener {
 
   private final CompletableFuture<Integer> exit = new CompletableFuture<>();
   private final AtomicBoolean acked = new AtomicBoolean();
-  private final AtomicBoolean stepStarted = new AtomicBoolean();
+  private final AtomicBoolean ending = new AtomicBoolean();
+
+  /** A RunStep has been accepted at all; the Initialized resend and exit 7 both ask. */
+  private final AtomicBoolean anyStep = new AtomicBoolean();
+
+  /** Highest {@code stepIndex} accepted; a RunStep at or below it is a replay and is ignored. */
+  private int lastStepIndex = -1;
+
+  private volatile boolean ready;
   private volatile Step step;
   private volatile boolean cancelRequested;
 
+  /** The first step failure, as the root span's error at the ending; null while all passed. */
+  private volatile String firstFailure;
+
   /**
-   * First connect to first {@code Ack}; see {@link Spans}. The other children live on the worker
-   * that runs them, so only this one, which ends on the event loop, is a field.
+   * First connect to first {@code Ack}; see {@link Spans}. The other children live on the lane that
+   * runs them, so only this one, which ends on the event loop, is a field.
    */
   private volatile Spans.Span dialSpan;
 
   /**
    * Guards everything below. One lock across the decision to send and the send itself is what keeps
-   * a chunk from the step's thread overtaking the replay of the ones held before it — and a host
-   * that drops {@code seq <= lastSeq} would discard the held ones if it did.
+   * a frame from a step overtaking the replay of the ones held before it.
    */
   private final Object outbox = new Object();
 
@@ -127,40 +146,43 @@ public final class DaemonMain implements ControlSocket.Listener {
 
   private boolean initializedPending;
 
-  /** The checkout succeeded and {@code Initialized} was sent at least once. */
+  /** The worktree is ready and {@code Initialized} was sent at least once. */
   private boolean initializedSent;
-  private final TreeMap<Long, StepChunk> heldChunks = new TreeMap<>();
+
+  /**
+   * Held frames by the order they were produced in — chunks and {@code StepFinished}s alike. A key
+   * is taken when a frame is first delivered, so a write that fails on a dying socket after later
+   * frames were already held still goes back in its own place.
+   */
+  private final TreeMap<Long, CiDaemonMessage> held = new TreeMap<>();
+
+  private long nextOrdinal;
   private long heldChars;
   private long droppedChunks;
 
-  /** The terminal frame and the exit it ends in, once there is one; kept until it is written. */
+  /** The terminal frame ({@code InitFailed}) and the exit it ends in; kept until it is written. */
   private CiDaemonMessage terminal;
   private int terminalCode;
   private boolean terminalInFlight;
 
   /** A daemon whose telemetry is off. */
   public DaemonMain(
-      Vertx vertx,
-      DaemonEnv env,
-      ControlSocket.Settings settings,
-      Initializer initializer,
-      Steps steps) {
-    this(vertx, env, settings, initializer, steps, Telemetry.off());
+      Vertx vertx, DaemonEnv env, ControlSocket.Settings settings, Worktree worktree, Steps steps) {
+    this(vertx, env, settings, worktree, steps, Telemetry.off());
   }
 
   public DaemonMain(
       Vertx vertx,
       DaemonEnv env,
       ControlSocket.Settings settings,
-      Initializer initializer,
+      Worktree worktree,
       Steps steps,
       Telemetry telemetry) {
     this.env = env;
-    this.initializer = initializer;
+    this.worktree = worktree;
     this.steps = steps;
     this.telemetry = telemetry;
-    this.socket =
-        new ControlSocket(vertx, env.daemonUrl(), env.token(), settings, this);
+    this.socket = new ControlSocket(vertx, env.daemonUrl(), env.token(), settings, this);
   }
 
   /**
@@ -172,8 +194,7 @@ public final class DaemonMain implements ControlSocket.Listener {
     String missing = env.missing();
     if (missing != null) {
       // Nothing to report this over: the socket needs the very values that are absent. The
-      // container's stdout is the only channel, and qits-ci captures a bounded `docker logs` tail
-      // when a container never registers, so this line is the diagnosis a human gets.
+      // container's stdout is the only channel, so this line is the diagnosis a human gets.
       LOG.errorf("ci-daemon cannot start: %s is not set. Exiting.", missing);
       return ExitCode.MISCONFIGURED;
     }
@@ -197,6 +218,7 @@ public final class DaemonMain implements ControlSocket.Listener {
       return ExitCode.SOCKET_CLOSED_EARLY;
     } finally {
       workers.shutdownNow();
+      lane.shutdownNow();
       socket.shutdown();
       telemetry.shutdown();
     }
@@ -237,6 +259,7 @@ public final class DaemonMain implements ControlSocket.Listener {
       case Ack ack -> onAck(ack);
       case RunStep request -> onRunStep(request);
       case Cancel cancel -> onCancel(cancel);
+      case Close close -> onClose();
       default ->
           // Everything else in the sealed set is daemon→host. A host echoing one back is not a
           // conversation this version has, and there is nothing to do about it but say so.
@@ -262,39 +285,40 @@ public final class DaemonMain implements ControlSocket.Listener {
     if (acked.compareAndSet(false, true)) {
       endSpan(dialSpan, null);
       // Confirms host→daemon delivery, which Hello never did — see AckReceived's javadoc. Fired
-      // before the clone starts and best-effort: a container probe is the only caller that waits
-      // for it, and a probe that never sees it is REJECTED at its own deadline rather than this
-      // daemon retrying a send the socket has already told it is gone. Only for the first Ack: the
-      // one a reconnect earns re-admits a launch that was confirmed long ago, and a second clone
-      // into the same checkout would be a second initialization of one container.
+      // before the worktree is made and best-effort. Only for the first Ack: the one a reconnect
+      // earns re-admits a launch that was confirmed long ago, and a second worktree for the same
+      // run would be a second initialization of one lease.
       socket
           .send(new AckReceived())
           .onFailure(t -> LOG.debugf("ci-daemon could not confirm the Ack: %s", t.getMessage()));
-      workers.execute(this::initialize);
+      lane.execute(this::initialize);
     }
     release();
   }
 
   /**
-   * The clone and checkout, off the event loop. A failure ends the container here: there is no step
-   * to run without a checkout, and {@code InitFailed} carries the reason the host branches on —
-   * {@code SHA_GONE} in particular, which is what makes the force-push case a discarded run rather
-   * than a recorded failure against a commit nobody can look at.
+   * The mirror and the worktree, on the lane. A failure ends the lease here: there is no step to run
+   * without a checkout, and {@code InitFailed} carries the reason the host branches on — {@code
+   * SHA_GONE} in particular, which is what makes the force-push case a discarded run rather than a
+   * recorded failure against a commit nobody can look at.
    */
   private void initialize() {
     Spans.Span checkout = telemetry.span("checkout");
-    Workspace.Preparation preparation;
+    MirrorWorktree.Preparation preparation;
     try {
-      preparation = initializer.prepare();
+      preparation = worktree.prepare();
     } catch (RuntimeException e) {
       LOG.error("ci-daemon initialization threw", e);
       preparation =
-          new Workspace.Preparation(InitFailed.Reason.CLONE_FAILED, String.valueOf(e.getMessage()));
+          new MirrorWorktree.Preparation(
+              InitFailed.Reason.CLONE_FAILED, String.valueOf(e.getMessage()));
     }
     if (!preparation.ready()) {
       LOG.errorf("ci-daemon initialization failed: %s", preparation.failure());
       String why = "InitFailed " + preparation.failure() + ": " + preparation.detail();
       checkout.end(why);
+      // Whatever half of it was made goes before the frame does: the host ends the lease on it.
+      worktree.remove();
       sendAndFinish(
           new InitFailed(preparation.failure(), preparation.detail()),
           ExitCode.INIT_FAILED_SENT,
@@ -302,122 +326,217 @@ public final class DaemonMain implements ControlSocket.Listener {
       return;
     }
     checkout.end();
+    ready = true;
     synchronized (outbox) {
       initializedSent = true;
       deliver(new Initialized());
     }
   }
 
+  /** On the event loop: accept or drop, then queue on the lane. */
   private void onRunStep(RunStep request) {
-    if (!stepStarted.compareAndSet(false, true)) {
-      // Exactly one per container lifetime. A host re-admitting this launch after an outage may send
-      // it again; anything else is a host bug or a hostile frame. Running it would give one
-      // container's results two identities.
-      LOG.infof("ci-daemon ignored a second RunStep (%s)", request.correlationId());
+    synchronized (this) {
+      if (ending.get()) {
+        LOG.infof(
+            "ci-daemon ignored RunStep %d (%s): the lease is ending",
+            request.stepIndex(), request.correlationId());
+        return;
+      }
+      if (request.stepIndex() <= lastStepIndex) {
+        // A host re-admitting this launch after an outage may send a step again. Running it twice
+        // would give one step two results.
+        LOG.infof(
+            "ci-daemon ignored a repeated RunStep %d (%s)",
+            request.stepIndex(), request.correlationId());
+        return;
+      }
+      lastStepIndex = request.stepIndex();
+    }
+    anyStep.set(true);
+    lane.execute(() -> runStep(request));
+  }
+
+  /** On the lane. */
+  private void runStep(RunStep request) {
+    if (ending.get() || !ready) {
+      // Initialization failed (InitFailed is on its way) or a Close got here first.
       return;
     }
-    workers.execute(
-        () -> {
-          Spans.Span script = telemetry.span("script");
-          Step running =
-              steps.create(
-                  request,
-                  message -> {
-                    if (message instanceof StepChunk chunk) {
-                      telemetry.output(chunk);
-                    }
-                    deliver(message);
-                  });
-          step = running;
-          StepFinished finished = running.run();
-          String why = failure(finished);
-          script.attribute("qits.ci.exit_code", (long) finished.exitCode());
-          script.attribute("qits.ci.timed_out", finished.timedOut());
-          if (cancelRequested) {
-            script.attribute("qits.ci.cancelled", true);
-          }
-          script.end(why);
-          // The telemetry flush, then the step's terminal frame, then the close, then the exit — in
-          // that order, each waiting on the last, so neither the result nor the telemetry can be
-          // lost to a container reaped while a write was still queued.
-          sendAndFinish(finished, ExitCode.OK, why);
-        });
+    Spans.Span script = telemetry.span("script");
+    script.attribute("qits.ci.step_index", (long) request.stepIndex());
+    cancelRequested = false;
+    Step running =
+        steps.create(
+            request,
+            message -> {
+              if (message instanceof StepChunk chunk) {
+                telemetry.output(chunk);
+              }
+              deliver(message);
+            });
+    step = running;
+    StepFinished finished;
+    try {
+      finished = running.run();
+    } finally {
+      step = null;
+    }
+    String why = failure(finished);
+    script.attribute("qits.ci.exit_code", (long) finished.exitCode());
+    script.attribute("qits.ci.timed_out", finished.timedOut());
+    if (cancelRequested) {
+      script.attribute("qits.ci.cancelled", true);
+    }
+    script.end(why);
+    if (why != null && firstFailure == null) {
+      firstFailure = "step " + request.stepIndex() + ": " + why;
+    }
+    // Not the terminal frame any more: the lease goes on to the next RunStep or the Close. It is
+    // held through an outage like the chunks before it, and after them.
+    deliver(finished);
   }
 
   private void onCancel(Cancel cancel) {
     Step running = step;
     if (running == null) {
-      LOG.warnf("ci-daemon received Cancel (%s) with no step running — exiting.", cancel.correlationId());
-      closeAndFinish(ExitCode.CANCELLED_BEFORE_STEP, "cancelled before a step ran");
+      if (!anyStep.get()) {
+        LOG.warnf(
+            "ci-daemon received Cancel (%s) with no step run yet — exiting.",
+            cancel.correlationId());
+        teardown(ExitCode.CANCELLED_BEFORE_STEP, "cancelled before a step ran", true);
+      } else {
+        // Between steps there is nothing to kill; the host follows with Close.
+        LOG.infof(
+            "ci-daemon received Cancel (%s) between steps; nothing to kill",
+            cancel.correlationId());
+      }
       return;
     }
     LOG.infof("ci-daemon cancelling step %s", cancel.correlationId());
     cancelRequested = true;
-    // Off the event loop: the kill waits out its own grace period.
+    // Off the event loop and off the lane: the kill waits out its own grace period, and the lane is
+    // the thread the step it kills is blocking.
     workers.execute(running::cancel);
+  }
+
+  /**
+   * The host is done with the lease. A step still running is killed — its {@code StepFinished} is
+   * still sent — and the teardown queues behind it on the lane, so the worktree is removed only once
+   * nothing is using it.
+   */
+  private void onClose() {
+    LOG.info("ci-daemon received Close; removing the worktree and exiting.");
+    // The root span's error is read on the lane, once the step this Close may kill has finished.
+    teardown(ExitCode.OK, null, true);
+  }
+
+  /**
+   * Every ending after the dial: kill the running step, then — on the lane, behind it — remove the
+   * worktree, flush, close (when the socket is still ours to close) and exit. Runs once.
+   */
+  private void teardown(int code, String rootError, boolean closeSocket) {
+    teardown(code, rootError, closeSocket, null);
+  }
+
+  private void teardown(int code, String rootError, boolean closeSocket, String why) {
+    if (!ending.compareAndSet(false, true)) {
+      return;
+    }
+    Step running = step;
+    if (running != null) {
+      cancelRequested = true;
+      workers.execute(running::cancel);
+    }
+    try {
+      lane.execute(
+          () -> {
+            worktree.remove();
+            String error = rootError != null ? rootError : firstFailure;
+            if (closeSocket) {
+              closeAndFinish(code, error);
+            } else {
+              flushAndFinish(code, why, error);
+            }
+          });
+    } catch (java.util.concurrent.RejectedExecutionException e) {
+      finish(code, why);
+    }
   }
 
   @Override
   public void onClosed() {
     String why =
-        "the control socket dropped and could not be re-established before a step could finish";
-    flushAndFinish(ExitCode.SOCKET_CLOSED_EARLY, why, "socket lost: " + why);
+        "the control socket dropped and could not be re-established before the host closed the"
+            + " lease";
+    teardown(ExitCode.SOCKET_CLOSED_EARLY, "socket lost: " + why, false, why);
   }
 
   @Override
   public void onDialFailed(String detail) {
     LOG.errorf("ci-daemon could not reach qits-ci: %s", detail);
     endSpan(dialSpan, detail);
+    // Nothing was made: the worktree comes after the first Ack.
     flushAndFinish(ExitCode.DIAL_FAILED, detail, "dial failed: " + detail);
   }
 
   /**
-   * Send a frame that must survive an outage — {@code Initialized} or a step chunk — or hold it
-   * until the host has re-admitted this launch. Anything else that arrives here (there is nothing
-   * else today) is sent best-effort.
+   * Send a frame that must survive an outage — {@code Initialized}, a step chunk, a {@code
+   * StepFinished} — or hold it until the host has re-admitted this launch.
    */
   private void deliver(CiDaemonMessage message) {
     synchronized (outbox) {
+      long ordinal = nextOrdinal++;
       if (live) {
-        transmit(message);
+        transmit(ordinal, message);
       } else {
-        hold(message);
+        hold(ordinal, message);
       }
     }
   }
 
   /** Under {@link #outbox}. A write that fails means the socket is going; keep the frame. */
-  private void transmit(CiDaemonMessage message) {
+  private void transmit(long ordinal, CiDaemonMessage message) {
     socket
         .send(message)
         .onFailure(
             t -> {
               synchronized (outbox) {
                 live = false;
-                hold(message);
+                hold(ordinal, message);
               }
             });
   }
 
   /** Under {@link #outbox}. */
-  private void hold(CiDaemonMessage message) {
+  private void hold(long ordinal, CiDaemonMessage message) {
     switch (message) {
       case Initialized initialized -> initializedPending = true;
       case StepChunk chunk -> {
-        if (heldChunks.put(chunk.seq(), chunk) == null) {
+        if (held.put(ordinal, chunk) == null) {
           heldChars += chunk.text().length();
         }
-        while (heldChars > MAX_HELD_CHUNK_CHARS && heldChunks.size() > 1) {
-          heldChars -= heldChunks.pollFirstEntry().getValue().text().length();
-          if (droppedChunks++ == 0) {
-            LOG.warnf(
-                "ci-daemon holds more than %d characters of output for the control socket's"
-                    + " return; dropping the oldest",
-                MAX_HELD_CHUNK_CHARS);
-          }
+        dropOldestChunks();
+      }
+      case StepFinished finished -> held.put(ordinal, finished);
+      default -> {}
+    }
+  }
+
+  /** Under {@link #outbox}. Only chunks are dropped; a step's result never is. */
+  private void dropOldestChunks() {
+    var it = held.entrySet().iterator();
+    while (heldChars > MAX_HELD_CHUNK_CHARS && it.hasNext()) {
+      CiDaemonMessage oldest = it.next().getValue();
+      if (oldest instanceof StepChunk chunk && heldChars - chunk.text().length() > 0) {
+        it.remove();
+        heldChars -= chunk.text().length();
+        if (droppedChunks++ == 0) {
+          LOG.warnf(
+              "ci-daemon holds more than %d characters of output for the control socket's"
+                  + " return; dropping the oldest",
+              MAX_HELD_CHUNK_CHARS);
         }
       }
-      default -> {}
     }
   }
 
@@ -431,21 +550,29 @@ public final class DaemonMain implements ControlSocket.Listener {
         LOG.warnf("ci-daemon dropped %d chunk(s) of output during the outage", droppedChunks);
         droppedChunks = 0;
       }
-      List<StepChunk> replay = List.copyOf(heldChunks.values());
-      heldChunks.clear();
+      var replay = new java.util.ArrayList<>(held.entrySet());
+      held.clear();
       heldChars = 0;
       live = true;
       // Also re-sent when the first copy was written but no RunStep has come back: a write the
       // socket accepted is not a frame the host read, and a host still waiting for Initialized
       // would otherwise wait out its own init deadline. The host ignores a duplicate.
-      if (initializedPending || (initializedSent && !stepStarted.get())) {
+      if (initializedPending || (initializedSent && !anyStep.get())) {
         initializedPending = false;
-        transmit(new Initialized());
+        socket
+            .send(new Initialized())
+            .onFailure(
+                t -> {
+                  synchronized (outbox) {
+                    live = false;
+                    initializedPending = true;
+                  }
+                });
       }
       if (!replay.isEmpty()) {
-        LOG.infof("ci-daemon replaying %d chunk(s) held through the outage", replay.size());
+        LOG.infof("ci-daemon replaying %d frame(s) held through the outage", replay.size());
       }
-      replay.forEach(this::transmit);
+      replay.forEach(e -> transmit(e.getKey(), e.getValue()));
       if (terminal != null && !terminalInFlight) {
         transmitTerminal();
       }
@@ -453,9 +580,10 @@ public final class DaemonMain implements ControlSocket.Listener {
   }
 
   /**
-   * The telemetry flush, then the terminal frame, then the close, then the exit — each waiting on
-   * the last, so the result cannot be lost to a process that exited while the write was still
-   * queued, and the telemetry cannot be lost to a container reaped on the frame's arrival. A write
+   * For {@code InitFailed}, the one terminal frame left: the telemetry flush, then the frame, then
+   * the close, then the exit — each waiting on the last, so the frame cannot be lost to a process
+   * that exited while the write was still queued, and the telemetry cannot be lost to a lease the
+   * host ends on the frame's arrival. A write
    * that fails keeps the frame for the reconnect; only the reconnect budget running out gives up on
    * it.
    *

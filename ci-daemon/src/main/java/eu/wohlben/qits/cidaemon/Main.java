@@ -1,5 +1,6 @@
 package eu.wohlben.qits.cidaemon;
 
+import eu.wohlben.qits.cidaemon.protocol.CiDaemonBinary;
 import io.quarkus.runtime.Quarkus;
 import io.quarkus.runtime.QuarkusApplication;
 import io.quarkus.runtime.annotations.QuarkusMain;
@@ -10,23 +11,28 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicLong;
 import org.jboss.logging.Logger;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 
 /**
  * Entry point, and <b>the one CDI shell</b>: it resolves configuration, news up the plain classes
  * that do the work, and hands its exit code back to the runtime. Everything below it — {@link
- * DaemonMain}, {@link ControlSocket}, {@link Workspace}, {@link StepProcess} — is a plain class with
- * a plain constructor, which is what makes the suite able to drive the whole flow without a
- * container.
+ * DaemonMain}, {@link ControlSocket}, {@link MirrorWorktree}, {@link StepProcess} — is a plain
+ * class with a plain constructor, which is what makes the suite able to drive the whole flow
+ * without a container.
  *
  * <p>That single-reader property is the point of the shape, not a style preference: two components
  * resolving the same key independently is how they come to disagree about it silently. Every setting
  * a class needs arrives as a constructor argument from here.
  *
  * <p>Unlike the {@code workspace-daemon} this repo mirrors, {@code run} does <b>not</b> call {@link
- * Quarkus#waitForExit()}. This process has one step to run and then it is done; {@link
+ * Quarkus#waitForExit()}. This process has one run's steps to run and then it is done; {@link
  * DaemonMain#run()} blocks until a terminal condition and returns the code the container exits with.
+ *
+ * <p>{@code --version} is the one argument: it prints {@link CiDaemonBinary#VERSION} and exits 0
+ * before Quarkus starts, so the release can run the built binary as a smoke test with no
+ * environment, no container and no docker.
  */
 @QuarkusMain
 public class Main {
@@ -41,7 +47,16 @@ public class Main {
    */
   static final String TELEMETRY_URL = "QITS_CI_TELEMETRY_URL";
 
+  /** What {@code --version} prints: the binary's name and version, nothing else. */
+  static String versionLine() {
+    return CiDaemonBinary.DAEMON_NAME + " " + CiDaemonBinary.VERSION;
+  }
+
   public static void main(String... args) {
+    if (args.length == 1 && "--version".equals(args[0])) {
+      System.out.println(versionLine());
+      return;
+    }
     Quarkus.run(DaemonApplication.class, args);
   }
 
@@ -76,8 +91,14 @@ public class Main {
     @ConfigProperty(name = "qits.token-subject")
     Optional<String> tokenSubject;
 
-    @ConfigProperty(name = "qits.ci.workspace-dir", defaultValue = "/workspace")
-    String workspaceDir;
+    // The lease's warm mirrors and the run's worktree (qits-1541): /cache/git/<projectId>/<repo>.git
+    // and /work/<runId>. Keys so the suite — or QITS_CI_GIT_CACHE_DIR / QITS_CI_WORK_DIR, or a
+    // -D system property — can point them at a temp directory.
+    @ConfigProperty(name = "qits.ci.git-cache-dir", defaultValue = "/cache/git")
+    String gitCacheDir;
+
+    @ConfigProperty(name = "qits.ci.work-dir", defaultValue = "/work")
+    String workDir;
 
     @ConfigProperty(name = "qits.ci.heartbeat-interval-ms", defaultValue = "10000")
     long heartbeatMillis;
@@ -97,8 +118,8 @@ public class Main {
     @ConfigProperty(name = "qits.ci.git-timeout-seconds", defaultValue = "600")
     long gitTimeoutSeconds;
 
-    // qits-1253: how long to wait before each re-clone after the git host answers with a transient
-    // failure (a 503, a dropped connection) — see Workspace.cloneWithRetry(). Comma-separated,
+    // qits-1253: how long to wait before each retry after the git host answers a mirror clone or
+    // fetch with a transient failure (a 503, a dropped connection). Comma-separated,
     // ISO-8601-ish with the `PT` prefix implied: "2S,5S" means two attempts after the first, after
     // 2s and then 5s. Not a List<Duration> ConfigProperty: SmallRye's Duration converter demands the
     // full "PT2S" form, and the point of writing it here is that it does not.
@@ -154,7 +175,8 @@ public class Main {
               branch.orElse(""),
               sha.orElse(""),
               token.orElse(""),
-              tokenSubject.orElse(""));
+              tokenSubject.orElse(""),
+              runId.orElse(""));
       Telemetry telemetry = telemetry(env);
       // On the root logger, so every line this process writes is shipped — queued from here, sent
       // once the environment is known to be complete.
@@ -162,15 +184,20 @@ public class Main {
       if (telemetry.enabled()) {
         Runtime.getRuntime().addShutdownHook(telemetry.shutdownHook());
       }
-      Path dir = Path.of(workspaceDir);
-      Workspace workspace =
-          new Workspace(
-              dir,
+      MirrorWorktree worktree =
+          new MirrorWorktree(
+              Path.of(gitCacheDir),
+              Path.of(workDir),
               env.repositoryUrl(),
-              env.branch(),
+              projectId.orElse(""),
+              repoName.orElse(""),
+              repoId.orElse(""),
+              env.runId(),
               env.sha(),
               CommandRunner.forking(gitTimeoutSeconds),
               parseCloneRetryDelays(cloneRetryDelays));
+      // One counter for every step of the lease; see StepProcess on seq.
+      AtomicLong seq = new AtomicLong();
       return new DaemonMain(
               vertx,
               env,
@@ -180,18 +207,20 @@ public class Main {
                   dialInitialBackoffMillis,
                   dialMaxBackoffMillis,
                   reconnectBudgetMillis),
-              workspace::prepare,
+              worktree,
               (request, emit) ->
                   new StepProcess(
-                      dir,
+                      worktree.directory().toPath(),
                       request,
                       emit,
+                      seq,
                       stepChunkMaxChars,
                       stepChunkFlushMillis,
                       stepKillGraceMillis,
-                      // Read here rather than captured above: initialization decides it, and it has
-                      // always completed by the time a RunStep is accepted.
-                      workspace.shell()),
+                      // Read here rather than captured above: initialization decides them, and it
+                      // has always completed by the time a step runs (the lane orders them).
+                      worktree.shell(),
+                      worktree.processGroups()),
               telemetry)
           .run();
     }

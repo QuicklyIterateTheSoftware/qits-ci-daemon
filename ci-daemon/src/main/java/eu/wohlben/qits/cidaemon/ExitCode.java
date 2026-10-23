@@ -4,11 +4,12 @@ package eu.wohlben.qits.cidaemon;
  * The process exit codes this daemon can end with. Every one of them is a terminal condition —
  * <b>this daemon always exits</b>, which is the one deliberate inversion of the qits-workspace-daemon
  * shape it otherwise mirrors. A workspace container's daemon is the container's whole reason to be
- * alive and must outlive every failure; a step container's daemon has exactly one step to run, so
- * there is nothing for it to stay alive <em>for</em>.
+ * alive and must outlive every failure; a CI lease's daemon has one run's steps to run, and when the
+ * host says {@code Close} there is nothing for it to stay alive <em>for</em>.
  *
- * <p><b>{@link #OK} means a {@link eu.wohlben.qits.cidaemon.protocol.StepFinished} was delivered</b>,
- * and nothing else does — not even the paths where the daemon behaved perfectly. {@link
+ * <p><b>{@link #OK} means the host's {@link eu.wohlben.qits.cidaemon.protocol.Close} was answered</b>
+ * — the worktree removed and the socket closed — and nothing else does, whatever the steps' own exit
+ * codes were: those travel in each {@code StepFinished}. {@link
  * #INIT_FAILED_SENT} is the case worth stating: the daemon did its job, reported a structured
  * failure, and the host has everything it needs; the container still did not run its step, and
  * {@code docker inspect} of the reaped container should say so. The exit code describes the
@@ -16,10 +17,10 @@ package eu.wohlben.qits.cidaemon;
  */
 public final class ExitCode {
 
-  /** A step ran and its {@code StepFinished} reached the host. The only clean ending. */
+  /** The host sent {@code Close} and the lease was torn down. The only clean ending. */
   public static final int OK = 0;
 
-  /** The env contract was not satisfied — no url, id, token, repository, branch or sha. */
+  /** The env contract was not satisfied — no url, id, token, repository, branch, sha or run id. */
   public static final int MISCONFIGURED = 2;
 
   /** The control socket could not be reached within the dial budget. */
@@ -27,17 +28,16 @@ public final class ExitCode {
 
   /**
    * The host's {@code Ack} carried a capability version this binary does not know. There is no
-   * compat mode at version 1 and no soft landing planned for version 2: one honest log line beats a
-   * half-understood conversation about a container that lives for one step.
+   * compat mode: one honest log line beats a half-understood conversation.
    */
   public static final int CAPABILITY_MISMATCH = 4;
 
-  /** Clone or checkout failed; an {@code InitFailed} was delivered and no step ran. */
+  /** The mirror or the worktree could not be made; an {@code InitFailed} was delivered. */
   public static final int INIT_FAILED_SENT = 5;
 
   /**
-   * The socket dropped and could not be re-established within the reconnect budget before the step's
-   * result was delivered. A drop alone is not this ending — an edge redeploy drops every socket and
+   * The socket dropped and could not be re-established within the reconnect budget before the host
+   * closed the lease. A drop alone is not this ending — an edge redeploy drops every socket and
    * the daemon re-dials through it; a host that has not taken the launch back by the end of the
    * budget has reaped it, and then there is nothing to reconnect to.
    */

@@ -46,6 +46,7 @@ public final class CiDaemonCodec {
       case StepFinished m -> {
         map.put(Field.TYPE, Type.STEP_FINISHED);
         map.put(Field.CORRELATION_ID, m.correlationId());
+        map.put(Field.STEP_INDEX, m.stepIndex());
         map.put(Field.EXIT_CODE, m.exitCode());
         map.put(Field.TIMED_OUT, m.timedOut());
       }
@@ -57,13 +58,18 @@ public final class CiDaemonCodec {
       case RunStep m -> {
         map.put(Field.TYPE, Type.RUN_STEP);
         map.put(Field.CORRELATION_ID, m.correlationId());
+        map.put(Field.STEP_INDEX, m.stepIndex());
         map.put(Field.SCRIPT, m.script());
         map.put(Field.TIMEOUT_SECONDS, m.timeoutSeconds());
+        // A nested object, not flattened keys: the step env's keys are the step's own and could be
+        // anything, so they must never share a namespace with the frame's fields.
+        map.put(Field.ENV, new LinkedHashMap<>(m.env()));
       }
       case Cancel m -> {
         map.put(Field.TYPE, Type.CANCEL);
         map.put(Field.CORRELATION_ID, m.correlationId());
       }
+      case Close _ -> map.put(Field.TYPE, Type.CLOSE); // no fields beyond the tag
     }
     return map;
   }
@@ -89,6 +95,7 @@ public final class CiDaemonCodec {
       case Type.STEP_FINISHED ->
           new StepFinished(
               str(map, Field.CORRELATION_ID),
+              intVal(map, Field.STEP_INDEX),
               intVal(map, Field.EXIT_CODE),
               boolVal(map, Field.TIMED_OUT));
       case Type.HEARTBEAT -> new Heartbeat();
@@ -96,9 +103,12 @@ public final class CiDaemonCodec {
       case Type.RUN_STEP ->
           new RunStep(
               str(map, Field.CORRELATION_ID),
+              intVal(map, Field.STEP_INDEX),
               str(map, Field.SCRIPT),
-              intVal(map, Field.TIMEOUT_SECONDS));
+              intVal(map, Field.TIMEOUT_SECONDS),
+              stringMap(map, Field.ENV));
       case Type.CANCEL -> new Cancel(str(map, Field.CORRELATION_ID));
+      case Type.CLOSE -> new Close();
       default -> throw new IllegalArgumentException("unknown ci-daemon message type: " + type);
     };
   }
@@ -116,6 +126,34 @@ public final class CiDaemonCodec {
   private static long longVal(Map<String, Object> map, String key) {
     Object value = map.get(key);
     return value instanceof Number number ? number.longValue() : 0L;
+  }
+
+  /**
+   * A nested string map, as whatever the JSON layer decoded it to: a plain {@code Map} (Jackson,
+   * or a map built by hand) or an {@code Iterable} of entries (a Vert.x {@code JsonObject}, which
+   * is not a {@code Map}) — named structurally so this module still depends on nothing. Absent
+   * decodes to an empty map; a {@code null} value is left out, because an environment variable
+   * cannot hold one.
+   */
+  private static Map<String, String> stringMap(Map<String, Object> map, String key) {
+    Object value = map.get(key);
+    Map<String, String> out = new LinkedHashMap<>();
+    Iterable<?> entries;
+    if (value instanceof Map<?, ?> nested) {
+      entries = nested.entrySet();
+    } else if (value instanceof Iterable<?> iterable) {
+      entries = iterable;
+    } else if (value == null) {
+      return out;
+    } else {
+      throw new IllegalArgumentException("'" + key + "' is not an object: " + value);
+    }
+    for (Object entry : entries) {
+      if (entry instanceof Map.Entry<?, ?> e && e.getKey() != null && e.getValue() != null) {
+        out.put(e.getKey().toString(), e.getValue().toString());
+      }
+    }
+    return out;
   }
 
   private static boolean boolVal(Map<String, Object> map, String key) {

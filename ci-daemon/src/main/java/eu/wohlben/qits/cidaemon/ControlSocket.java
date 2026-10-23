@@ -307,8 +307,19 @@ public final class ControlSocket {
   public Future<Void> close() {
     closing = true;
     WebSocket ws = socket;
-    Future<Void> closed = ws == null || ws.isClosed() ? Future.succeededFuture() : ws.close();
-    return closed.otherwiseEmpty();
+    if (ws == null || ws.isClosed()) {
+      return Future.succeededFuture();
+    }
+    // On the socket's own context, like send(): a close issued from the lane straight after a
+    // send() from the same thread would otherwise overtake the write send() queued there, and a
+    // step's last StepFinished would be lost behind the close that follows it.
+    Context context = socketContext;
+    if (context != null && Vertx.currentContext() != context) {
+      Promise<Void> promise = Promise.promise();
+      context.runOnContext(v -> ws.close().otherwiseEmpty().onComplete(promise));
+      return promise.future();
+    }
+    return ws.close().otherwiseEmpty();
   }
 
   /** Release the client. Called once the process is on its way out. */

@@ -5,7 +5,7 @@ package eu.wohlben.qits.cidaemon;
  * verbatim and nothing is parsed out of it, and no value here is announced back to the host, which
  * already knows all of them.
  *
- * <p>It is a record rather than eight {@code @ConfigProperty} fields on the flow class because the
+ * <p>It is a record rather than nine {@code @ConfigProperty} fields on the flow class because the
  * flow is a plain class with a plain constructor — {@link Main} is the one place that resolves
  * configuration, and this is the shape it hands over.
  *
@@ -21,7 +21,8 @@ public record DaemonEnv(
     String branch,
     String sha,
     String token,
-    String tokenSubject) {
+    String tokenSubject,
+    String runId) {
 
   /**
    * The first missing value, or {@code null} when the contract is satisfied. Checked before the
@@ -55,6 +56,11 @@ public record DaemonEnv(
     if (blank(sha)) {
       return "QITS_CI_SHA";
     }
+    // Required since capability 2: the run's worktree is /work/<runId>, and two leases on one
+    // target must not share one. It used to be a telemetry label only.
+    if (blank(runId)) {
+      return "QITS_CI_RUN_ID";
+    }
     return null;
   }
 
@@ -78,6 +84,8 @@ public record DaemonEnv(
         + (blank(token) ? "<absent>" : "<set>")
         + ", tokenSubject="
         + tokenSubject
+        + ", runId="
+        + runId
         + "]";
   }
 

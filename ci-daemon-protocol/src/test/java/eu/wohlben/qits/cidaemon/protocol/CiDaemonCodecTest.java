@@ -88,8 +88,8 @@ class CiDaemonCodecTest {
 
   @Test
   void stepFinishedRoundTripsBothTimeoutStates() {
-    StepFinished ok = new StepFinished("c1", 0, false);
-    StepFinished killed = new StepFinished("c1", 137, true);
+    StepFinished ok = new StepFinished("c1", 0, 0, false);
+    StepFinished killed = new StepFinished("c1", 2, 137, true);
     assertEquals(ok, roundTrip(ok));
     assertEquals(killed, roundTrip(killed));
     assertEquals(
@@ -122,12 +122,59 @@ class CiDaemonCodecTest {
   }
 
   @Test
-  void runStepRoundTrips() {
-    RunStep step = new RunStep("c1", "set -e\nmvn -q verify\n", 900);
+  void stepFinishedCarriesItsStepIndexOnTheWire() {
+    Map<String, Object> map = CiDaemonCodec.encode(new StepFinished("c1", 3, 1, false));
+    assertEquals(3, map.get(CiDaemonProtocol.Field.STEP_INDEX));
+  }
+
+  @Test
+  void runStepRoundTripsWithItsIndexAndEnv() {
+    RunStep step =
+        new RunStep("c1", 1, "set -e\nmvn -q verify\n", 900, Map.of("QITS_CI_STEP_NAME", "verify"));
     assertEquals(step, roundTrip(step));
+    Map<String, Object> map = CiDaemonCodec.encode(step);
+    assertEquals(CiDaemonProtocol.Type.RUN_STEP, map.get(CiDaemonProtocol.Field.TYPE));
+    assertEquals(1, map.get(CiDaemonProtocol.Field.STEP_INDEX));
+    // Nested, never flattened: a step variable named like a frame field must not collide with it.
+    assertEquals(Map.of("QITS_CI_STEP_NAME", "verify"), map.get(CiDaemonProtocol.Field.ENV));
+  }
+
+  @Test
+  void runStepEnvMayArriveAsAnIterableOfEntriesTheWayAVertxJsonObjectDoes() {
+    Map<String, Object> map =
+        new LinkedHashMap<>(CiDaemonCodec.encode(new RunStep("c1", 0, "true", 30, Map.of())));
+    Map<String, Object> env = new LinkedHashMap<>();
+    env.put("A", "1");
+    env.put("N", 7L); // a JSON number still reaches the step as text
+    env.put("GONE", null); // an environment variable cannot hold null; it is left out
+    Iterable<Map.Entry<String, Object>> jsonObjectLike = env.entrySet()::iterator;
+    map.put(CiDaemonProtocol.Field.ENV, jsonObjectLike);
     assertEquals(
-        CiDaemonProtocol.Type.RUN_STEP,
-        CiDaemonCodec.encode(step).get(CiDaemonProtocol.Field.TYPE));
+        new RunStep("c1", 0, "true", 30, Map.of("A", "1", "N", "7")), CiDaemonCodec.decode(map));
+  }
+
+  @Test
+  void runStepWithoutAnEnvDecodesToAnEmptyOne() {
+    Map<String, Object> map =
+        new LinkedHashMap<>(CiDaemonCodec.encode(new RunStep("c1", 0, "true", 30, null)));
+    map.remove(CiDaemonProtocol.Field.ENV);
+    assertEquals(Map.of(), ((RunStep) CiDaemonCodec.decode(map)).env());
+  }
+
+  @Test
+  void runStepRejectsAnEnvThatIsNotAnObject() {
+    Map<String, Object> map =
+        new LinkedHashMap<>(CiDaemonCodec.encode(new RunStep("c1", 0, "true", 30, Map.of())));
+    map.put(CiDaemonProtocol.Field.ENV, "A=1");
+    assertThrows(IllegalArgumentException.class, () -> CiDaemonCodec.decode(map));
+  }
+
+  @Test
+  void closeRoundTrips() {
+    assertEquals(new Close(), roundTrip(new Close()));
+    assertEquals(
+        CiDaemonProtocol.Type.CLOSE,
+        CiDaemonCodec.encode(new Close()).get(CiDaemonProtocol.Field.TYPE));
   }
 
   @Test
@@ -181,9 +228,9 @@ class CiDaemonCodecTest {
   }
 
   @Test
-  void theCapabilityVersionIsOne() {
+  void theCapabilityVersionIsTwo() {
     // Pinned so a bump is a deliberate edit rather than a side effect. It reaches qits-ci as a
     // version bump of this jar, and the host's side of the skew is decided there.
-    assertEquals(1, CiDaemonProtocol.CAPABILITY_VERSION);
+    assertEquals(2, CiDaemonProtocol.CAPABILITY_VERSION);
   }
 }

@@ -15,8 +15,10 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledOnOs;
 import org.junit.jupiter.api.condition.OS;
@@ -156,12 +158,14 @@ class StepProcessTest {
     StepProcess process =
         new StepProcess(
             workDir,
-            new RunStep("c1", "touch running; sleep 60", 300),
+            new RunStep("c1", 0, "touch running; sleep 60", 300, Map.of()),
             emitted::add,
+            new AtomicLong(),
             8192,
             100,
             5000,
-            "bash");
+            "bash",
+            true);
     CompletableFuture<StepFinished> finished =
         CompletableFuture.supplyAsync(process::run);
 
@@ -197,12 +201,14 @@ class StepProcessTest {
     StepProcess process =
         new StepProcess(
             Path.of("/nonexistent-directory-for-this-test"),
-            new RunStep("c1", "echo hi", 30),
+            new RunStep("c1", 0, "echo hi", 30, Map.of()),
             emitted::add,
+            new AtomicLong(),
             8192,
             100,
             5000,
-            "bash");
+            "bash",
+            true);
 
     StepFinished finished = process.run();
 
@@ -211,18 +217,103 @@ class StepProcessTest {
     assertTrue(textOf(Stream.ERR).contains("ci-daemon could not start bash"));
   }
 
+  @Test
+  void theStepsOwnEnvIsLaidOverTheInheritedOneForThatChildOnly() {
+    StepFinished finished =
+        run(
+            new RunStep(
+                "c1",
+                4,
+                "echo \"$QITS_TEST_STEP_VAR $HOME\"",
+                30,
+                Map.of("QITS_TEST_STEP_VAR", "from-the-step", "HOME", "/overridden")),
+            new AtomicLong());
+
+    assertEquals(0, finished.exitCode());
+    assertEquals(4, finished.stepIndex(), "the result names its step");
+    assertEquals("from-the-step /overridden\n", textOf(Stream.OUT));
+    assertFalse(System.getenv().containsKey("QITS_TEST_STEP_VAR"), "the daemon's own env is untouched");
+  }
+
+  @Test
+  void seqContinuesFromTheLeasesCounterRatherThanRestartingPerStep() {
+    AtomicLong seq = new AtomicLong(41);
+
+    run(new RunStep("c2", 1, "echo one", 30, Map.of()), seq);
+
+    assertEquals(41L, chunks(Stream.OUT).getFirst().seq());
+    assertTrue(seq.get() > 41, "the shared counter moved on");
+  }
+
+  @Test
+  void aCancelKillsTheStepsWholeProcessGroupNotOnlyItsShell() throws Exception {
+    Path pidFile = workDir.resolve("child.pid");
+    StepProcess process =
+        new StepProcess(
+            workDir,
+            new RunStep("c1", 0, "sleep 300 & echo $! > child.pid; wait", 300, Map.of()),
+            emitted::add,
+            new AtomicLong(),
+            8192,
+            100,
+            2000,
+            "bash",
+            true);
+    CompletableFuture<StepFinished> finished = CompletableFuture.supplyAsync(process::run);
+    for (int i = 0; i < 200 && (!Files.exists(pidFile) || Files.size(pidFile) == 0); i++) {
+      Thread.sleep(25);
+    }
+    long child = Long.parseLong(Files.readString(pidFile).strip());
+    assertTrue(running(child));
+
+    process.cancel();
+    finished.get(30, TimeUnit.SECONDS);
+
+    // The background child shared the step's group and went with it; in a lease the next step would
+    // otherwise inherit it.
+    for (int i = 0; i < 100 && running(child); i++) {
+      Thread.sleep(50);
+    }
+    assertFalse(running(child));
+  }
+
+  @Test
+  void aBackgroundChildLeftRunningByAFinishedStepDoesNotOutliveItOrHoldItsResult()
+      throws Exception {
+    long startedAt = System.nanoTime();
+    StepFinished finished = run("sleep 300 & echo $! > child.pid; exit 0", 30);
+    long elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000L;
+
+    assertEquals(0, finished.exitCode());
+    assertTrue(elapsedMillis < 10_000, () -> "the leftover held the step open: " + elapsedMillis);
+    long child = Long.parseLong(Files.readString(workDir.resolve("child.pid")).strip());
+    for (int i = 0; i < 100 && running(child); i++) {
+      Thread.sleep(50);
+    }
+    assertFalse(running(child));
+  }
+
   // --- helpers ------------------------------------------------------------------------------------
 
   private StepFinished run(String script, int timeoutSeconds) {
-    return new StepProcess(
-            workDir,
-            new RunStep("c1", script, timeoutSeconds),
-            emitted::add,
-            8192,
-            100,
-            5000,
-            shell)
-        .run();
+    return run(new RunStep("c1", 0, script, timeoutSeconds, Map.of()), new AtomicLong());
+  }
+
+  /**
+   * Running, as opposed to gone or a zombie: an orphan is reparented to a PID 1 that may never reap
+   * it, and {@code ProcessHandle.isAlive} reports a zombie as alive.
+   */
+  private static boolean running(long pid) {
+    try {
+      String stat = Files.readString(Path.of("/proc", String.valueOf(pid), "stat"));
+      return !stat.substring(stat.lastIndexOf(')') + 2).startsWith("Z");
+    } catch (java.io.IOException gone) {
+      return false;
+    }
+  }
+
+  private StepFinished run(RunStep request, AtomicLong seq) {
+    return new StepProcess(workDir, request, emitted::add, seq, 8192, 100, 5000, shell, true).run();
   }
 
   private List<StepChunk> chunks(Stream channel) {

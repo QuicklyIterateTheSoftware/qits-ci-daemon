@@ -1,13 +1,14 @@
 # qits-ci-daemon
 
-Everything qits-ci runs **inside** a step container. One binary, one step, one container lifetime.
+Everything qits-ci runs **inside** a CI lease. One binary, one run, one container lifetime.
 
-A ci run is a host-side sequence of steps, and each step is its own throwaway container started from
-the image that step's pipeline config declares. This binary is what runs in it: it clones the pushed
-commit, executes that one step's script as its own child process, streams the output back over the
-socket it dialled, reports the exit, and exits. Then the container is reaped and the next step gets a
-fresh one. Everything on the host's side of the boundary — launching containers, parsing the
-pipeline config, persisting runs and steps — belongs to
+A ci run is one lease on an execution target: one container, from the shared
+`qits/build-images/ci-slot` image, with this binary as its entrypoint (qits-1541, epic qits-1481).
+The daemon makes the run's worktree from a warm bare mirror the target keeps in `/cache/git`, then
+runs every step of the run in it, one after another, each as its own child process, streaming the
+output back over the socket it dialled and reporting each exit. When the host says `Close` it
+removes the worktree and exits, and qits-ci deletes the lease. Everything on the host's side of the
+boundary — leases, parsing the pipeline config, persisting runs and steps — belongs to
 [qits-ci-service](https://github.com/QuicklyIterateTheSoftware/qits-ci-service).
 
     ./mvnw verify     # a clone of this repo alone builds and tests green — no monorepo, no docker
@@ -21,7 +22,7 @@ pipeline config, persisting runs and steps — belongs to
 
 Inside `ci-daemon/`, `Main` is the only CDI bean: it resolves configuration and news up plain
 classes with plain constructors — `DaemonMain` (the flow), `ControlSocket` (the dial),
-`Workspace` (clone + checkout), `StepProcess` (the child), `Telemetry` (the export to
+`MirrorWorktree` (mirror + worktree), `StepProcess` (each step's child), `Telemetry` (the export to
 qits-observability, below). One reader per setting, which is what
 stops two components from resolving the same key differently, and a suite that can drive the whole
 flow against a real socket without a container.
@@ -41,7 +42,7 @@ to `…/artifacts/daemons/qits-ci-daemon/<version>`. It carries `CiDaemonBinary.
 build filters out of `${project.version}` — so the jar's version and the binary's version are one
 string by construction, and there is no second place for them to disagree.
 
-That exists to answer one question: **who decides which daemon binary a step container downloads.**
+That exists to answer one question: **who decides which daemon binary a CI lease downloads.**
 It used to be the platform underneath qits-ci — `QITS_CI_DAEMON_VERSION`, a configuration entry
 rewritten the instant a version was published, with an adoption probe layered on top that launched
 whatever had just landed and kept it if the container dialled. Both of those move a version into a
@@ -76,10 +77,10 @@ Two consequences worth stating, because they are the ones that bite:
 
 ## The boundary
 
-**qits-ci never executes anything.** It starts containers; that is all. A step's script reaches a
-container only as the reply on the socket that container's daemon dialled, and executes only as that
+**qits-ci never executes anything.** It asks for leases; that is all. A step's script reaches a
+container only as a frame on the socket that container's daemon dialled, and executes only as that
 daemon's child. This binary is the other half of that rule: it is the process that *does* run
-repo-controlled code, and it runs it inside the sandbox the host built — `--cap-drop=ALL`,
+repo-controlled code, and it runs it inside the sandbox the target built — `--cap-drop=ALL`,
 `no-new-privileges`, resource caps, no docker socket.
 
 The consequence runs the other way too. From the moment a step's script starts, everything this
@@ -95,9 +96,11 @@ its own; it is handed everything before the socket exists:
 |---|---|
 | `QITS_CI_DAEMON_URL` | The control socket, dialled **verbatim**. |
 | `QITS_CI_DAEMON_ID` | The host-minted registration identity — carried in the `Hello` that opens every conversation. |
-| `QITS_CI_REPOSITORY_URL`, `QITS_CI_BRANCH`, `QITS_CI_SHA` | What to clone and what to check out. |
-| `QITS_CI_REPO_ID`, `QITS_CI_PROJECT_ID`, `QITS_CI_REPO_NAME` | Which repository, in both coordinate systems: the storage id, and the public `(projectId, repoName)` pair a step's release call spells. The pair is empty — never absent — on an id-addressed run. For the step's script; the daemon reads them only as telemetry labels. |
-| `QITS_CI_RUN_ID`, `QITS_CI_STEP_INDEX`, `QITS_DOMAIN` | *Optional.* Telemetry labels only (below); the run id also seeds the trace id. Absent, the label is left out. |
+| `QITS_CI_REPOSITORY_URL`, `QITS_CI_BRANCH`, `QITS_CI_SHA` | What the mirror is cloned and fetched from, the run's branch (a label: a mirror carries every ref), and the commit the worktree is at. |
+| `QITS_CI_RUN_ID` | The run. Its worktree is `/work/<runId>`; also a telemetry label and the trace id's seed. Absent or blank, the daemon exits 2 naming it. |
+| `QITS_CI_PROJECT_ID`, `QITS_CI_REPO_NAME`, `QITS_CI_REPO_ID` | Which repository, in both coordinate systems: the public `(projectId, repoName)` pair names the mirror, `/cache/git/<projectId>/<repoName>.git`; on an id-addressed run the pair is empty — never absent — and the mirror is `/cache/git/_by-id/<repoId>.git`. Telemetry labels too. |
+| `QITS_CI_STEP_INDEX`, `QITS_DOMAIN` | *Optional.* Telemetry labels only (below). A lease runs every step, so the step index is normally absent; each step's index travels in its `RunStep`. |
+| `QITS_CI_GIT_CACHE_DIR`, `QITS_CI_WORK_DIR` | *Optional.* `/cache/git` and `/work` unless set — keys for the suite, constants in a lease. |
 | `QITS_CI_TELEMETRY_URL` | *Optional.* The OTLP endpoint (below). Unset derives it; set but empty switches the export off. |
 | `CI`, `QITS_CI` | Both `true`, set for the step script's benefit rather than the daemon's. |
 | `QITS_TOKEN` | The run's own `ci-run` token, presented as the handshake's bearer (below). Absent or blank, the daemon exits 2 naming it. |
@@ -127,35 +130,66 @@ build JDK's `cacerts`, which GraalVM embeds at build time, and `quarkus.ssl.nati
 carries the reasoning. The edge's certificate therefore has to chain to a public root.
 
 
-    dial → Hello → Ack → clone+checkout → Initialized → RunStep → StepChunk* → flush telemetry → StepFinished → exit
+Capability version 2 (qits-1541). One lease, one daemon, every step:
 
-`Heartbeat` runs underneath from dial to close. `Cancel` may arrive after `RunStep` and is answered
-with a `StepFinished` like any other ending. Failure to clone or check out replaces `Initialized`
+    dial → Hello{capabilityVersion: 2} → Ack → AckReceived
+         → mirror + worktree → Initialized
+         → ( RunStep{stepIndex, script, timeoutSeconds, env} → StepChunk* → StepFinished{stepIndex, exitCode, timedOut} )*
+         → Close → git worktree remove --force → flush telemetry → socket closed → exit 0
+
+`Heartbeat` runs underneath from dial to close. Failure to make the worktree replaces `Initialized`
 with `InitFailed`, whose `reason` is the structured signal that retired qits-ci's old
-prelude-sentinel inference.
+prelude-sentinel inference. Capability 1 — one container, one step, one shallow clone — is gone, not
+kept beside it: qits-ci pins this daemon by the protocol jar's version, so an old service keeps
+fetching an old binary and there is no dual mode.
 
-A socket that drops after connecting — every step's does when qits-edge is redeployed — is
-re-dialled with the same token within `qits.ci.reconnect-budget-ms`. The step keeps running; the
-daemon says `Hello` again on the new socket, and the host's `Ack` releases what the outage held: an
-`Initialized` that failed to send, the step's chunks (about 1 MiB, oldest dropped first, `seq`
-unchanged) and the terminal frame. A second `Ack` does not clone again and a resent `RunStep` is
-ignored.
+**The worktree.** Under an exclusive lock on `/cache/git/<projectId>/<repoName>.lock` (a `fcntl`
+lock taken by the daemon itself, `GitLock`): `git clone --mirror` on the target's first run of the
+repository and `git fetch --prune origin` on every later one, `git worktree prune`, then `git
+worktree add --detach /work/<runId> <sha>`. Submodules are `git submodule update --init --depth 50`,
+each with `--reference /cache/git/<projectId>/<submodule>.git` — a submodule's mirror that is missing
+is created first, under its own lock, and one that cannot be is simply not referenced. Credentials
+are the bootstrap's: it writes a git credential helper answering with `$QITS_TOKEN`, and every git
+call inherits it. A mirror clone or fetch the git host answers with a transient failure (a 5xx, a
+dropped connection) is retried after 2s and 5s (qits-1253). A sha the fresh mirror does not hold is
+`SHA_GONE`; anything else that fails is `CLONE_FAILED`.
+
+**The steps.** `RunStep`s run one at a time, in the order they arrive, on one lane that also runs the
+initialization and the teardown — so a step never shares the worktree with another and the worktree
+is never removed under one. Each runs with `/work/<runId>` as its cwd, under `setsid` (when the image
+has it) as the leader of a process group of its own, with the step's `env` laid over the lease's
+environment for that child only. `StepChunk.seq` is one counter for the whole lease. A `RunStep`
+whose `stepIndex` is not above the last one accepted is a replay and is ignored. `Cancel` kills the
+running step's whole process group — SIGTERM, `qits.ci.step-kill-grace-ms`, SIGKILL — and the step
+still finishes with a `StepFinished`; whatever a finished step left running in its group is killed
+with it, so the next step inherits nothing.
+
+**The ending.** `Close` kills a step still running (its `StepFinished` is still sent), removes the
+worktree with `git worktree remove --force` (under the mirror's lock again), flushes the telemetry,
+closes the socket and exits 0. There is no answer frame; qits-ci deletes the lease after the socket
+closes. Every other ending after initialization removes the worktree too.
+
+A socket that drops after connecting — every lease's does when qits-edge is redeployed — is
+re-dialled with the same token within `qits.ci.reconnect-budget-ms`. The steps keep running; the
+daemon says `Hello` again on the new socket, and the host's `Ack` releases what the outage held, in
+the order it was produced: an `Initialized` that failed to send, every step's chunks (about 1 MiB,
+oldest dropped first, `seq` unchanged) and every `StepFinished` (never dropped). A second `Ack` does
+not make the worktree again.
 
 **The workspace daemon never exits; this daemon always exits.** That is the one deliberate inversion
-of the precedent it otherwise mirrors. Any terminal condition — result delivered, `InitFailed` sent,
-an `Ack` carrying a capability version this binary does not know, or dial failure after a short
-capped retry — ends the process. Exit code 0 only on the clean paths, so `docker logs` of a reaped
-container reads honestly:
+of the precedent it otherwise mirrors. Any terminal condition — `Close`, `InitFailed` sent, an `Ack`
+carrying a capability version this binary does not know, or dial failure after a short capped retry
+— ends the process. Exit code 0 only on the clean path:
 
 | Exit | Ending |
 |---|---|
-| 0 | A step ran and its `StepFinished` reached the host. The only clean one. |
+| 0 | The host sent `Close` and the lease was torn down. The only clean one; the steps' own exit codes travel in their `StepFinished`s. |
 | 2 | The env contract was not satisfied; nothing was dialled. |
 | 3 | No connection within the dial budget (~30s total, not infinite). |
 | 4 | The `Ack` carried a capability version this binary does not know. |
-| 5 | `InitFailed` delivered — the daemon did its job, the container did not run its step. |
-| 6 | The socket dropped and the reconnect budget (~90s) ran out before the result was delivered; the host has reaped us. |
-| 7 | `Cancel` with no step running. |
+| 5 | `InitFailed` delivered — the daemon did its job, no step ran. |
+| 6 | The socket dropped and the reconnect budget (~90s) ran out before the host closed the lease. |
+| 7 | `Cancel` before any step was run. |
 
 The socket already carried whether the daemon behaved; the exit code is about whether the
 *container* did what it was started for, which is why 5 is not a zero.
@@ -192,47 +226,45 @@ as the run, so there is nothing to rotate.
   and nothing else, a full queue drops its oldest line and ships the count as a line, a body is cut
   at 16 KiB keeping its head, and a timer sends one batch at a time, dropping (not retrying) a batch
   that fails.
-- *The step's output*, one record per line — INFO for stdout, WARN for stderr, attribute
+- *The steps' output*, one record per line — INFO for stdout, WARN for stderr, attribute
   `qits.ci.stream=out|err` — split out of the chunks (which are not lines) with partial lines carried
-  over. Only the **latest** `qits.ci.telemetry-output-max-lines` (200) are kept, because the failure
-  is at the end, and `step output: N lines, M not exported` is shipped when the cap bit. This is
+  over. Only the **latest** `qits.ci.telemetry-output-max-lines` (200) across the lease's steps are
+  kept, because the failure is at the end, and `step output: N lines, M not exported` is shipped when the cap bit. This is
   load-bearing: every step on the estate shares one `qits-ci-daemon` bucket of a few thousand
   records, and one chatty build must not evict everyone else's. Output has a buffer of its own and is
   sent only at the flush, so it can never displace one of the daemon's own lines. qits-ci still gets
   all of it as chunks.
-- *Spans*: a root `ci-daemon step` from the daemon's start to the flush, and children `dial` (first
-  connect → `Ack`), `checkout` (clone + checkout) and `script` (spawn → exit, with
-  `qits.ci.exit_code`, `qits.ci.timed_out` and, when it was, `qits.ci.cancelled`). ERROR, with the
-  reason as the status message, on a non-zero exit, a timeout, `InitFailed`, a failed dial, a
-  capability mismatch and a lost socket. The trace id is the first 16 bytes of SHA-256 over
-  `QITS_CI_RUN_ID`, so every step of a run — each its own container — lands in one trace with no
-  protocol change. Log records carry the ids of the span they were written in. There is no `deliver`
-  span: the terminal frame is handed over *after* the flush, so such a span could never be exported.
+- *Spans*: a root `ci-daemon lease` from the daemon's start to the flush, and children `dial` (first
+  connect → `Ack`), `checkout` (mirror + worktree) and one `script` per step (spawn → exit, with
+  `qits.ci.step_index`, `qits.ci.exit_code`, `qits.ci.timed_out` and, when it was,
+  `qits.ci.cancelled`). ERROR, with the reason as the status message, on a non-zero exit, a timeout,
+  `InitFailed`, a failed dial, a capability mismatch and a lost socket; the root carries the first
+  failing step's. The trace id is the first 16 bytes of SHA-256 over `QITS_CI_RUN_ID`. Log records
+  carry the ids of the span they were written in.
 - *Resource*: `service.name=qits-ci-daemon`, `service.version` (the binary's version),
   `qits.ci.run_id`, `qits.ci.step_index`, `qits.ci.repo_id`, `qits.ci.repo_name`,
   `qits.ci.project_id`, `vcs.ref.head.name`, `vcs.ref.head.revision`, `qits.domain` — each left out
   when its variable is absent or blank.
 
-**No metrics.** One process runs one step, so a series would have one point; the `script` span
+**No metrics.** One process runs one run, so a series would have a handful of points; the `script` span
 already carries the duration and the exit code; and a series per run would churn
 qits-observability's 500-series bucket for nothing.
 
-**When: before the terminal frame, bounded.** qits-ci `docker rm -f`s the container the moment
-`StepFinished` arrives — a SIGKILL, with no grace — so anything sent after that frame races the
-kill, and the end of a step is exactly what it would lose. So every ending flushes **first**: the
-spans are ended, both buffers drained, the final requests sent and their responses awaited — and
-only then is `StepFinished` or `InitFailed` handed to the socket. The flush is bounded by
-`qits.ci.telemetry-flush-ms` (3000): an unreachable, silent or failing collector delays the terminal
-frame by at most that, and never changes the step's result or the exit code. It is a future composed
-in front of the send, bounded by a Vert.x timer, not a wait — the flush's own requests and the
-frame's write need the event loop, and nothing parks it. It runs once: a terminal frame held through
-a socket outage was flushed before it was held and is not flushed again on the replay. The endings
-with no terminal frame (exits 3, 4, 6, 7) flush the same way before they exit; nothing waits for
-those, so best effort is the contract. A misconfigured daemon (exit 2) exports nothing, because the
+**When: once, at the ending, bounded.** qits-ci deletes the lease — a SIGKILL, with no grace — once
+the socket closes after `Close`, and ends it the moment an `InitFailed` arrives, so anything sent
+after those races the kill. So every ending flushes **first**: the spans are ended, both buffers
+drained, the final requests sent and their responses awaited — and only then is the socket closed
+(after `Close`) or `InitFailed` handed to it. A `StepFinished` is not an ending any more and does
+not wait for a flush. The flush is bounded by `qits.ci.telemetry-flush-ms` (3000): an unreachable,
+silent or failing collector delays the exit by at most that, and never changes a step's result or
+the exit code. It is a future composed in front of the close, bounded by a Vert.x timer, not a wait
+— the flush's own requests and the socket need the event loop, and nothing parks it. It runs once.
+The endings with nothing left to say to the host (exits 3, 4, 6, 7) flush the same way before they
+exit; nothing waits for those, so best effort is the contract. A misconfigured daemon (exit 2) exports nothing, because the
 address may be the thing that is missing.
 
-The daemon's last line before `ci-daemon exiting N` says how it went — it is what a runner's
-`docker logs` tail of the reaped container shows:
+The daemon's last line before `ci-daemon exiting N` says how it went — it is what a `docker logs`
+tail of the lease's container shows:
 
     telemetry: submitted 37 logs, 4 spans (0 dropped)
     telemetry: NOT submitted (timeout after 3000 ms)
@@ -240,28 +272,33 @@ The daemon's last line before `ci-daemon exiting N` says how it went — it is w
 
 A JVM shutdown hook runs the same bounded flush if none has run, which covers a SIGTERM or SIGINT (a
 manual `docker stop`, a Ctrl-C). It is not the mechanism and cannot be: Quarkus closes Vert.x from
-its own hook concurrently, so it is best effort, and **`docker rm -f` is a SIGKILL that no hook
-sees** — anything the daemon has not flushed by the time the host reaps it is gone. That is why the
-flush sits in front of the terminal frame rather than behind the exit.
+its own hook concurrently, so it is best effort, and **a lease deleted is a SIGKILL that no hook
+sees** — anything the daemon has not flushed by then is gone. That is why the flush sits in front of
+the close rather than behind the exit.
 
 ## The image contract
 
-The daemon is **not** baked into an image. qits-ci runs arbitrary repo-chosen images — that is the
-feature — so the entrypoint is overridden with a fixed, host-authored bootstrap that downloads
-`$QITS_CI_DAEMON_BINARY_URL`, `chmod +x`, and `exec`s it. Nothing is mounted and nothing is injected
-into the image; the container fetches over the same network path it already uses for its clone.
+The daemon is **not** baked into an image. A CI lease runs `qits/build-images/ci-slot` with a fixed,
+host-authored bootstrap as its entrypoint, the same `BOOTSTRAP` shape as before: it downloads
+`$QITS_CI_DAEMON_BINARY_URL` with `$QITS_TOKEN`, writes the git credential helper, `chmod +x`, and
+`exec`s the binary. Nothing of the daemon is baked in, so the image and the daemon version move
+independently.
 
-What that asks of a step's image: **`git` and a downloader** (`wget` or `curl` — the bootstrap probes
-for either). What it asks of this repo: the binary must be a **fully static musl build**, because a
-glibc-linked one dies on every alpine-family image, and it must take no arguments — the environment
-above is its whole input.
+What that asks of the image: **`git` and a downloader** (`wget` or `curl` — the bootstrap probes for
+either), and, preferably, `bash`, `setsid` and `kill` (util-linux / procps). What it asks of this
+repo: the binary must be a **fully static musl build**, because a glibc-linked one dies on every
+alpine-family image, and it takes no arguments but `--version` — the environment above is its whole
+input.
 
-`git` is probed with `--version` before the clone, so an image that does not satisfy the contract
+`git` is probed with `--version` before the mirror, so an image that does not satisfy the contract
 reports `InitFailed{TOOLING_MISSING}` rather than failing halfway through a step.
 
-**`bash` is preferred but not required.** It is probed at the same moment — before the clone rather
+**`bash` is preferred but not required.** It is probed at the same moment — before the mirror rather
 than at step time, so a broken image is still reported as a broken image — and an image that has it
-runs the step's script under it exactly as before. An image without it runs the script under `sh`.
+runs every step's script under it. An image without it runs the scripts under `sh`. **`setsid` is
+probed too**: with it each step is the leader of its own process group, which is what lets `Cancel`,
+a timeout and a finished step's cleanup reach its background children; without it only the shell is
+signalled.
 
 That distinction is not a nicety, and it was bought. Demanding bash refused an entire class of image
 for no capability: `docker:28-dind` carries docker, git and wget but no bash, and it is the only
@@ -313,11 +350,17 @@ Checking a build:
 static executable. It is genuinely fully static; assert on `ldd`, or on `static-pie`, never on the
 literal string `statically linked`.
 
-Running the binary with no environment at all is the cheap check the test suite structurally cannot
-do: it must print the name of the first missing variable and exit 2, not die resolving config.
+Running the binary is the cheap check the test suite structurally cannot do, and the QA step does
+both halves of it directly — the binary is static, so no container is needed (and a CI lease has no
+docker to give one): `--version` must print `qits-ci-daemon <version>`, and a run with no
+environment at all must print the name of the first missing variable and exit 2, not die resolving
+config.
 
-    $ docker run --rm -v "$PWD/ci-daemon/target/qits-ci-daemon":/qits-ci-daemon:ro alpine:3 /qits-ci-daemon
+    $ ci-daemon/target/qits-ci-daemon --version
+    qits-ci-daemon 2026.1023.120000
+    $ env -i ci-daemon/target/qits-ci-daemon; echo $?
     ... ci-daemon cannot start: QITS_CI_DAEMON_URL is not set. Exiting.
+    2
 
 ## Other repositories build on this image
 

@@ -29,7 +29,7 @@ import java.util.function.LongSupplier;
 final class Spans {
 
   /** The root span's name. */
-  static final String ROOT = "ci-daemon step";
+  static final String ROOT = "ci-daemon lease";
 
   /** What an open child is ended with when the daemon flushes before it ended on its own. */
   static final String UNFINISHED = "the daemon ended before this did";

@@ -15,4 +15,5 @@ public sealed interface CiDaemonMessage
         Heartbeat,
         Ack,
         RunStep,
-        Cancel {}
+        Cancel,
+        Close {}

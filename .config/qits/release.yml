@@ -13,10 +13,11 @@ artifacts:
   - { type: maven, name: "eu.wohlben.qits:qits-ci-daemon-protocol", path: ci-daemon-protocol, sbom: ci-daemon-protocol/target/sbom.json }
 
 # THE QA HALF IS THIS REPOSITORY'S, AND THE ARCHETYPE'S HEADER SAYS SO. Two things live here that
-# a compile does not: the JVM suite, and a smoke probe that really STARTS A CONTAINER on the built
-# binary and asserts it refuses to run with no environment (exit 2). That probe needs a docker
-# socket, which is why this step keeps `docker: true` — the archetype's `build: true` gives a
-# builder and no socket.
+# a compile does not: the JVM suite, and a smoke probe that RUNS THE BUILT BINARY: `--version` must
+# name it, and a run with no environment at all must refuse with exit 2. The binary is fully static,
+# so it runs directly in the step — no container and no docker socket (qits-1541: a CI lease has
+# neither, and a docker step is a CONFIG_ERROR once qits-ci runs steps in a slot). The
+# archetype's `build: true` is all this step needs: a builder for the buildctl calls.
 release-request:
   - image: qits/build-images/maven-base:latest
     timeout-seconds: 1800
@@ -28,7 +29,7 @@ release-request:
       ./mvnw -B -ntp -s .qits-maven-settings.xml verify
 
   - image: qits/build-images/ci-base:latest
-    docker: true
+    build: true
     timeout-seconds: 3600
     script: |
       # THE ADDRESSES ARE CODE (qits-731): the registry is registry.qits.<domain>, the hosted maven
@@ -78,11 +79,17 @@ release-request:
         --output type=local,dest=out
       # THE EXPORT STAYS IN out/ AND MUST NOT BE "SIMPLIFIED" TO /tmp/qits-ci-daemon: that path is
       # the RUNNING daemon of this very step's container, and writing it is ETXTBSY.
-      probe=$(docker create alpine:3 /qits-ci-daemon)
-      docker cp out/qits-ci-daemon "$probe:/qits-ci-daemon"
-      docker start -a "$probe" || true
-      code=$(docker inspect -f '{{.State.ExitCode}}' "$probe")
-      docker rm "$probe" >/dev/null
+      # The export loses the mode bit, as in the release step.
+      chmod +x out/qits-ci-daemon
+      version=$(out/qits-ci-daemon --version)
+      case "$version" in
+        "qits-ci-daemon "?*) echo "smoke: $version" ;;
+        *) echo "--version printed '$version', expected 'qits-ci-daemon <version>'" >&2; exit 1 ;;
+      esac
+      # `env -i`: none of this step's own QITS_* may leak in. The binary must name the first missing
+      # variable and exit 2, not die resolving config (see AGENTS.md on empty defaultValues).
+      code=0
+      env -i out/qits-ci-daemon || code=$?
       [ "$code" = 2 ] || { echo "a daemon run with no environment exited $code, expected 2" >&2; exit 1; }
       echo "qits-ci-daemon built: $(sha256sum out/qits-ci-daemon | cut -d' ' -f1)"
 

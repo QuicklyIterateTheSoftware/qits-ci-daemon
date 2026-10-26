@@ -300,8 +300,9 @@ host-authored bootstrap as its entrypoint, the same `BOOTSTRAP` shape as before:
 independently.
 
 What that asks of the image: **`git` and a downloader** (`wget` or `curl` — the bootstrap probes for
-either), and, preferably, `bash`, `setsid` and `kill` (util-linux / procps). What it asks of this
-repo: the binary must be a **fully static musl build**, because a glibc-linked one dies on every
+either), and, preferably, `bash` and `setsid` (util-linux). No `kill` binary: a step's process group
+is signalled through the step shell's builtin `kill`, because Debian's binary is procps' and the
+ci-slot image has no procps (qits-1541). What it asks of this repo: the binary must be a **fully static musl build**, because a glibc-linked one dies on every
 alpine-family image, and it takes no arguments but `--version` — the environment above is its whole
 input.
 

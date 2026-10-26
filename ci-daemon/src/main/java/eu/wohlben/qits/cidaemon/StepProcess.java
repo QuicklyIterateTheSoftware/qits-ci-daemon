@@ -238,9 +238,20 @@ public final class StepProcess implements Step {
 
   /**
    * {@code kill -s <signal> -- -<pgid>}, best effort: the JDK can signal a process but not a group,
-   * and {@code kill} is the one portable way to say "the group". The pgid is a number this process
-   * read from the JDK, so nothing untrusted reaches the argv. A group already gone answers nonzero,
-   * which is the common case after a clean exit and means nothing.
+   * and {@code kill} is the one portable way to say "the group" — one {@code kill(2)} on {@code
+   * -pgid}, atomic against a group that is still forking, which walking {@code /proc} is not.
+   *
+   * <p><b>The step's shell's builtin {@code kill}, never a {@code kill} binary on PATH.</b> The
+   * binary is not part of the image contract: on Alpine busybox supplies it, but on Debian it is
+   * procps', and the ci-slot image (bookworm-slim) has no procps. Exec'ing {@code kill} there failed
+   * with an IOException this method swallowed, so no group was ever signalled: a step's background
+   * child outlived the step and held its pipes open until the pumps' bound (qits-1541). The shell is
+   * already the image's contract — the step itself runs under it — and every shell the probe can
+   * choose (bash, dash, busybox ash) has the builtin. The signal and the pgid are positional
+   * parameters, not text spliced into the script, and both are values this class produced.
+   *
+   * <p>A group already gone answers nonzero, which is the common case after a clean exit and means
+   * nothing.
    */
   private void signalGroup(Process leader, String signal) {
     if (!processGroup) {
@@ -248,13 +259,20 @@ public final class StepProcess implements Step {
     }
     try {
       Process kill =
-          new ProcessBuilder("kill", "-s", signal, "--", "-" + leader.pid())
+          new ProcessBuilder(
+                  shell,
+                  "-c",
+                  "kill -s \"$1\" -- \"-$2\"",
+                  "kill",
+                  signal,
+                  String.valueOf(leader.pid()))
               .redirectErrorStream(true)
               .redirectOutput(ProcessBuilder.Redirect.DISCARD)
               .start();
       kill.waitFor(5, TimeUnit.SECONDS);
     } catch (IOException e) {
-      // No `kill` binary: the direct signal to the shell in terminate() is what is left.
+      // No shell to run the builtin in: the direct signal to the shell in terminate() is what is
+      // left.
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
     }

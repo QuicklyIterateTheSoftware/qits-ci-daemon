@@ -126,6 +126,13 @@ public class Main {
     @ConfigProperty(name = "qits.ci.clone-retry-delays", defaultValue = "2S,5S")
     String cloneRetryDelays;
 
+    // qits-1541: a run's worktree on the shared mirror is locked for its whole life, so a container
+    // that dies without a Close leaves a locked entry behind. One older than this is taken away by
+    // the next run on the mirror. It has to outlast the longest lease — every step's timeout added
+    // up — by a wide margin, because a live entry taken away breaks that run outright.
+    @ConfigProperty(name = "qits.ci.worktree-stale-after-seconds", defaultValue = "86400")
+    long worktreeStaleAfterSeconds;
+
     @ConfigProperty(name = "qits.ci.step-kill-grace-ms", defaultValue = "5000")
     long stepKillGraceMillis;
 
@@ -195,7 +202,8 @@ public class Main {
               env.runId(),
               env.sha(),
               CommandRunner.forking(gitTimeoutSeconds),
-              parseCloneRetryDelays(cloneRetryDelays));
+              parseCloneRetryDelays(cloneRetryDelays),
+              Duration.ofSeconds(worktreeStaleAfterSeconds));
       // One counter for every step of the lease; see StepProcess on seq.
       AtomicLong seq = new AtomicLong();
       return new DaemonMain(

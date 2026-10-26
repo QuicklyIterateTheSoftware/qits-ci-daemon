@@ -113,7 +113,8 @@ class MultiStepRunTest {
             "run-7",
             sha,
             CommandRunner.forking(60),
-            List.of(Duration.ZERO));
+            List.of(Duration.ZERO),
+            MirrorWorktree.DEFAULT_STALE_AFTER);
     AtomicLong seq = new AtomicLong();
     DaemonEnv env =
         new DaemonEnv(

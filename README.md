@@ -135,7 +135,7 @@ Capability version 2 (qits-1541). One lease, one daemon, every step:
     dial → Hello{capabilityVersion: 2} → Ack → AckReceived
          → mirror + worktree → Initialized
          → ( RunStep{stepIndex, script, timeoutSeconds, env} → StepChunk* → StepFinished{stepIndex, exitCode, timedOut} )*
-         → Close → git worktree remove --force → flush telemetry → socket closed → exit 0
+         → Close → git worktree unlock + remove --force → flush telemetry → socket closed → exit 0
 
 `Heartbeat` runs underneath from dial to close. Failure to make the worktree replaces `Initialized`
 with `InitFailed`, whose `reason` is the structured signal that retired qits-ci's old
@@ -145,14 +145,28 @@ fetching an old binary and there is no dual mode.
 
 **The worktree.** Under an exclusive lock on `/cache/git/<projectId>/<repoName>.lock` (a `fcntl`
 lock taken by the daemon itself, `GitLock`): `git clone --mirror` on the target's first run of the
-repository and `git fetch --prune origin` on every later one, `git worktree prune`, then `git
-worktree add --detach /work/<runId> <sha>`. Submodules are `git submodule update --init --depth 50`,
-each with `--reference /cache/git/<projectId>/<submodule>.git` — a submodule's mirror that is missing
-is created first, under its own lock, and one that cannot be is simply not referenced. Credentials
+repository and `git fetch --prune origin` on every later one, then `git worktree add --lock --reason
+"qits-ci run <runId> <ISO instant>" --detach /work/<runId> <sha>`. Submodules are `git submodule
+update --init --depth 50`, each with `--reference /cache/git/<projectId>/<submodule>.git` — a
+submodule's mirror that is missing is created first, under its own lock, and one that cannot be is
+simply not referenced — and each from the repository of the same name beside `QITS_CI_REPOSITORY_URL`,
+never from the GitHub url the estate's `.gitmodules` commit. Credentials
 are the bootstrap's: it writes a git credential helper answering with `$QITS_TOKEN`, and every git
 call inherits it. A mirror clone or fetch the git host answers with a transient failure (a 5xx, a
 dropped connection) is retried after 2s and 5s (qits-1253). A sha the fresh mirror does not hold is
 `SHA_GONE`; anything else that fails is `CLONE_FAILED`.
+
+**Why the worktree is locked (qits-1541).** Every ci-slot container on a target has its own `/work`
+and shares `/cache/git`, so from inside one container every other run's worktree directory is
+missing, and a missing directory is exactly what `git worktree prune` deletes an entry for. A bare
+prune before the add took every other live run's `worktrees/<id>` — submodule gitdirs included,
+since they live under its `modules/` — and six runs started together on one target all failed at
+the submodule clone. The lock is taken by the add itself, prune skips a locked entry, and nothing
+here ever runs a bare prune again: Close unlocks and removes this run's entry alone. A container
+killed before its Close leaves a locked entry behind, so the next run on the mirror unlocks and
+removes any whose qits-ci lock reason is older than `qits.ci.worktree-stale-after-seconds` (a day:
+far past the longest lease, because taking a live entry breaks that run) and runs `git worktree
+prune --expire` with the same bound for the unlocked entries an older daemon left.
 
 **The steps.** `RunStep`s run one at a time, in the order they arrive, on one lane that also runs the
 initialization and the teardown — so a step never shares the worktree with another and the worktree
@@ -165,7 +179,8 @@ still finishes with a `StepFinished`; whatever a finished step left running in i
 with it, so the next step inherits nothing.
 
 **The ending.** `Close` kills a step still running (its `StepFinished` is still sent), removes the
-worktree with `git worktree remove --force` (under the mirror's lock again), flushes the telemetry,
+worktree — `git worktree unlock`, `git worktree remove --force`, and a delete of the directory and of
+this run's own `worktrees/<id>` for what git refuses (under the mirror's lock again) — flushes the telemetry,
 closes the socket and exits 0. There is no answer frame; qits-ci deletes the lease after the socket
 closes. Every other ending after initialization removes the worktree too.
 

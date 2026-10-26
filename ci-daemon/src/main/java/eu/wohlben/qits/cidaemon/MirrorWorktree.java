@@ -6,6 +6,8 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.regex.Matcher;
@@ -19,15 +21,45 @@ import org.jboss.logging.Logger;
  * <pre>
  *   under flock &lt;cache&gt;/&lt;projectId&gt;/&lt;repoName&gt;.lock:
  *     git clone --mirror (first use) | git fetch --prune origin (every later one)
- *     git worktree prune
- *     git worktree add --detach &lt;work&gt;/&lt;runId&gt; &lt;sha&gt;
- *     git submodule init + sync           (they write the mirror's shared config)
+ *     expire locked qits-ci entries older than the bound; git worktree prune --expire &lt;bound&gt;
+ *     git worktree add --lock --reason "qits-ci run &lt;runId&gt; &lt;ISO instant&gt;" --detach
+ *         &lt;work&gt;/&lt;runId&gt; &lt;sha&gt;
+ *     git submodule init + sync, each url set to the sibling beside the run's origin
+ *                                         (they write the mirror's shared config)
  *   then, per submodule:
  *     its own mirror, cloned under its own lock if missing
- *     git submodule update --init --depth 50 [--reference &lt;its mirror&gt;] -- &lt;path&gt;
- *   on Close:
- *     git worktree remove --force &lt;work&gt;/&lt;runId&gt;     (under the lock again)
+ *     git -c submodule.&lt;name&gt;.url=&lt;sibling&gt; submodule update --init --depth 50
+ *         [--reference &lt;its mirror&gt;] -- &lt;path&gt;
+ *   on Close (under the lock again), this run's entry and nothing else:
+ *     git worktree unlock; git worktree remove --force   | rm the dir and worktrees/&lt;id&gt;
  * </pre>
+ *
+ * <p><b>Why every worktree is locked (qits-1541).</b> Every ci-slot container on a target has a
+ * {@code /work} of its own and shares {@code /cache/git}, so from inside one container another
+ * run's worktree directory does not exist — and to {@code git worktree prune} a worktree whose
+ * directory is missing is a dead one. An unconditional prune before the add therefore deleted every
+ * other live run's {@code worktrees/<id>}, and with it the submodule gitdirs under its {@code
+ * modules/}: six runs started together on one target all died at the submodule clone. The flock
+ * never helped, because it serialises the commands, not the judgement. A locked worktree is one
+ * prune never touches, so the lock is taken by the {@code add} itself — there is no add-then-lock
+ * window for another container's prune to land in — and given up only by this run's own Close.
+ *
+ * <p><b>Why an expiry, and why prune stays.</b> A container killed before its Close leaves a locked
+ * entry nothing will ever unlock. The lock's reason carries the moment it was taken, so the next
+ * run on the mirror takes away a qits-ci entry older than {@code staleAfter} — a bound set far past
+ * the longest lease, because removing a live entry breaks that run outright, while leaking a dead
+ * one costs a few kilobytes for a day. A lock without a qits-ci reason has no age to judge and is
+ * never touched. {@code git worktree prune --expire <bound>} stays beside it for the unlocked
+ * entries a daemon from before this change leaves behind: they are live for a while too, and the
+ * same bound keeps prune from judging one before it could possibly be dead.
+ *
+ * <p><b>Submodule urls.</b> The estate's {@code .gitmodules} name the public GitHub address, and a
+ * lease must fetch from the platform's git host it was handed, as the java-service release step's
+ * own {@code git -c submodule.$name.url=$origin_parent/$name submodule update} did before this
+ * class recursed. So each submodule's url is the repository of the same last path segment beside
+ * {@link #repositoryUrl}, written into the shared config under the lock (what a step's own {@code
+ * git submodule} later reads) and passed again with {@code -c} on the update, which runs outside
+ * the lock where another run's {@code sync} could rewrite the shared value in between.
  *
  * <p><b>Why a mirror.</b> A CI lease runs every step of a run in one container on a target that
  * keeps {@code /cache/git} between leases, so the second run of a repository pays a fetch of the
@@ -40,8 +72,11 @@ import org.jboss.logging.Logger;
  * target share the mirror. A fetch running while another run's {@code worktree prune} or {@code
  * worktree add} rewrites {@code worktrees/} is the race; one lock around all of it is what makes the
  * mirror single-writer. The submodule clones run outside it — they are the slow part, and they write
- * only into this worktree's own {@code modules/} — and a submodule's own mirror is created under its
- * own lock, never while the parent's is held, so the two locks are never taken in opposite orders.
+ * only into this worktree's own {@code worktrees/<id>/modules/}, which the worktree's lock protects
+ * like the rest of the entry; what they share is a read of the submodule's mirror through {@code
+ * objects/info/alternates}, which nothing here ever deletes — and a submodule's own mirror is
+ * created under its own lock, never while the parent's is held, so the two locks are never taken in
+ * opposite orders.
  *
  * <p><b>Credentials</b> are the bootstrap's, exactly as for the old clone: the bootstrap writes a git
  * credential helper that answers with {@code $QITS_TOKEN}, and every git invocation here inherits
@@ -96,6 +131,18 @@ public final class MirrorWorktree implements DaemonMain.Worktree {
    */
   private static final Pattern SEGMENT = Pattern.compile("[A-Za-z0-9_][A-Za-z0-9._-]{0,127}");
 
+  /**
+   * How old a qits-ci lock may grow before the next run on the mirror judges its run dead: a day,
+   * against a lease that is a handful of steps of at most an hour each.
+   */
+  static final Duration DEFAULT_STALE_AFTER = Duration.ofHours(24);
+
+  /** The lock reason's prefix; what marks an entry as this daemon's to expire. */
+  static final String LOCK_REASON_PREFIX = "qits-ci run ";
+
+  private static final Pattern LOCK_REASON =
+      Pattern.compile("qits-ci run (\\S+) (\\S+)\\s*");
+
   /** The project directory of an id-addressed run, whose (projectId, repoName) pair is empty. */
   static final String ID_ADDRESSED = "_by-id";
 
@@ -109,12 +156,16 @@ public final class MirrorWorktree implements DaemonMain.Worktree {
   private final String sha;
   private final CommandRunner runner;
   private final List<Duration> retryDelays;
+  private final Duration staleAfter;
 
   private volatile String shell = "sh";
   private volatile boolean processGroups;
 
   /** Set once {@code worktree add} succeeded: what {@link #remove()} has to undo. */
   private volatile Path worktree;
+
+  /** The run's own {@code <mirror>/worktrees/<id>}, read back from the worktree's {@code .git}. */
+  private volatile Path adminDir;
 
   private volatile Path mirror;
 
@@ -123,6 +174,8 @@ public final class MirrorWorktree implements DaemonMain.Worktree {
    * @param workRoot {@code /work} in a lease; the run's worktree is {@code <workRoot>/<runId>}
    * @param projectId with {@code repoName}, names the mirror; both blank on an id-addressed run,
    *     which falls back to {@code <cacheRoot>/_by-id/<repoId>.git}
+   * @param staleAfter how old another run's locked entry on the mirror must be before this run
+   *     takes it away as the leftover of a container that died without a Close
    */
   public MirrorWorktree(
       Path cacheRoot,
@@ -134,7 +187,8 @@ public final class MirrorWorktree implements DaemonMain.Worktree {
       String runId,
       String sha,
       CommandRunner runner,
-      List<Duration> retryDelays) {
+      List<Duration> retryDelays,
+      Duration staleAfter) {
     this.cacheRoot = cacheRoot;
     this.workRoot = workRoot;
     this.repositoryUrl = repositoryUrl;
@@ -145,6 +199,7 @@ public final class MirrorWorktree implements DaemonMain.Worktree {
     this.sha = sha;
     this.runner = runner;
     this.retryDelays = List.copyOf(retryDelays);
+    this.staleAfter = staleAfter;
   }
 
   /**
@@ -195,13 +250,17 @@ public final class MirrorWorktree implements DaemonMain.Worktree {
       if (!synced.ok()) {
         return new Preparation(InitFailed.Reason.CLONE_FAILED, tail(synced.output()));
       }
-      git(mirrorDir, "worktree", "prune");
-      if (Files.exists(target)) {
-        // A daemon restarted in the same container, or a run id reused: what is there is not ours
-        // to keep, and `worktree add` refuses a non-empty directory.
-        git(mirrorDir, "worktree", "remove", "--force", target.toString());
-        deleteRecursively(target);
-        git(mirrorDir, "worktree", "prune");
+      Instant now = Instant.now();
+      expireStaleEntries(mirrorDir, now);
+      // Never a bare prune: see the class comment. Locked entries are skipped by prune whatever the
+      // expiry; the expiry is for the unlocked ones a daemon from before qits-1541 leaves.
+      git(mirrorDir, "worktree", "prune", "--expire", staleAfter.toSeconds() + ".seconds.ago");
+      Path ownAdmin = mirrorDir.resolve("worktrees").resolve(runId);
+      if (Files.exists(target) || Files.exists(ownAdmin)) {
+        // A daemon restarted in the same container, or this run id's entry from an earlier attempt:
+        // what is there is not ours to keep, and `worktree add` refuses a non-empty directory. The
+        // run id is unique to this run, so the entry it names is this run's and nobody else's.
+        removeOwnEntry(mirrorDir, target, adminDirOf(mirrorDir, target));
       }
       CommandRunner.Result present = git(mirrorDir, "cat-file", "-e", sha + "^{commit}");
       if (!present.ok()) {
@@ -210,12 +269,32 @@ public final class MirrorWorktree implements DaemonMain.Worktree {
             tail("the mirror, fetched just now, has no commit " + sha + ". " + present.output()));
       }
       Files.createDirectories(workRoot);
+      String reason = LOCK_REASON_PREFIX + runId + " " + now;
       CommandRunner.Result added =
-          git(mirrorDir, "worktree", "add", "--detach", target.toString(), sha);
+          git(
+              mirrorDir,
+              "worktree",
+              "add",
+              "--lock",
+              "--reason",
+              reason,
+              "--detach",
+              target.toString(),
+              sha);
+      boolean reasonRecorded = added.ok();
+      if (!added.ok() && rejectsReason(added.output())) {
+        // git before 2.31 knows `add --lock` but not `--reason`. The lock is still taken by the add
+        // itself; the reason, which is what lets a later run judge its age, is written after.
+        added = git(mirrorDir, "worktree", "add", "--lock", "--detach", target.toString(), sha);
+      }
       if (!added.ok()) {
         return new Preparation(InitFailed.Reason.CLONE_FAILED, tail(added.output()));
       }
       worktree = target;
+      adminDir = adminDirOf(mirrorDir, target);
+      if (!reasonRecorded) {
+        Files.writeString(adminDir.resolve("locked"), reason + "\n");
+      }
       submodules = new ArrayList<>();
       if (Files.exists(target.resolve(".gitmodules"))) {
         // init resolves each relative url against the mirror's origin and writes it, with `active`,
@@ -226,7 +305,24 @@ public final class MirrorWorktree implements DaemonMain.Worktree {
         if (!sync.ok()) {
           return new Preparation(InitFailed.Reason.CLONE_FAILED, tail(sync.output()));
         }
-        submodules = submodules(target);
+        submodules = new ArrayList<>();
+        for (Submodule found : submodules(target)) {
+          String sibling =
+              configKeyName(found.name()) ? siblingUrl(repositoryUrl, found.url()) : null;
+          if (sibling == null) {
+            LOG.warnf(
+                "ci-daemon: submodule %s has no sibling beside the run's origin; using %s",
+                found.path(), found.url());
+            submodules.add(found);
+            continue;
+          }
+          CommandRunner.Result set =
+              git(target, "config", "submodule." + found.name() + ".url", sibling);
+          if (!set.ok()) {
+            return new Preparation(InitFailed.Reason.CLONE_FAILED, tail(set.output()));
+          }
+          submodules.add(new Submodule(found.name(), found.path(), sibling));
+        }
       }
     } catch (IOException e) {
       return new Preparation(
@@ -235,7 +331,12 @@ public final class MirrorWorktree implements DaemonMain.Worktree {
 
     for (Submodule submodule : submodules) {
       Path reference = referenceMirror(projectDir, submodule);
-      List<String> argv = new ArrayList<>(List.of("submodule", "update", "--init", "--depth"));
+      List<String> argv = new ArrayList<>();
+      if (submodule.url() != null && configKeyName(submodule.name())) {
+        argv.add("-c");
+        argv.add("submodule." + submodule.name() + ".url=" + submodule.url());
+      }
+      argv.addAll(List.of("submodule", "update", "--init", "--depth"));
       argv.add(String.valueOf(SUBMODULE_DEPTH));
       if (reference != null) {
         argv.add("--reference");
@@ -252,9 +353,11 @@ public final class MirrorWorktree implements DaemonMain.Worktree {
   }
 
   /**
-   * {@code git worktree remove --force}, under the mirror's lock, and a plain delete behind it for
-   * whatever git did not take. Idempotent, never throws: it runs on every ending, and an ending is
-   * no place to fail.
+   * This run's entry and nothing else, under the mirror's lock: unlock, {@code git worktree remove
+   * --force}, and a plain delete of the directory and of {@code worktrees/<id>} behind it for
+   * whatever git did not take — git refuses to remove a worktree holding submodules. Never a {@code
+   * prune}: from this container every other run's worktree looks dead. Idempotent, never throws: it
+   * runs on every ending, and an ending is no place to fail.
    */
   @Override
   public void remove() {
@@ -265,17 +368,139 @@ public final class MirrorWorktree implements DaemonMain.Worktree {
     }
     worktree = null;
     try (GitLock lock = GitLock.acquire(mirrorDir.resolveSibling(lockName(mirrorDir)))) {
-      CommandRunner.Result removed = git(mirrorDir, "worktree", "remove", "--force", target.toString());
-      if (!removed.ok() || Files.exists(target)) {
-        LOG.warnf(
-            "ci-daemon: git worktree remove left %s behind (%s); deleting it",
-            target, tail(removed.output()));
-        deleteRecursively(target);
-        git(mirrorDir, "worktree", "prune");
-      }
+      removeOwnEntry(mirrorDir, target, adminDir);
     } catch (IOException e) {
       LOG.warnf("ci-daemon could not remove the worktree %s: %s", target, e.getMessage());
     }
+  }
+
+  /** Called under the mirror's lock. {@code admin} is this run's own {@code worktrees/<id>}. */
+  private void removeOwnEntry(Path mirrorDir, Path target, Path admin) throws IOException {
+    git(mirrorDir, "worktree", "unlock", target.toString());
+    CommandRunner.Result removed =
+        git(mirrorDir, "worktree", "remove", "--force", target.toString());
+    if (!removed.ok() || Files.exists(target) || Files.exists(admin)) {
+      LOG.infof(
+          "ci-daemon: git worktree remove left %s behind (%s); deleting it and %s",
+          target, tail(removed.output()), admin);
+      deleteRecursively(target);
+      deleteRecursively(admin);
+    }
+  }
+
+  /**
+   * The worktree's own administrative directory, as its {@code .git} file names it — git suffixes
+   * the name when it collides — and {@code worktrees/<runId>} when that file is gone or names
+   * anything outside this mirror's {@code worktrees/}, which is never this run's to delete.
+   */
+  private Path adminDirOf(Path mirrorDir, Path target) {
+    Path worktrees = mirrorDir.resolve("worktrees");
+    Path fallback = worktrees.resolve(runId);
+    try {
+      String dotGit = Files.readString(target.resolve(".git")).strip();
+      if (dotGit.startsWith("gitdir:")) {
+        Path named = Path.of(dotGit.substring("gitdir:".length()).strip()).normalize();
+        if (named.getParent() != null
+            && named.getParent().equals(worktrees.toAbsolutePath().normalize())) {
+          return named;
+        }
+      }
+    } catch (IOException | RuntimeException e) {
+      // no readable .git: the fallback is the name git gives an uncontested add
+    }
+    return fallback;
+  }
+
+  /**
+   * Under the mirror's lock: every entry locked by a qits-ci run whose lock is older than {@link
+   * #staleAfter} is the leftover of a container that died before its Close; it is unlocked and its
+   * metadata removed. An entry without a qits-ci reason, or younger than the bound, is left alone.
+   * Its worktree directory is in that dead container's {@code /work}, out of reach and gone with
+   * it.
+   */
+  private void expireStaleEntries(Path mirrorDir, Instant now) {
+    Path worktrees = mirrorDir.resolve("worktrees");
+    if (!Files.isDirectory(worktrees)) {
+      return;
+    }
+    Instant bound = now.minus(staleAfter);
+    try (Stream<Path> entries = Files.list(worktrees)) {
+      for (Path entry : entries.toList()) {
+        Path locked = entry.resolve("locked");
+        if (!Files.isRegularFile(locked, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+          continue;
+        }
+        String reason = Files.readString(locked);
+        Instant at = lockedAt(reason);
+        if (at == null || at.isAfter(bound)) {
+          continue;
+        }
+        LOG.warnf(
+            "ci-daemon: expiring %s, locked at %s by a run that never closed (%s)",
+            entry.getFileName(), at, reason.strip());
+        Files.deleteIfExists(locked);
+        deleteRecursively(entry);
+      }
+    } catch (IOException e) {
+      // Leaking a dead entry for one more run costs kilobytes; failing this run for it costs a run.
+      LOG.warnf("ci-daemon could not expire stale worktrees of %s: %s", mirrorDir, e.getMessage());
+    }
+  }
+
+  /** The instant a qits-ci lock reason records, or null when it is not one of ours. */
+  static Instant lockedAt(String reason) {
+    if (reason == null) {
+      return null;
+    }
+    Matcher matcher = LOCK_REASON.matcher(reason.strip());
+    if (!matcher.matches()) {
+      return null;
+    }
+    try {
+      return Instant.parse(matcher.group(2));
+    } catch (DateTimeParseException e) {
+      return null;
+    }
+  }
+
+  private static boolean rejectsReason(String output) {
+    return output != null && output.contains("unknown option") && output.contains("reason");
+  }
+
+  /**
+   * The repository beside {@code repositoryUrl} with {@code submoduleUrl}'s last path segment — the
+   * same {@code ${QITS_CI_REPOSITORY_URL%/*}/<name>} the release step used — or null when either
+   * has no such segment. The segment is kept as written, {@code .git} and all.
+   */
+  static String siblingUrl(String repositoryUrl, String submoduleUrl) {
+    if (repositoryUrl == null || repositoryName(submoduleUrl) == null) {
+      return null;
+    }
+    String origin = stripTrailingSlashes(repositoryUrl.strip());
+    int slash = origin.lastIndexOf('/');
+    if (slash <= 0) {
+      return null;
+    }
+    String sub = stripTrailingSlashes(submoduleUrl.strip());
+    String last = sub.substring(Math.max(sub.lastIndexOf('/'), sub.lastIndexOf(':')) + 1);
+    return origin.substring(0, slash) + "/" + last;
+  }
+
+  private static String stripTrailingSlashes(String value) {
+    String trimmed = value;
+    while (trimmed.endsWith("/")) {
+      trimmed = trimmed.substring(0, trimmed.length() - 1);
+    }
+    return trimmed;
+  }
+
+  /**
+   * Whether a submodule name from the untrusted {@code .gitmodules} can sit in a {@code -c
+   * key=value} argument: an {@code =} would end the key early, a control character would not
+   * survive the round trip.
+   */
+  private static boolean configKeyName(String name) {
+    return name != null && !name.isEmpty() && name.chars().noneMatch(c -> c == '=' || c < 0x20);
   }
 
   private static String lockName(Path mirrorDir) {

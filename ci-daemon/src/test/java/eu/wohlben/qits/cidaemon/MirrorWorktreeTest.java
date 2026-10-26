@@ -9,10 +9,12 @@ import eu.wohlben.qits.cidaemon.protocol.InitFailed;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -179,6 +181,168 @@ class MirrorWorktreeTest {
     assertTrue(Files.exists(mirror.resolve("HEAD")), "the mirror is the cache; it stays");
   }
 
+  /**
+   * qits-1541's live defect: every ci-slot container has a {@code /work} of its own and shares the
+   * target's {@code /cache/git}, so from inside one container another's worktree directory does
+   * not exist. The test reproduces that by moving the other "container"'s work root out of the way
+   * while this one runs — exactly what that run's {@code /work} looks like from here.
+   */
+  @Test
+  void oneContainersPrepareNeverPrunesAnotherContainersLiveWorktreeOrItsSubmodule()
+      throws Exception {
+    Path sub = remote("sub", "sub content\n");
+    Path remote = remoteWithSubmodule("repo", sub, "libs/sub");
+    String sha = Git.sha(remote, "HEAD");
+    Path mirror = tmp.resolve("cache/p1/repo.git");
+    MirrorWorktree b = worktree(remote, tmp.resolve("container-b/work"), "rB", sha, runner());
+    assertTrue(b.prepare().ready());
+    Path bCheckout = tmp.resolve("container-b/work/rB");
+    Path bAdmin = mirror.resolve("worktrees/rB");
+    assertTrue(Files.isDirectory(bAdmin.resolve("modules")), "B's submodule gitdir is under it");
+
+    MirrorWorktree.Preparation a =
+        whileHidden(
+            tmp.resolve("container-b"),
+            () -> worktree(remote, tmp.resolve("container-a/work"), "rA", sha, runner()).prepare());
+
+    assertTrue(a.ready(), a::toString);
+    assertTrue(Files.isDirectory(bAdmin), "A pruned B's live worktree");
+    assertTrue(Files.isDirectory(bAdmin.resolve("modules")), "A pruned B's submodule gitdir");
+    // And B carries on: its worktree and its submodule are still repositories.
+    Git.run(bCheckout, "status", "--porcelain");
+    Git.run(bCheckout.resolve("libs/sub"), "status", "--porcelain");
+    assertEquals(sha, Git.sha(bCheckout, "HEAD"));
+    Files.writeString(bCheckout.resolve("libs/sub/new.txt"), "x\n");
+    Git.run(bCheckout.resolve("libs/sub"), "add", "new.txt");
+  }
+
+  @Test
+  void aRunsWorktreeIsLockedFromTheAddOnWithItsRunIdAndATimestamp() throws Exception {
+    Path remote = remote("repo", "first\n");
+    Instant before = Instant.now().minusSeconds(1);
+    assertTrue(worktree(remote, "r1", Git.sha(remote, "HEAD")).prepare().ready());
+
+    String reason = Files.readString(tmp.resolve("cache/p1/repo.git/worktrees/r1/locked")).strip();
+    assertTrue(reason.startsWith("qits-ci run r1 "), reason);
+    Instant at = MirrorWorktree.lockedAt(reason);
+    assertTrue(at != null && !at.isBefore(before), reason);
+    // Locked in the same command that added it: there is no add-then-lock window.
+    assertEquals(1, count("worktree", "add", "--lock", "--reason"));
+    assertEquals(0, count("worktree", "lock"));
+  }
+
+  @Test
+  void aGitWithoutAddReasonStillLocksAtTheAddAndRecordsTheReasonItself() throws Exception {
+    Path remote = remote("repo", "first\n");
+    CommandRunner oldGit =
+        (dir, argv) ->
+            List.of(argv).contains("--reason")
+                ? new CommandRunner.Result(
+                    129, "error: unknown option `reason'\nusage: git worktree add")
+                : runner().run(dir, argv);
+
+    assertTrue(worktree(remote, "r1", Git.sha(remote, "HEAD"), oldGit).prepare().ready());
+
+    String reason =
+        Files.readString(tmp.resolve("cache/p1/repo.git/worktrees/r1/locked")).strip();
+    assertTrue(reason.startsWith("qits-ci run r1 "), reason);
+    assertEquals(1, count("worktree", "add", "--lock", "--detach"));
+  }
+
+  @Test
+  void closeRemovesOnlyItsOwnEntryAndLeavesAnotherContainersAlone() throws Exception {
+    Path sub = remote("sub", "sub content\n");
+    Path remote = remoteWithSubmodule("repo", sub, "libs/sub");
+    String sha = Git.sha(remote, "HEAD");
+    Path mirror = tmp.resolve("cache/p1/repo.git");
+    MirrorWorktree a = worktree(remote, tmp.resolve("container-a/work"), "rA", sha, runner());
+    MirrorWorktree b = worktree(remote, tmp.resolve("container-b/work"), "rB", sha, runner());
+    assertTrue(b.prepare().ready());
+    assertTrue(whileHidden(tmp.resolve("container-b"), a::prepare).ready());
+
+    whileHidden(
+        tmp.resolve("container-b"),
+        () -> {
+          a.remove();
+          return null;
+        });
+
+    assertFalse(Files.exists(tmp.resolve("container-a/work/rA")));
+    assertFalse(Files.exists(mirror.resolve("worktrees/rA")), "A's own entry stayed behind");
+    assertTrue(Files.isDirectory(mirror.resolve("worktrees/rB/modules")), "A's Close took B's");
+    Git.run(tmp.resolve("container-b/work/rB/libs/sub"), "status", "--porcelain");
+    String list = Git.run(mirror, "worktree", "list", "--porcelain");
+    assertTrue(list.contains("container-b/work/rB"), list);
+    assertFalse(list.contains("container-a/work/rA"), list);
+  }
+
+  @Test
+  void aLockedEntryOlderThanTheBoundIsExpiredAndAFreshOneIsKept() throws Exception {
+    Path remote = remote("repo", "first\n");
+    String sha = Git.sha(remote, "HEAD");
+    Path mirror = tmp.resolve("cache/p1/repo.git");
+    // Two containers that died without a Close: one long ago, one a moment ago.
+    assertTrue(worktree(remote, tmp.resolve("old/work"), "rOld", sha, runner()).prepare().ready());
+    assertTrue(worktree(remote, tmp.resolve("live/work"), "rLive", sha, runner()).prepare().ready());
+    Files.writeString(
+        mirror.resolve("worktrees/rOld/locked"),
+        "qits-ci run rOld " + Instant.now().minus(Duration.ofHours(25)) + "\n");
+    Files.writeString(
+        mirror.resolve("worktrees/rLive/locked"),
+        "qits-ci run rLive " + Instant.now().minus(Duration.ofHours(23)) + "\n");
+    MirrorWorktree.deleteRecursively(tmp.resolve("old"));
+    MirrorWorktree.deleteRecursively(tmp.resolve("live"));
+    // A lock nobody here wrote has no timestamp to judge, and is never touched.
+    String elsewhere = tmp.resolve("elsewhere/x").toString();
+    Git.run(mirror, "worktree", "add", "--lock", "--detach", elsewhere, sha);
+    MirrorWorktree.deleteRecursively(tmp.resolve("elsewhere"));
+
+    assertTrue(
+        worktree(remote, tmp.resolve("new/work"), "rNew", sha, runner(), Duration.ofHours(24))
+            .prepare()
+            .ready());
+
+    assertFalse(Files.exists(mirror.resolve("worktrees/rOld")), "the stale entry leaked");
+    assertTrue(
+        Files.isDirectory(mirror.resolve("worktrees/rLive")),
+        "an entry younger than the bound was taken");
+    assertTrue(Files.isDirectory(mirror.resolve("worktrees/x")), "a foreign lock was taken");
+    assertTrue(Files.isDirectory(mirror.resolve("worktrees/rNew")));
+  }
+
+  @Test
+  void aSubmoduleWithAnAbsoluteUrlIsClonedFromTheSiblingBesideTheRunsOriginNotFromThatUrl()
+      throws Exception {
+    Path sub = remote("sub", "sub content\n");
+    // The estate's .gitmodules name the public GitHub address; a lease must not go there.
+    Path remote =
+        remoteWithSubmodule("repo", sub, "libs/sub", "https://github.invalid/org/sub.git");
+    String sha = Git.sha(remote, "HEAD");
+
+    MirrorWorktree.Preparation preparation = worktree(remote, "r1", sha).prepare();
+
+    assertTrue(preparation.ready(), preparation::toString);
+    assertEquals("sub content\n", Files.readString(tmp.resolve("work/r1/libs/sub/file.txt")));
+    String origin =
+        Git.run(tmp.resolve("cache/p1/sub.git"), "config", "--get", "remote.origin.url").strip();
+    assertEquals(tmp.resolve("remote").resolve("sub.git").toString(), origin);
+    assertEquals(0, count("https://github.invalid/org/sub.git"));
+  }
+
+  @Test
+  void theSiblingUrlKeepsTheSubmodulesOwnLastSegmentBesideTheRunsOrigin() {
+    assertEquals(
+        "https://githost:8080/qits/qits-events-frontend.git",
+        MirrorWorktree.siblingUrl(
+            "https://githost:8080/qits/qits-events-service",
+            "https://github.com/QuicklyIterateTheSoftware/qits-events-frontend.git"));
+    assertEquals(
+        "https://githost/qits/front",
+        MirrorWorktree.siblingUrl("https://githost/qits/svc.git/", "../front/"));
+    assertNull(MirrorWorktree.siblingUrl("svc", "https://x/front.git"));
+    assertNull(MirrorWorktree.siblingUrl("https://githost/qits/svc", "https://x/.."));
+  }
+
   @Test
   void aShaTheFreshMirrorDoesNotHoldIsShaGoneAndNotAFailedClone() throws Exception {
     Path remote = remote("repo", "first\n");
@@ -281,9 +445,25 @@ class MirrorWorktreeTest {
   }
 
   private MirrorWorktree worktree(Path remote, String runId, String sha, CommandRunner runner) {
+    return worktree(remote, tmp.resolve("work"), runId, sha, runner);
+  }
+
+  private MirrorWorktree worktree(
+      Path remote, Path workRoot, String runId, String sha, CommandRunner runner) {
+    return worktree(remote, workRoot, runId, sha, runner, MirrorWorktree.DEFAULT_STALE_AFTER);
+  }
+
+  /** A run in a "container" of its own: its own work root, the one shared cache. */
+  private MirrorWorktree worktree(
+      Path remote,
+      Path workRoot,
+      String runId,
+      String sha,
+      CommandRunner runner,
+      Duration staleAfter) {
     return new MirrorWorktree(
         tmp.resolve("cache"),
-        tmp.resolve("work"),
+        workRoot,
         remote.toString(),
         "p1",
         repoName(remote),
@@ -291,7 +471,22 @@ class MirrorWorktreeTest {
         runId,
         sha,
         runner,
-        List.of(Duration.ZERO, Duration.ZERO));
+        List.of(Duration.ZERO, Duration.ZERO),
+        staleAfter);
+  }
+
+  /**
+   * Runs {@code action} with {@code container} moved out of the way, which is what one ci-slot
+   * container's {@code /work} looks like from inside another: absent.
+   */
+  private <T> T whileHidden(Path container, Callable<T> action) throws Exception {
+    Path away = container.resolveSibling(container.getFileName() + "-elsewhere");
+    Files.move(container, away);
+    try {
+      return action.call();
+    } finally {
+      Files.move(away, container);
+    }
   }
 
   private static String repoName(Path remote) {
@@ -345,13 +540,18 @@ class MirrorWorktreeTest {
    * ../sub.git} — the estate's own convention — so init resolves it against the mirror's origin.
    */
   private Path remoteWithSubmodule(String name, Path sub, String path) throws Exception {
+    return remoteWithSubmodule(name, sub, path, "../sub.git");
+  }
+
+  private Path remoteWithSubmodule(String name, Path sub, String path, String url)
+      throws Exception {
     Path source = tmp.resolve("src/" + name);
     Files.createDirectories(source);
     Git.run(source, "init", "-q", "-b", "main");
     Files.writeString(source.resolve("README"), "super\n");
     Git.run(source, "add", "README");
     Git.run(source, "-c", "protocol.file.allow=always", "submodule", "add", "-q", sub.toString(), path);
-    Git.run(source, "config", "-f", ".gitmodules", "submodule." + path + ".url", "../sub.git");
+    Git.run(source, "config", "-f", ".gitmodules", "submodule." + path + ".url", url);
     Git.run(source, "add", ".gitmodules");
     Git.run(source, "commit", "-q", "-m", "with a submodule");
     Path bare = tmp.resolve("remote/" + name + ".git");

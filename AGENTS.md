@@ -135,6 +135,11 @@ the same path). Never delete a lock file, never take a submodule's lock while ho
 (`MirrorWorktree` creates submodule mirrors after releasing it), and remove the worktree on every
 ending after initialization — `DaemonMain.teardown` does, on the lane behind the last step.
 
+**Never run a bare `git worktree prune` on a mirror** (qits-1541). Another container's `/work` is
+invisible from this one, so to prune every other live run looks dead. A run's worktree is locked by
+its own `worktree add --lock`, removed by its own Close, and otherwise only aged out past
+`qits.ci.worktree-stale-after-seconds`; touch no other run's entry.
+
 ## Formatting
 
 `google-java-format`, 100 columns, two-space indent. Javadoc explains *why* — the tradeoff, the

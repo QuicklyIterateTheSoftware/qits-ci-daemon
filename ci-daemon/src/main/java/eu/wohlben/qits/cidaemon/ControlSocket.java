@@ -243,21 +243,47 @@ public final class ControlSocket {
   /**
    * A connected socket closed. Unless this side asked for it, that opens (or continues) an outage
    * and the same token is dialled again within the reconnect budget.
+   *
+   * <p>A host that refuses a re-dial closes with 1008 and a reason ({@code UNKNOWN_DAEMON}, {@code
+   * WRONG_RUN}, {@code ALREADY_CONNECTED}, ...), and that reason is otherwise invisible in the lease
+   * log (qits-1728): every close this side did not ask for is logged with its status and reason, not
+   * just the first of an outage, so an accepted-then-refused re-dial shows up too.
    */
   private void onLost(WebSocket ws) {
     if (closing || ended || socket != ws) {
       return;
     }
+    String closeDetail = closeDescription(ws);
     if (outageStartedNanos == 0) {
       outageStartedNanos = System.nanoTime();
       deadlineNanos = outageStartedNanos + settings.reconnectBudgetMillis() * 1_000_000L;
       attempts = 0;
       LOG.warnf(
-          "ci-daemon control socket closed; re-dialling for up to %dms",
-          settings.reconnectBudgetMillis());
+          "ci-daemon control socket closed (%s); re-dialling for up to %dms",
+          closeDetail, settings.reconnectBudgetMillis());
+    } else {
+      LOG.warnf(
+          "ci-daemon control socket closed again (%s) on re-dial attempt %d",
+          closeDetail, attempts);
     }
     listener.onDisconnected();
     retryOrGiveUp("the socket closed");
+  }
+
+  /**
+   * Render a close for the log: the status and reason when the host sent a close frame, or a flat
+   * "no close frame" when the connection just dropped (both {@link WebSocket#closeStatusCode()} and
+   * {@link WebSocket#closeReason()} may be {@code null} — qits-1728).
+   */
+  private static String closeDescription(WebSocket ws) {
+    Short code = ws.closeStatusCode();
+    if (code == null) {
+      return "no close frame";
+    }
+    String reason = ws.closeReason();
+    return reason == null || reason.isBlank()
+        ? "status " + code
+        : "status " + code + " (" + reason + ")";
   }
 
   private void onFrame(String json) {

@@ -130,18 +130,37 @@ build JDK's `cacerts`, which GraalVM embeds at build time, and `quarkus.ssl.nati
 carries the reasoning. The edge's certificate therefore has to chain to a public root.
 
 
-Capability version 2 (qits-1541). One lease, one daemon, every step:
+Capability version 3 (qits-732; capability 2 was qits-1541). One lease, one daemon, every step —
+and, for a release request, both of its runs:
 
-    dial → Hello{capabilityVersion: 2} → Ack → AckReceived
+    dial → Hello{capabilityVersion: 3} → Ack{2|3} → AckReceived
          → mirror + worktree → Initialized
          → ( RunStep{stepIndex, script, timeoutSeconds, env} → StepChunk* → StepFinished{stepIndex, exitCode, timedOut} )*
+         [ → Continue{runId, branch, sha, token, env} → fetch tag + checkout in the same worktree → Continued{runId}
+           → ( RunStep{stepIndex from 0, ...} → StepChunk* → StepFinished )* ]
          → Close → git worktree unlock + remove --force → flush telemetry → socket closed → exit 0
 
 `Heartbeat` runs underneath from dial to close. Failure to make the worktree replaces `Initialized`
 with `InitFailed`, whose `reason` is the structured signal that retired qits-ci's old
 prelude-sentinel inference. Capability 1 — one container, one step, one shallow clone — is gone, not
 kept beside it: qits-ci pins this daemon by the protocol jar's version, so an old service keeps
-fetching an old binary and there is no dual mode.
+fetching an old binary and there is no dual mode. Capability 3 only added `Continue`, so the daemon
+accepts an `Ack` of 2 as well (that host never sends one); any other version is still exit 4.
+
+**One lease, two runs (qits-732).** A release request's phase-1 run (QA on the fold) and phase-2
+run (the build of the cut tag) share one lease. After phase 1's last `StepFinished` the host sends
+`Continue` instead of `Close`. The daemon takes it only when idle — initialized, no step running or
+queued — and otherwise answers `ContinueFailed{NOT_IDLE}` and leaves the run alone. Then, on the
+lane: the run-scoped identity becomes the new run's (the bearer the socket re-dials with and the
+telemetry posts with, and an env layer — `Continue.env` plus `QITS_TOKEN` — that every later step
+gets between the lease env and its own `RunStep.env`); `refs/tags/<branch>` is fetched into the
+mirror under its lock with the new token in git's env (the sha itself as the fallback; skipped when
+the mirror already has it); `git checkout --force --detach <sha>` runs in the **same** `/work/<runId>`
+— no `git clean`, so `target/`, `node_modules/` and the rest of phase 1's untracked output stay
+warm; the step index resets so `RunStep{stepIndex: 0}` runs again (the lease-wide `seq` does not);
+and `Continued{runId}` goes back. A fetch or checkout that fails answers `ContinueFailed{FETCH_FAILED
+| CHECKOUT_FAILED, detail}` and the daemon stays up for the host's `Close`. Telemetry after a
+`Continue` is labelled with the new run's id, branch and sha; the trace stays the lease's.
 
 **The worktree.** Under an exclusive lock on `/cache/git/<projectId>/<repoName>.lock` (a `fcntl`
 lock taken by the daemon itself, `GitLock`): `git clone --mirror` on the target's first run of the
@@ -188,8 +207,9 @@ A socket that drops after connecting — every lease's does when qits-edge is re
 re-dialled with the same token within `qits.ci.reconnect-budget-ms`. The steps keep running; the
 daemon says `Hello` again on the new socket, and the host's `Ack` releases what the outage held, in
 the order it was produced: an `Initialized` that failed to send, every step's chunks (about 1 MiB,
-oldest dropped first, `seq` unchanged) and every `StepFinished` (never dropped). A second `Ack` does
-not make the worktree again.
+oldest dropped first, `seq` unchanged) and every `StepFinished` (never dropped), then a `Continued` or
+`ContinueFailed` no `RunStep` has answered yet. A re-dial after a `Continue` presents the new run's
+token. A second `Ack` does not make the worktree again.
 
 **The workspace daemon never exits; this daemon always exits.** That is the one deliberate inversion
 of the precedent it otherwise mirrors. Any terminal condition — `Close`, `InitFailed` sent, an `Ack`

@@ -1,5 +1,6 @@
 package eu.wohlben.qits.cidaemon;
 
+import eu.wohlben.qits.cidaemon.protocol.ContinueFailed;
 import eu.wohlben.qits.cidaemon.protocol.InitFailed;
 import java.io.File;
 import java.io.IOException;
@@ -10,6 +11,7 @@ import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -30,6 +32,10 @@ import org.jboss.logging.Logger;
  *     its own mirror, cloned under its own lock if missing
  *     git -c submodule.&lt;name&gt;.url=&lt;sibling&gt; submodule update --init --depth 50
  *         [--reference &lt;its mirror&gt;] -- &lt;path&gt;
+ *   on Continue (qits-732), the lease's next run in the same worktree:
+ *     under the lock: git fetch origin +refs/tags/&lt;branch&gt;:refs/tags/&lt;branch&gt;
+ *                     | git fetch origin &lt;sha&gt;          (skipped when the mirror has it)
+ *     git checkout --force --detach &lt;sha&gt;              (no clean: target/ stays warm)
  *   on Close (under the lock again), this run's entry and nothing else:
  *     git worktree unlock; git worktree remove --force   | rm the dir and worktrees/&lt;id&gt;
  * </pre>
@@ -80,7 +86,8 @@ import org.jboss.logging.Logger;
  *
  * <p><b>Credentials</b> are the bootstrap's, exactly as for the old clone: the bootstrap writes a git
  * credential helper that answers with {@code $QITS_TOKEN}, and every git invocation here inherits
- * it. Nothing in this class sees the token.
+ * it. Nothing in this class reads the token: after a {@code Continue} the new run's {@code
+ * QITS_TOKEN} reaches the helper as an environment entry laid over git's child, never as an argv.
  *
  * <p><b>The failure mapping</b> drives host behaviour, not just a log line: no usable {@code git} ⇒
  * {@link InitFailed.Reason#TOOLING_MISSING}; the mirror could not be cloned or fetched, or the
@@ -130,6 +137,14 @@ public final class MirrorWorktree implements DaemonMain.Worktree {
    * directories, so a {@code ..}, a slash or a leading dot or dash is refused at this boundary.
    */
   private static final Pattern SEGMENT = Pattern.compile("[A-Za-z0-9_][A-Za-z0-9._-]{0,127}");
+
+  /**
+   * What a {@code Continue}'s branch — a version tag — may look like before it is spliced into a
+   * refspec: it arrives over the socket and becomes an argv element, so a leading dash, a colon, a
+   * {@code ..} or anything else git's ref grammar or option parser would read is refused. A name
+   * that does not match is not an error; the sha is fetched directly instead.
+   */
+  private static final Pattern TAG_NAME = Pattern.compile("[A-Za-z0-9_][A-Za-z0-9._/-]{0,254}");
 
   /**
    * How old a qits-ci lock may grow before the next run on the mirror judges its run dead: a day,
@@ -211,6 +226,16 @@ public final class MirrorWorktree implements DaemonMain.Worktree {
     public static final Preparation READY = new Preparation(null, null);
 
     public boolean ready() {
+      return failure == null;
+    }
+  }
+
+  /** The outcome of {@link #continueAt}: done, or a reason the host branches on plus detail. */
+  public record Continuation(ContinueFailed.Reason failure, String detail) {
+
+    public static final Continuation DONE = new Continuation(null, null);
+
+    public boolean done() {
       return failure == null;
     }
   }
@@ -350,6 +375,87 @@ public final class MirrorWorktree implements DaemonMain.Worktree {
       }
     }
     return Preparation.READY;
+  }
+
+  /**
+   * Move the existing worktree to the lease's next run (qits-732): fetch {@code refs/tags/<branch>}
+   * into the mirror — or the sha itself when the tag cannot be fetched — under the mirror's lock,
+   * then {@code git checkout --force --detach <sha>} in the same directory. Never throws.
+   *
+   * <p><b>No {@code git clean}, on purpose.</b> Untracked and ignored files — {@code target/},
+   * {@code node_modules/}, whatever the first run built — survive the move; that warm tree is what
+   * sharing the lease between a release request's two runs is for, and the second run's commit is
+   * the first's plus a version bump. {@code --force} only discards changes to tracked files, which a
+   * build that edits its own sources leaves behind and the new commit must not inherit.
+   *
+   * <p>{@code env} is laid over every git child here: it carries the new run's {@code QITS_TOKEN},
+   * which the bootstrap's credential helper answers with. The directory does not move — it is still
+   * {@code <workRoot>/<first runId>}, locked under the first run's reason, and removed by the Close
+   * as before. Submodules are not updated: the tag is the fold it was cut from plus a version
+   * commit, which moves no gitlink.
+   */
+  @Override
+  public Continuation continueAt(String branch, String sha, Map<String, String> env) {
+    Path target = worktree;
+    Path mirrorDir = mirror;
+    if (target == null || mirrorDir == null) {
+      return new Continuation(
+          ContinueFailed.Reason.CHECKOUT_FAILED, "there is no worktree to move: it was never made");
+    }
+    if (sha == null || !COMMIT_ID.matcher(sha).matches()) {
+      // Crosses from the socket into an argv; see COMMIT_ID.
+      return new Continuation(
+          ContinueFailed.Reason.FETCH_FAILED, "the Continue's sha is not a commit id: " + tail(sha));
+    }
+    Map<String, String> gitEnv = env == null ? Map.of() : env;
+    try (GitLock lock = GitLock.acquire(mirrorDir.resolveSibling(lockName(mirrorDir)))) {
+      if (!hasCommit(mirrorDir, sha)) {
+        StringBuilder said = new StringBuilder();
+        if (branch != null && TAG_NAME.matcher(branch).matches() && !branch.contains("..")
+            && !branch.endsWith("/") && !branch.endsWith(".lock")) {
+          String ref = "refs/tags/" + branch;
+          CommandRunner.Result byTag =
+              withRetry(() -> git(gitEnv, mirrorDir, "fetch", "origin", "+" + ref + ":" + ref), null);
+          if (!byTag.ok()) {
+            said.append(byTag.output());
+          }
+        }
+        if (!hasCommit(mirrorDir, sha)) {
+          CommandRunner.Result bySha =
+              withRetry(() -> git(gitEnv, mirrorDir, "fetch", "origin", sha), null);
+          if (!bySha.ok()) {
+            said.append(bySha.output());
+          }
+        }
+        if (!hasCommit(mirrorDir, sha)) {
+          return new Continuation(
+              ContinueFailed.Reason.FETCH_FAILED,
+              tail("the mirror has no commit " + sha + " after fetching refs/tags/" + branch
+                  + " and the sha itself. " + said));
+        }
+      }
+    } catch (IOException e) {
+      return new Continuation(
+          ContinueFailed.Reason.FETCH_FAILED, tail("the mirror could not be locked: " + e));
+    }
+    CommandRunner.Result checkout = git(gitEnv, target, "checkout", "--force", "--detach", sha);
+    if (!checkout.ok()) {
+      return new Continuation(ContinueFailed.Reason.CHECKOUT_FAILED, tail(checkout.output()));
+    }
+    CommandRunner.Result head = git(target, "rev-parse", "HEAD");
+    CommandRunner.Result wanted = git(target, "rev-parse", "--verify", sha + "^{commit}");
+    if (!head.ok()
+        || !wanted.ok()
+        || !head.output().strip().equals(wanted.output().strip())) {
+      return new Continuation(
+          ContinueFailed.Reason.CHECKOUT_FAILED,
+          tail("the worktree is at " + head.output().strip() + " after checking out " + sha));
+    }
+    return Continuation.DONE;
+  }
+
+  private boolean hasCommit(Path mirrorDir, String sha) {
+    return git(mirrorDir, "cat-file", "-e", sha + "^{commit}").ok();
   }
 
   /**
@@ -643,12 +749,16 @@ public final class MirrorWorktree implements DaemonMain.Worktree {
   }
 
   private CommandRunner.Result git(Path dir, String... args) {
+    return git(Map.of(), dir, args);
+  }
+
+  private CommandRunner.Result git(Map<String, String> env, Path dir, String... args) {
     String[] argv = new String[args.length + 3];
     argv[0] = "git";
     argv[1] = "-C";
     argv[2] = dir.toString();
     System.arraycopy(args, 0, argv, 3, args.length);
-    return runner.run(null, argv);
+    return env.isEmpty() ? runner.run(null, argv) : runner.run(null, env, argv);
   }
 
   private static String transientReason(String output) {

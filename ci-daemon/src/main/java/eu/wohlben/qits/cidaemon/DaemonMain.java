@@ -6,6 +6,9 @@ import eu.wohlben.qits.cidaemon.protocol.Cancel;
 import eu.wohlben.qits.cidaemon.protocol.CiDaemonMessage;
 import eu.wohlben.qits.cidaemon.protocol.CiDaemonProtocol;
 import eu.wohlben.qits.cidaemon.protocol.Close;
+import eu.wohlben.qits.cidaemon.protocol.Continue;
+import eu.wohlben.qits.cidaemon.protocol.ContinueFailed;
+import eu.wohlben.qits.cidaemon.protocol.Continued;
 import eu.wohlben.qits.cidaemon.protocol.Hello;
 import eu.wohlben.qits.cidaemon.protocol.InitFailed;
 import eu.wohlben.qits.cidaemon.protocol.Initialized;
@@ -13,6 +16,8 @@ import eu.wohlben.qits.cidaemon.protocol.RunStep;
 import eu.wohlben.qits.cidaemon.protocol.StepFinished;
 import eu.wohlben.qits.cidaemon.protocol.StepChunk;
 import io.vertx.core.Vertx;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
@@ -26,7 +31,10 @@ import org.jboss.logging.Logger;
  *
  * <pre>
  *   dial → Hello → Ack → AckReceived → mirror + worktree → Initialized →
- *     (RunStep → StepChunk* → StepFinished)* → Close → worktree remove → flush telemetry → exit 0
+ *     (RunStep → StepChunk* → StepFinished)*
+ *     [ Continue → fetch + checkout in the same worktree → Continued
+ *         (RunStep{stepIndex from 0} → StepChunk* → StepFinished)* ]
+ *     → Close → worktree remove → flush telemetry → exit 0
  * </pre>
  *
  * with {@code Heartbeat} underneath from dial to close, {@code InitFailed} standing in for {@code
@@ -34,6 +42,17 @@ import org.jboss.logging.Logger;
  * running. Steps run one at a time, in the order they arrive, on one lane that also runs the
  * initialization and the {@code Close} — so a {@code RunStep} that arrives early waits for the
  * worktree, and the worktree is removed only after the last step on the lane is done.
+ *
+ * <p><b>One lease, two runs (capability 3, qits-732).</b> A release request's QA run on the fold and
+ * its build of the cut tag share a lease: after the first run's last {@code StepFinished} the host
+ * sends {@code Continue} instead of {@code Close}. Accepted only while idle — initialized, no step
+ * running or queued — and otherwise answered {@code ContinueFailed{NOT_IDLE}} with the current run
+ * untouched. On the lane it swaps the run-scoped identity ({@link RunIdentity}: the bearer the
+ * socket re-dials and the telemetry posts with, and the env layer each later step gets between the
+ * lease env and its own), moves the same worktree to the new sha without cleaning it, resets the
+ * step index so {@code RunStep{0}} runs again — the lease-wide output {@code seq} goes on counting —
+ * and answers {@code Continued}, or {@code ContinueFailed} and stays up for the host's {@code
+ * Close}.
  *
  * <p><b>Every ending is an exit</b>, and every ending after initialization removes the worktree
  * first: the mirror lives on the target's cache volume and outlives this container, so a worktree
@@ -45,8 +64,10 @@ import org.jboss.logging.Logger;
  * was produced: an {@code Initialized} that failed to send, every step's chunks (bounded, oldest
  * dropped first) and every {@code StepFinished} (never dropped). On the new socket the daemon says
  * {@code Hello} again, and the host's {@code Ack} releases the held frames in order. An {@code
- * Initialized} that was written but never answered by a {@code RunStep} is sent again too. Only a
- * reconnect budget that runs out ends the process, as exit 6.
+ * Initialized} that was written but never answered by a {@code RunStep} is sent again too, and so
+ * is a Continue's answer ({@code Continued} or {@code ContinueFailed}), after the replay. A re-dial
+ * after a Continue presents the new run's token. Only a reconnect budget that runs out ends the
+ * process, as exit 6.
  *
  * <p><b>Telemetry is flushed once, at the ending, before the socket is closed.</b> A {@code
  * StepFinished} no longer ends the container, so there is no reaping to race until qits-ci deletes
@@ -69,6 +90,13 @@ public final class DaemonMain implements ControlSocket.Listener {
 
     /** Remove it again; idempotent, never throws, a no-op when nothing was made. */
     void remove();
+
+    /**
+     * Move the prepared worktree to {@code sha} for the lease's next run (qits-732), in place and
+     * without cleaning it, with {@code env} — the new run's identity — over every git child.
+     * Never throws.
+     */
+    MirrorWorktree.Continuation continueAt(String branch, String sha, Map<String, String> env);
   }
 
   /** Builds one step's execution. {@link StepProcess}'s constructor in production. */
@@ -78,6 +106,10 @@ public final class DaemonMain implements ControlSocket.Listener {
   }
 
   private final DaemonEnv env;
+
+  /** Who the lease serves now: the launch's run until a Continue makes it the next one. */
+  private final RunIdentity identity;
+
   private final ControlSocket socket;
   private final Worktree worktree;
   private final Steps steps;
@@ -119,8 +151,17 @@ public final class DaemonMain implements ControlSocket.Listener {
   /** A RunStep has been accepted at all; the Initialized resend and exit 7 both ask. */
   private final AtomicBoolean anyStep = new AtomicBoolean();
 
-  /** Highest {@code stepIndex} accepted; a RunStep at or below it is a replay and is ignored. */
+  /**
+   * Highest {@code stepIndex} accepted; a RunStep at or below it is a replay and is ignored. Back to
+   * -1 when a Continue succeeds, because the next run counts its steps from 0 again.
+   */
   private int lastStepIndex = -1;
+
+  /** Accepted RunSteps not yet finished on the lane; under {@code this}. A Continue needs zero. */
+  private int queuedSteps;
+
+  /** A Continue is on the lane; under {@code this}. A second one meanwhile is NOT_IDLE. */
+  private boolean continuing;
 
   private volatile boolean ready;
   private volatile Step step;
@@ -156,6 +197,13 @@ public final class DaemonMain implements ControlSocket.Listener {
    */
   private final TreeMap<Long, CiDaemonMessage> held = new TreeMap<>();
 
+  /**
+   * The latest answer to a Continue — {@code Continued} or {@code ContinueFailed} — until a RunStep
+   * comes back after it. Sent again after every re-Ack, like an unanswered {@code Initialized}: a
+   * write the socket accepted is not a frame the host read.
+   */
+  private CiDaemonMessage continueAnswer;
+
   private long nextOrdinal;
   private long heldChars;
   private long droppedChunks;
@@ -182,7 +230,8 @@ public final class DaemonMain implements ControlSocket.Listener {
     this.worktree = worktree;
     this.steps = steps;
     this.telemetry = telemetry;
-    this.socket = new ControlSocket(vertx, env.daemonUrl(), env.token(), settings, this);
+    this.identity = new RunIdentity(env);
+    this.socket = new ControlSocket(vertx, env.daemonUrl(), identity::token, settings, this);
   }
 
   /**
@@ -260,6 +309,7 @@ public final class DaemonMain implements ControlSocket.Listener {
       case RunStep request -> onRunStep(request);
       case Cancel cancel -> onCancel(cancel);
       case Close close -> onClose();
+      case Continue next -> onContinue(next);
       default ->
           // Everything else in the sealed set is daemon→host. A host echoing one back is not a
           // conversation this version has, and there is nothing to do about it but say so.
@@ -267,8 +317,17 @@ public final class DaemonMain implements ControlSocket.Listener {
     }
   }
 
+  /**
+   * The host versions this daemon can talk to: its own, and 2 — capability 3 only added {@code
+   * Continue}, which a host speaking 2 never sends, so nothing in that conversation is
+   * half-understood. Anything else is still an exit, not a guess.
+   */
+  static boolean understands(int hostVersion) {
+    return hostVersion == 2 || hostVersion == CiDaemonProtocol.CAPABILITY_VERSION;
+  }
+
   private void onAck(Ack ack) {
-    if (ack.capabilityVersion() != CiDaemonProtocol.CAPABILITY_VERSION) {
+    if (!understands(ack.capabilityVersion())) {
       LOG.errorf(
           "ci-daemon speaks capability version %d, the host answered %d — exiting rather than"
               + " guessing.",
@@ -351,9 +410,146 @@ public final class DaemonMain implements ControlSocket.Listener {
         return;
       }
       lastStepIndex = request.stepIndex();
+      queuedSteps++;
     }
     anyStep.set(true);
-    lane.execute(() -> runStep(request));
+    synchronized (outbox) {
+      continueAnswer = null; // the host read it: it is sending the next run's steps
+    }
+    try {
+      lane.execute(
+          () -> {
+            try {
+              runStep(request);
+            } finally {
+              synchronized (this) {
+                queuedSteps--;
+              }
+            }
+          });
+    } catch (java.util.concurrent.RejectedExecutionException e) {
+      synchronized (this) {
+        queuedSteps--;
+      }
+    }
+  }
+
+  /**
+   * On the event loop: a Continue is taken only between runs. Anything else — a step running or
+   * queued, the worktree not made yet, another Continue on the lane — is NOT_IDLE, answered at once
+   * and changing nothing, so the run in progress finishes exactly as it would have.
+   */
+  private void onContinue(Continue next) {
+    boolean idle;
+    synchronized (this) {
+      if (ending.get()) {
+        LOG.infof("ci-daemon ignored Continue (run %s): the lease is ending", next.runId());
+        return;
+      }
+      idle = ready && !continuing && queuedSteps == 0 && step == null;
+      if (idle) {
+        continuing = true;
+      }
+    }
+    if (!idle) {
+      LOG.warnf(
+          "ci-daemon refused Continue (run %s): a step is running or queued, or the worktree is not"
+              + " ready",
+          next.runId());
+      answerContinue(
+          new ContinueFailed(
+              next.runId(),
+              ContinueFailed.Reason.NOT_IDLE,
+              "the daemon was not idle: a step is running or queued, or the worktree is not ready"));
+      return;
+    }
+    try {
+      lane.execute(() -> continueRun(next));
+    } catch (java.util.concurrent.RejectedExecutionException e) {
+      synchronized (this) {
+        continuing = false;
+      }
+    }
+  }
+
+  /**
+   * On the lane: identity first, so the fetch already authenticates as the new run and a re-dial
+   * during it presents the new bearer; then the worktree; then the step index; then the answer. A
+   * failure leaves the daemon up — the host follows a {@code ContinueFailed} with {@code Close}.
+   */
+  private void continueRun(Continue next) {
+    Spans.Span span = telemetry.span("continue");
+    if (next.runId() != null) {
+      span.attribute("qits.ci.run_id", next.runId());
+    }
+    try {
+      if (ending.get()) {
+        span.end("the lease ended before the Continue ran");
+        return;
+      }
+      identity.continueAs(next);
+      telemetry.continueAs(identity.token(), next.runId(), next.branch(), next.sha());
+      LOG.infof(
+          "ci-daemon continuing as run %s at %s (%s), presenting its token (subject %s).",
+          next.runId(),
+          next.sha(),
+          next.branch(),
+          identity.tokenSubject() == null || identity.tokenSubject().isBlank()
+              ? "unnamed"
+              : identity.tokenSubject());
+      MirrorWorktree.Continuation moved;
+      try {
+        moved = worktree.continueAt(next.branch(), next.sha(), identity.env());
+      } catch (RuntimeException e) {
+        LOG.error("ci-daemon Continue threw", e);
+        moved =
+            new MirrorWorktree.Continuation(
+                ContinueFailed.Reason.CHECKOUT_FAILED, String.valueOf(e.getMessage()));
+      }
+      if (!moved.done()) {
+        String why = "ContinueFailed " + moved.failure() + ": " + moved.detail();
+        LOG.errorf("ci-daemon could not continue as run %s: %s", next.runId(), why);
+        span.end(why);
+        answerContinue(new ContinueFailed(next.runId(), moved.failure(), moved.detail()));
+        return;
+      }
+      synchronized (this) {
+        lastStepIndex = -1;
+      }
+      span.end();
+      answerContinue(new Continued(next.runId()));
+    } finally {
+      synchronized (this) {
+        continuing = false;
+      }
+    }
+  }
+
+  /** Deliver a Continue's answer and keep it for re-sending until a RunStep follows it. */
+  private void answerContinue(CiDaemonMessage answer) {
+    synchronized (outbox) {
+      continueAnswer = answer;
+      deliver(answer);
+    }
+  }
+
+  /**
+   * The step as it runs: the current run's identity layer under the step's own {@code env}. Empty
+   * until a Continue, when the lease env already is the run's.
+   */
+  private RunStep withRunEnv(RunStep request) {
+    Map<String, String> runEnv = identity.env();
+    if (runEnv.isEmpty()) {
+      return request;
+    }
+    Map<String, String> merged = new LinkedHashMap<>(runEnv);
+    merged.putAll(request.env());
+    return new RunStep(
+        request.correlationId(),
+        request.stepIndex(),
+        request.script(),
+        request.timeoutSeconds(),
+        merged);
   }
 
   /** On the lane. */
@@ -364,10 +560,14 @@ public final class DaemonMain implements ControlSocket.Listener {
     }
     Spans.Span script = telemetry.span("script");
     script.attribute("qits.ci.step_index", (long) request.stepIndex());
+    String runId = identity.runId();
+    if (runId != null && !runId.isBlank()) {
+      script.attribute("qits.ci.run_id", runId);
+    }
     cancelRequested = false;
     Step running =
         steps.create(
-            request,
+            withRunEnv(request),
             message -> {
               if (message instanceof StepChunk chunk) {
                 telemetry.output(chunk);
@@ -573,6 +773,12 @@ public final class DaemonMain implements ControlSocket.Listener {
         LOG.infof("ci-daemon replaying %d frame(s) held through the outage", replay.size());
       }
       replay.forEach(e -> transmit(e.getKey(), e.getValue()));
+      // After the replay: a Continue is only taken once the run before it is done, so everything
+      // held is that run's and goes first. Re-sent until a RunStep answers it; the host ignores a
+      // duplicate.
+      if (continueAnswer != null) {
+        transmit(nextOrdinal++, continueAnswer);
+      }
       if (terminal != null && !terminalInFlight) {
         transmitTerminal();
       }

@@ -12,6 +12,7 @@ import io.vertx.core.http.WebSocketClient;
 import io.vertx.core.http.WebSocketConnectOptions;
 import io.vertx.core.json.JsonObject;
 import java.net.URI;
+import java.util.function.Supplier;
 import org.jboss.logging.Logger;
 
 /**
@@ -107,7 +108,13 @@ public final class ControlSocket {
 
   private final Vertx vertx;
   private final String url;
-  private final String token;
+  /**
+   * Read at every dial rather than once: a {@code Continue} (qits-732) hands the lease the next
+   * run's token, and the first run's is deleted when that run closes — a re-dial presenting it would
+   * be refused for a credential that no longer exists.
+   */
+  private final Supplier<String> token;
+
   private final Settings settings;
   private final Listener listener;
 
@@ -134,6 +141,15 @@ public final class ControlSocket {
       Vertx vertx,
       String url,
       String token,
+      Settings settings,
+      Listener listener) {
+    this(vertx, url, () -> token, settings, listener);
+  }
+
+  public ControlSocket(
+      Vertx vertx,
+      String url,
+      Supplier<String> token,
       Settings settings,
       Listener listener) {
     this.vertx = vertx;
@@ -175,7 +191,7 @@ public final class ControlSocket {
     // No X-Qits-* header of any shape: qits-edge strips them all, so sending one here would only
     // be a header this container mistakenly trusted to arrive. The token is the whole handshake;
     // which launch this is travels in the Hello that follows instead.
-    options.addHeader(HEADER_AUTHORIZATION, "Bearer " + token);
+    options.addHeader(HEADER_AUTHORIZATION, "Bearer " + token.get());
     int attempt = attempts++;
     client
         .connect(options)

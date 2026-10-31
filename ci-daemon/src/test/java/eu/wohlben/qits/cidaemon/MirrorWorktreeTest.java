@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import eu.wohlben.qits.cidaemon.protocol.ContinueFailed;
 import eu.wohlben.qits.cidaemon.protocol.InitFailed;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -37,6 +38,101 @@ class MirrorWorktreeTest {
 
   /** Every git argv the runner saw, for asserting which of clone and fetch happened. */
   private final List<List<String>> commands = Collections.synchronizedList(new ArrayList<>());
+
+  /** The production runner, recording every argv with the env laid over it. */
+  private final List<Map<String, String>> envs = Collections.synchronizedList(new ArrayList<>());
+
+  private CommandRunner envRecordingRunner() {
+    CommandRunner forking = CommandRunner.forking(60);
+    return new CommandRunner() {
+      @Override
+      public Result run(java.io.File dir, String... argv) {
+        return run(dir, Map.of(), argv);
+      }
+
+      @Override
+      public Result run(java.io.File dir, Map<String, String> env, String... argv) {
+        commands.add(List.of(argv));
+        envs.add(env);
+        return forking.run(dir, env, argv);
+      }
+    };
+  }
+
+  @Test
+  void aContinueFetchesTheTagAsTheNewRunAndChecksItOutInTheSameDirectoryWithoutCleaning()
+      throws Exception {
+    Path remote = remote("repo", "first\n");
+    MirrorWorktree worktree =
+        worktree(remote, "r1", Git.sha(remote, "HEAD"), envRecordingRunner());
+    assertTrue(worktree.prepare().ready());
+    Path dir = tmp.resolve("work/r1");
+    Files.writeString(dir.resolve("untracked.txt"), "kept\n");
+    Files.writeString(dir.resolve("file.txt"), "edited by a build\n");
+    String released = Git.push(tmp, remote, "released\n");
+    Git.run(remote, "tag", "2026.1031.1", released);
+
+    MirrorWorktree.Continuation moved =
+        worktree.continueAt("2026.1031.1", released, Map.of("QITS_TOKEN", "next-t0ken"));
+
+    assertTrue(moved.done(), () -> "expected the worktree moved, got " + moved);
+    assertEquals(dir.toFile(), worktree.directory(), "the directory does not move");
+    assertEquals(released, Git.sha(dir, "HEAD"));
+    assertEquals("released\n", Files.readString(dir.resolve("file.txt")));
+    assertEquals("kept\n", Files.readString(dir.resolve("untracked.txt")));
+    assertEquals(
+        released, Git.sha(tmp.resolve("cache/p1/repo.git"), "refs/tags/2026.1031.1"));
+    synchronized (commands) {
+      int fetch = -1;
+      for (int i = 0; i < commands.size(); i++) {
+        if (commands.get(i).contains("+refs/tags/2026.1031.1:refs/tags/2026.1031.1")) {
+          fetch = i;
+        }
+      }
+      assertTrue(fetch >= 0, () -> "no tag fetch in " + commands);
+      // What the bootstrap's credential helper reads: the new run's token, in git's own env.
+      assertEquals("next-t0ken", envs.get(fetch).get("QITS_TOKEN"));
+    }
+    assertEquals(0, count("clean"), "never a clean: the first run's build output stays warm");
+  }
+
+  @Test
+  void aContinueToAShaNoRemoteHasIsFetchFailedAndTheWorktreeStaysWhereItWas() throws Exception {
+    Path remote = remote("repo", "first\n");
+    String sha = Git.sha(remote, "HEAD");
+    MirrorWorktree worktree = worktree(remote, "r1", sha);
+    assertTrue(worktree.prepare().ready());
+
+    MirrorWorktree.Continuation moved =
+        worktree.continueAt("no-such-tag", "0123456789abcdef0123456789abcdef01234567", Map.of());
+
+    assertEquals(ContinueFailed.Reason.FETCH_FAILED, moved.failure(), moved::toString);
+    assertEquals(sha, Git.sha(tmp.resolve("work/r1"), "HEAD"));
+  }
+
+  @Test
+  void aContinueWhoseShaIsNotACommitIdNeverReachesGit() throws Exception {
+    Path remote = remote("repo", "first\n");
+    MirrorWorktree worktree = worktree(remote, "r1", Git.sha(remote, "HEAD"));
+    assertTrue(worktree.prepare().ready());
+    long before = commands.size();
+
+    MirrorWorktree.Continuation moved = worktree.continueAt("v1", "--upload-pack=evil", Map.of());
+
+    assertEquals(ContinueFailed.Reason.FETCH_FAILED, moved.failure());
+    assertEquals(before, commands.size());
+  }
+
+  @Test
+  void aContinueBeforeTheWorktreeWasMadeIsCheckoutFailed() throws Exception {
+    Path remote = remote("repo", "first\n");
+    MirrorWorktree worktree = worktree(remote, "r1", Git.sha(remote, "HEAD"));
+
+    MirrorWorktree.Continuation moved =
+        worktree.continueAt("v1", Git.sha(remote, "HEAD"), Map.of());
+
+    assertEquals(ContinueFailed.Reason.CHECKOUT_FAILED, moved.failure());
+  }
 
   @Test
   void theFirstRunClonesABareMirrorAndChecksTheShaOutInAWorktreeOfIt() throws Exception {

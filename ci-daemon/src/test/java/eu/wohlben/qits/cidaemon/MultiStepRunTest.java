@@ -11,6 +11,9 @@ import eu.wohlben.qits.cidaemon.protocol.CiDaemonCodec;
 import eu.wohlben.qits.cidaemon.protocol.CiDaemonMessage;
 import eu.wohlben.qits.cidaemon.protocol.CiDaemonProtocol;
 import eu.wohlben.qits.cidaemon.protocol.Close;
+import eu.wohlben.qits.cidaemon.protocol.Continue;
+import eu.wohlben.qits.cidaemon.protocol.ContinueFailed;
+import eu.wohlben.qits.cidaemon.protocol.Continued;
 import eu.wohlben.qits.cidaemon.protocol.Hello;
 import eu.wohlben.qits.cidaemon.protocol.Initialized;
 import eu.wohlben.qits.cidaemon.protocol.RunStep;
@@ -165,6 +168,138 @@ class MultiStepRunTest {
     String worktrees = Git.run(tmp.resolve("cache/p1/repo.git"), "worktree", "list");
     assertFalse(worktrees.contains("run-7"), worktrees);
     assertNotNull(Files.readString(tmp.resolve("cache/p1/repo.git/HEAD")), "the mirror stays");
+  }
+
+  @Test
+  void aContinueMovesTheSameWorktreeToTheTagKeepingWhatTheFirstRunBuiltAndCloseRemovesIt()
+      throws Exception {
+    Path remote = remote();
+    String sha = Git.sha(remote, "HEAD");
+    List<CiDaemonMessage> received = Collections.synchronizedList(new ArrayList<>());
+    CompletableFuture<Void> closed = new CompletableFuture<>();
+    String[] tagged = new String[1];
+    server =
+        vertx
+            .createHttpServer()
+            .webSocketHandler(
+                ws -> {
+                  ws.closeHandler(v -> closed.complete(null));
+                  ws.textMessageHandler(
+                      json -> {
+                        CiDaemonMessage message =
+                            CiDaemonCodec.decode(new JsonObject(json).getMap());
+                        received.add(message);
+                        switch (message) {
+                          case Hello h -> send(ws, new Ack(CiDaemonProtocol.CAPABILITY_VERSION));
+                          case Initialized i ->
+                              send(
+                                  ws,
+                                  new RunStep(
+                                      "p1",
+                                      0,
+                                      "mkdir -p target && echo warm > target/built"
+                                          + " && echo mine > untracked.txt"
+                                          + " && echo dirty > file.txt",
+                                      60,
+                                      Map.of()));
+                          case StepFinished f when f.correlationId().equals("p1") -> {
+                            // The release cuts its tag only now, after the mirror was made: the
+                            // Continue has to fetch it.
+                            try {
+                              tagged[0] = Git.push(tmp, remote, "released\n");
+                              Git.run(remote, "tag", "2026.1031.1", tagged[0]);
+                            } catch (Exception e) {
+                              throw new IllegalStateException(e);
+                            }
+                            send(
+                                ws,
+                                new Continue(
+                                    "run-8",
+                                    "2026.1031.1",
+                                    tagged[0],
+                                    "next-t0ken",
+                                    Map.of("QITS_CI_RUN_ID", "run-8")));
+                          }
+                          case Continued c ->
+                              send(
+                                  ws,
+                                  new RunStep(
+                                      "p2",
+                                      0,
+                                      "cat file.txt untracked.txt target/built;"
+                                          + " echo \"$QITS_CI_RUN_ID $QITS_TOKEN\";"
+                                          + " git rev-parse HEAD",
+                                      60,
+                                      Map.of()));
+                          case ContinueFailed c -> send(ws, new Close());
+                          case StepFinished f -> send(ws, new Close());
+                          default -> {}
+                        }
+                      });
+                })
+            .listen(0)
+            .toCompletionStage()
+            .toCompletableFuture()
+            .get(10, TimeUnit.SECONDS);
+
+    MirrorWorktree worktree =
+        new MirrorWorktree(
+            tmp.resolve("cache"),
+            tmp.resolve("work"),
+            remote.toString(),
+            "p1",
+            "repo",
+            "repo-id",
+            "run-7",
+            sha,
+            CommandRunner.forking(60),
+            List.of(Duration.ZERO),
+            MirrorWorktree.DEFAULT_STALE_AFTER);
+    AtomicLong seq = new AtomicLong();
+    DaemonEnv env =
+        new DaemonEnv(
+            "ws://127.0.0.1:" + server.actualPort() + "/ci/daemon",
+            "daemon-1",
+            remote.toString(),
+            "main",
+            sha,
+            "run-t0ken",
+            "run:7",
+            "run-7");
+    DaemonMain daemon =
+        new DaemonMain(
+            vertx,
+            env,
+            new ControlSocket.Settings(10_000, 5_000, 50, 200, 5_000),
+            worktree,
+            (request, emit) ->
+                new StepProcess(
+                    worktree.directory().toPath(),
+                    request,
+                    emit,
+                    seq,
+                    8192,
+                    50,
+                    2000,
+                    worktree.shell(),
+                    worktree.processGroups()));
+
+    int code = CompletableFuture.supplyAsync(daemon::run).get(120, TimeUnit.SECONDS);
+    closed.get(10, TimeUnit.SECONDS);
+
+    assertEquals(ExitCode.OK, code);
+    assertEquals(
+        List.of(new Continued("run-8")), all(received, Continued.class), received::toString);
+    List<StepFinished> finished = all(received, StepFinished.class);
+    assertEquals(List.of("p1", "p2"), finished.stream().map(StepFinished::correlationId).toList());
+    assertEquals(List.of(0, 0), finished.stream().map(StepFinished::exitCode).toList());
+    // The tracked file is the tag's (--force dropped the first run's edit), the untracked and the
+    // ignored-by-convention build output are still there (no clean), and the step runs as run-8.
+    assertEquals(
+        "released\nmine\nwarm\nrun-8 next-t0ken\n" + tagged[0] + "\n", outOf(received, "p2"));
+    assertFalse(Files.exists(tmp.resolve("work/run-7")), "Close removes the one worktree");
+    String worktrees = Git.run(tmp.resolve("cache/p1/repo.git"), "worktree", "list");
+    assertFalse(worktrees.contains("run-7"), worktrees);
   }
 
   private static void send(ServerWebSocket ws, CiDaemonMessage message) {

@@ -13,6 +13,9 @@ import eu.wohlben.qits.cidaemon.protocol.CiDaemonCodec;
 import eu.wohlben.qits.cidaemon.protocol.CiDaemonMessage;
 import eu.wohlben.qits.cidaemon.protocol.CiDaemonProtocol;
 import eu.wohlben.qits.cidaemon.protocol.Close;
+import eu.wohlben.qits.cidaemon.protocol.Continue;
+import eu.wohlben.qits.cidaemon.protocol.ContinueFailed;
+import eu.wohlben.qits.cidaemon.protocol.Continued;
 import eu.wohlben.qits.cidaemon.protocol.Heartbeat;
 import eu.wohlben.qits.cidaemon.protocol.Hello;
 import eu.wohlben.qits.cidaemon.protocol.InitFailed;
@@ -209,6 +212,219 @@ class DaemonMainTest {
     assertEquals(ExitCode.CAPABILITY_MISMATCH, code);
     // No compat mode, and nothing half-done: the daemon does not clone for a host it cannot talk to.
     assertNull(host.first(Initialized.class));
+  }
+
+  @Test
+  void anAckOfCapabilityTwoIsUnderstoodBecauseThreeOnlyAddedContinue() throws Exception {
+    Host host =
+        host(
+            (h, message) -> {
+              if (message instanceof Hello) {
+                h.send(new Ack(2));
+              } else if (message instanceof Initialized) {
+                h.send(new RunStep("c1", 0, "true", 30, Map.of()));
+              }
+            });
+
+    int code = runDaemon(host.url("/ci/daemon"), ready(), 30).get(30, TimeUnit.SECONDS);
+    host.awaitDrained();
+
+    assertEquals(ExitCode.OK, code);
+    assertEquals(3, host.first(Hello.class).capabilityVersion(), "the daemon announces 3");
+    assertNotNull(host.first(StepFinished.class));
+    assertTrue(DaemonMain.understands(2));
+    assertTrue(DaemonMain.understands(3));
+    assertFalse(DaemonMain.understands(1));
+    assertFalse(DaemonMain.understands(4));
+  }
+
+  /** The second run of a release request, as qits-ci sends it after the first run's last step. */
+  private static Continue phaseTwo() {
+    return new Continue(
+        "run-10",
+        "2026.1031.120000",
+        "fedcba9876543210",
+        "next-t0ken",
+        Map.of(
+            "QITS_CI_RUN_ID", "run-10",
+            "QITS_CI_SHA", "fedcba9876543210",
+            "QITS_TOKEN_SUBJECT", "run:10",
+            "QITS_MAVEN_AUTH_PSW", "maven-secret"));
+  }
+
+  @Test
+  void aContinueAfterTheLastStepMovesTheWorktreeAndTheNextRunStartsAgainAtStepZero()
+      throws Exception {
+    Host host =
+        host(
+            (h, message) -> {
+              switch (message) {
+                case Hello hello -> h.send(new Ack(CiDaemonProtocol.CAPABILITY_VERSION));
+                case Initialized i ->
+                    h.send(new RunStep("p1", 0, "echo \"one $QITS_CI_RUN_ID\"", 30, Map.of()));
+                case StepFinished f when f.correlationId().equals("p1") -> h.send(phaseTwo());
+                case Continued c ->
+                    h.send(
+                        new RunStep(
+                            "p2",
+                            0,
+                            "echo \"two $QITS_CI_RUN_ID $QITS_TOKEN $QITS_MAVEN_AUTH_PSW $MINE\"",
+                            30,
+                            Map.of("MINE", "step-own")));
+                case StepFinished f -> h.send(new Close());
+                default -> {}
+              }
+            });
+    host.closeAfterStep = false;
+    ScriptedWorktree worktree = worktree(() -> MirrorWorktree.Preparation.READY);
+
+    int code =
+        runDaemon(tokenEnv(host.url("/ci/daemon")), worktree, 30, 10_000).get(30, TimeUnit.SECONDS);
+    host.awaitDrained();
+
+    assertEquals(ExitCode.OK, code);
+    assertEquals(new Continued("run-10"), host.first(Continued.class));
+    assertNull(host.first(ContinueFailed.class));
+    List<StepFinished> finished = host.all(StepFinished.class);
+    assertEquals(List.of("p1", "p2"), finished.stream().map(StepFinished::correlationId).toList());
+    assertEquals(List.of(0, 0), finished.stream().map(StepFinished::stepIndex).toList());
+    // The worktree was moved, once, to the Continue's tag and sha, with the new run's identity
+    // over git — its token included, which is what the credential helper answers with.
+    assertEquals(1, worktree.continuations.size());
+    List<Object> moved = worktree.continuations.getFirst();
+    assertEquals("2026.1031.120000", moved.get(0));
+    assertEquals("fedcba9876543210", moved.get(1));
+    @SuppressWarnings("unchecked")
+    Map<String, String> gitEnv = (Map<String, String>) moved.get(2);
+    assertEquals("next-t0ken", gitEnv.get("QITS_TOKEN"));
+    // A step before the Continue sees the lease env; one after it sees the new run's identity
+    // between the lease env and its own.
+    StringBuilder out = new StringBuilder();
+    host.all(StepChunk.class).forEach(chunk -> out.append(chunk.text()));
+    assertTrue(out.toString().contains("two run-10 next-t0ken maven-secret step-own"), out::toString);
+    assertFalse(out.toString().contains("one run-10"), out::toString);
+    // seq is the lease's: it goes on counting across the Continue rather than restarting.
+    List<Long> seqs = host.all(StepChunk.class).stream().map(StepChunk::seq).toList();
+    assertEquals(seqs.stream().sorted().distinct().toList(), seqs);
+    assertEquals(1, worktree.removals.get(), "Close removes the one worktree");
+  }
+
+  @Test
+  void aContinueWhileAStepRunsIsNotIdleAndTheRunningStepFinishesNormally() throws Exception {
+    Host host =
+        host(
+            (h, message) -> {
+              switch (message) {
+                case Hello hello -> h.send(new Ack(CiDaemonProtocol.CAPABILITY_VERSION));
+                case Initialized i ->
+                    h.send(new RunStep("c1", 0, "echo started; sleep 1; echo done", 30, Map.of()));
+                case StepChunk chunk when chunk.text().contains("started") -> h.send(phaseTwo());
+                case StepFinished f -> h.send(new Close());
+                default -> {}
+              }
+            });
+    host.closeAfterStep = false;
+    ScriptedWorktree worktree = worktree(() -> MirrorWorktree.Preparation.READY);
+
+    int code =
+        runDaemon(tokenEnv(host.url("/ci/daemon")), worktree, 30, 10_000).get(30, TimeUnit.SECONDS);
+    host.awaitDrained();
+
+    assertEquals(ExitCode.OK, code);
+    ContinueFailed refused = host.first(ContinueFailed.class);
+    assertNotNull(refused, () -> "expected NOT_IDLE in " + host.received);
+    assertEquals("run-10", refused.runId());
+    assertEquals(ContinueFailed.Reason.NOT_IDLE, refused.reason());
+    assertNull(host.first(Continued.class));
+    assertTrue(worktree.continuations.isEmpty(), "the worktree was not touched");
+    StepFinished finished = host.first(StepFinished.class);
+    assertEquals(0, finished.exitCode());
+    assertFalse(finished.timedOut());
+    StringBuilder out = new StringBuilder();
+    host.all(StepChunk.class).forEach(chunk -> out.append(chunk.text()));
+    assertEquals("started\ndone\n", out.toString());
+  }
+
+  @Test
+  void aContinueWhoseShaCannotBeFetchedIsReportedAndTheDaemonStaysUpUntilClose()
+      throws Exception {
+    AtomicInteger stepsAfterFailure = new AtomicInteger();
+    Host host =
+        host(
+            (h, message) -> {
+              switch (message) {
+                case Hello hello -> h.send(new Ack(CiDaemonProtocol.CAPABILITY_VERSION));
+                case Initialized i -> h.send(new RunStep("p1", 0, "true", 30, Map.of()));
+                case StepFinished f when f.correlationId().equals("p1") -> h.send(phaseTwo());
+                case ContinueFailed failed ->
+                    // Answered only after a pause: the daemon has to still be there for it.
+                    vertx.setTimer(300, id -> h.send(new Close()));
+                case StepFinished f -> stepsAfterFailure.incrementAndGet();
+                default -> {}
+              }
+            });
+    host.closeAfterStep = false;
+    ScriptedWorktree worktree = worktree(() -> MirrorWorktree.Preparation.READY);
+    worktree.continuation =
+        new MirrorWorktree.Continuation(
+            ContinueFailed.Reason.FETCH_FAILED, "fatal: couldn't find remote ref refs/tags/x");
+
+    int code =
+        runDaemon(tokenEnv(host.url("/ci/daemon")), worktree, 30, 10_000).get(30, TimeUnit.SECONDS);
+    host.awaitDrained();
+
+    assertEquals(ExitCode.OK, code);
+    ContinueFailed failed = host.first(ContinueFailed.class);
+    assertEquals(
+        new ContinueFailed(
+            "run-10",
+            ContinueFailed.Reason.FETCH_FAILED,
+            "fatal: couldn't find remote ref refs/tags/x"),
+        failed);
+    assertNull(host.first(Continued.class));
+    assertEquals(0, stepsAfterFailure.get());
+    assertEquals(1, worktree.removals.get());
+  }
+
+  @Test
+  void aReDialAfterAContinuePresentsTheNewRunsTokenAndResendsTheUnansweredContinued()
+      throws Exception {
+    List<String> bearers = Collections.synchronizedList(new ArrayList<>());
+    Host host =
+        host(
+            (h, message) -> {
+              switch (message) {
+                case Hello hello -> {
+                  bearers.add(h.headers.get(ControlSocket.HEADER_AUTHORIZATION));
+                  h.send(new Ack(CiDaemonProtocol.CAPABILITY_VERSION));
+                }
+                case Initialized i -> h.send(new RunStep("p1", 0, "true", 30, Map.of()));
+                case StepFinished f when f.correlationId().equals("p1") -> h.send(phaseTwo());
+                case Continued c when h.upgrades.get() == 1 ->
+                    h.socket.close(); // the edge goes away before the host answered it
+                case Continued c ->
+                    h.send(new RunStep("p2", 0, "echo \"$QITS_TOKEN\"", 30, Map.of()));
+                case StepFinished f -> h.send(new Close());
+                default -> {}
+              }
+            });
+    host.closeAfterStep = false;
+
+    int code =
+        runDaemon(tokenEnv(host.url("/ci/daemon")), ready(), 30, 10_000, 10_000)
+            .get(30, TimeUnit.SECONDS);
+    host.awaitDrained();
+
+    assertEquals(ExitCode.OK, code);
+    assertEquals(2, host.upgrades.get(), "one re-dial");
+    assertEquals(List.of("Bearer run-t0ken", "Bearer next-t0ken"), bearers);
+    assertEquals(
+        1,
+        host.receivedOn(2).stream().filter(Continued.class::isInstance).count(),
+        () -> "Continued sent again on the new socket: " + host.receivedOn(2));
+    assertEquals(
+        List.of("p1", "p2"),
+        host.all(StepFinished.class).stream().map(StepFinished::correlationId).toList());
   }
 
   @Test
@@ -1067,6 +1283,19 @@ class DaemonMainTest {
     @Override
     public void remove() {
       removals.incrementAndGet();
+    }
+
+    /** What a Continue does to this worktree; done unless a test says otherwise. */
+    volatile MirrorWorktree.Continuation continuation = MirrorWorktree.Continuation.DONE;
+
+    /** The (branch, sha, env) of every continueAt, in order. */
+    final List<List<Object>> continuations = Collections.synchronizedList(new ArrayList<>());
+
+    @Override
+    public MirrorWorktree.Continuation continueAt(
+        String branch, String sha, Map<String, String> env) {
+      continuations.add(List.of(branch, sha, env));
+      return continuation;
     }
   }
 

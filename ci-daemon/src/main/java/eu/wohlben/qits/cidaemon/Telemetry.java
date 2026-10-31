@@ -97,8 +97,10 @@ public final class Telemetry extends Handler {
   private final Vertx vertx;
   private final Http http;
   private final String endpoint;
-  private final Map<String, String> headers;
-  private final Map<String, String> resource;
+  /** Swapped whole by {@link #continueAs}; every request reads the current one. */
+  private volatile Map<String, String> headers;
+
+  private volatile Map<String, String> resource;
   private final Settings settings;
   private final LongSupplier clock;
   private final Spans spans;
@@ -148,6 +150,34 @@ public final class Telemetry extends Handler {
     this.output = new StepOutput(settings.outputMaxLines());
     this.queue = new ArrayBlockingQueue<>(Math.max(1, settings.capacity()));
     setLevel(Level.INFO);
+  }
+
+  /**
+   * The lease now serves the next run of its release request (qits-732): every later request
+   * carries {@code token} — the first run's is deleted when that run closes, so the final flush
+   * would otherwise be refused — and is labelled with the new run's id, branch and sha. The trace
+   * stays the lease's: its root span covers both runs and its id was seeded from the first run's.
+   * A label of the first run's that is already queued is sent under the new one, which costs a
+   * line's attribution and never a line.
+   */
+  public void continueAs(String token, String runId, String branch, String sha) {
+    headers =
+        Map.of(
+            "Content-Type", "application/x-protobuf",
+            "Authorization", "Bearer " + (token == null ? "" : token));
+    Map<String, String> next = new LinkedHashMap<>(resource);
+    replace(next, "qits.ci.run_id", runId);
+    replace(next, "vcs.ref.head.name", branch);
+    replace(next, "vcs.ref.head.revision", sha);
+    resource = Map.copyOf(next);
+  }
+
+  private static void replace(Map<String, String> resource, String key, String value) {
+    if (value == null || value.isBlank()) {
+      resource.remove(key);
+    } else {
+      resource.put(key, value.trim());
+    }
   }
 
   /**

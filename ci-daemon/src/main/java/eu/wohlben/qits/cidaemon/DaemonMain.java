@@ -49,7 +49,8 @@ import org.jboss.logging.Logger;
  * running or queued — and otherwise answered {@code ContinueFailed{NOT_IDLE}} with the current run
  * untouched. On the lane it swaps the run-scoped identity ({@link RunIdentity}: the bearer the
  * socket re-dials and the telemetry posts with, and the env layer each later step gets between the
- * lease env and its own), moves the same worktree to the new sha without cleaning it, resets the
+ * lease env and its own), re-points the credentials the bootstrap baked into the container at the
+ * new token ({@link CredentialRefresh}), moves the same worktree to the new sha without cleaning it, resets the
  * step index so {@code RunStep{0}} runs again — the lease-wide output {@code seq} goes on counting —
  * and answers {@code Continued}, or {@code ContinueFailed} and stays up for the host's {@code
  * Close}.
@@ -114,6 +115,9 @@ public final class DaemonMain implements ControlSocket.Listener {
   private final Worktree worktree;
   private final Steps steps;
   private final Telemetry telemetry;
+
+  /** The bootstrap's baked credentials, re-pointed on a Continue. */
+  private final CredentialRefresh credentials;
 
   /** Off-event-loop pool for what must not wait behind the lane: a cancel's kill and its grace. */
   private final ExecutorService workers =
@@ -226,6 +230,18 @@ public final class DaemonMain implements ControlSocket.Listener {
       Worktree worktree,
       Steps steps,
       Telemetry telemetry) {
+    this(vertx, env, settings, worktree, steps, telemetry, CredentialRefresh.none());
+  }
+
+  public DaemonMain(
+      Vertx vertx,
+      DaemonEnv env,
+      ControlSocket.Settings settings,
+      Worktree worktree,
+      Steps steps,
+      Telemetry telemetry,
+      CredentialRefresh credentials) {
+    this.credentials = credentials;
     this.env = env;
     this.worktree = worktree;
     this.steps = steps;
@@ -487,8 +503,23 @@ public final class DaemonMain implements ControlSocket.Listener {
         span.end("the lease ended before the Continue ran");
         return;
       }
-      identity.continueAs(next);
+      String oldToken = identity.token();
+      String newToken = next.token() == null || next.token().isBlank() ? oldToken : next.token();
+      identity.continueAs(next, credentials.inheritedOverlay(oldToken, newToken, next.env()));
       telemetry.continueAs(identity.token(), next.runId(), next.branch(), next.sha());
+      // Before the worktree moves and before Continued: the host revokes the first run's token on
+      // Continued, and a file the bootstrap baked it into would refuse every later step. No new
+      // wire reason — the host decodes against the released enum — so CHECKOUT_FAILED with a
+      // "credentials:" detail.
+      String unwritten = credentials.refresh(oldToken, newToken, next.env());
+      if (unwritten != null) {
+        String detail = "credentials: " + unwritten;
+        LOG.errorf("ci-daemon could not continue as run %s: %s", next.runId(), detail);
+        span.end("ContinueFailed CHECKOUT_FAILED: " + detail);
+        answerContinue(
+            new ContinueFailed(next.runId(), ContinueFailed.Reason.CHECKOUT_FAILED, detail));
+        return;
+      }
       LOG.infof(
           "ci-daemon continuing as run %s at %s (%s), presenting its token (subject %s).",
           next.runId(),

@@ -427,6 +427,133 @@ class DaemonMainTest {
         host.all(StepFinished.class).stream().map(StepFinished::correlationId).toList());
   }
 
+  private static final String NEW_AUTH = "{\"auths\":{\"registry.qits.example\":{\"auth\":\"bmV4dA==\"}}}";
+
+  /** phaseTwo() as a lease with a registry credential receives it. */
+  private static Continue phaseTwoWithRegistry() {
+    Map<String, String> env = new java.util.HashMap<>(phaseTwo().env());
+    env.put("QITS_CI_REGISTRY_AUTH_CONFIG", NEW_AUTH);
+    Continue base = phaseTwo();
+    return new Continue(base.runId(), base.branch(), base.sha(), base.token(), env);
+  }
+
+  /** Phase 1, then the Continue, then one phase-2 step running {@code script}, then Close. */
+  private Host continuingHost(Continue next, String script) throws Exception {
+    Host host =
+        host(
+            (h, message) -> {
+              switch (message) {
+                case Hello hello -> h.send(new Ack(CiDaemonProtocol.CAPABILITY_VERSION));
+                case Initialized i -> h.send(new RunStep("p1", 0, "true", 30, Map.of()));
+                case StepFinished f when f.correlationId().equals("p1") -> h.send(next);
+                case Continued c -> h.send(new RunStep("p2", 0, script, 30, Map.of()));
+                case ContinueFailed failed -> vertx.setTimer(300, id -> h.send(new Close()));
+                case StepFinished f -> h.send(new Close());
+                default -> {}
+              }
+            });
+    host.closeAfterStep = false;
+    return host;
+  }
+
+  private CompletableFuture<Integer> runDaemon(
+      DaemonEnv env, DaemonMain.Worktree initializer, CredentialRefresh credentials) {
+    DaemonMain daemon =
+        new DaemonMain(
+            vertx,
+            env,
+            new ControlSocket.Settings(10_000, 30, 50, 200, 2_000),
+            initializer,
+            this::step,
+            Telemetry.off(),
+            credentials);
+    return CompletableFuture.supplyAsync(daemon::run);
+  }
+
+  @Test
+  void aContinueRePointsEveryCredentialTheBootstrapBakedAtTheNewRunsToken() throws Exception {
+    Path baked = workDir.resolve("baked");
+    Path docker = baked.resolve("docker");
+    Files.createDirectories(docker);
+    Files.writeString(docker.resolve("config.json"), "{\"auths\":{\"x\":{\"auth\":\"b2xk\"}}}");
+    Path deploy = baked.resolve("qits-deploy-settings.xml");
+    Files.writeString(
+        deploy,
+        "<value>Bearer run-t0ken</value>\n<value>Bearer run-t0ken</value>\n"
+            + "<value>Bearer run-t0ken</value>\n");
+    Files.setPosixFilePermissions(
+        deploy, java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
+    Path npmrc = baked.resolve("home/.npmrc");
+    Files.createDirectories(npmrc.getParent());
+    Files.writeString(
+        npmrc,
+        "color=false\n//registry.qits.example/:_authToken=run-t0ken\n"
+            + "//mirror.qits.example/:_authToken=run-t0ken\n");
+    CredentialRefresh credentials =
+        new CredentialRefresh(
+            Map.of("QITS_PUBLISH_TOKEN", "run-t0ken", "QITS_TOKEN", "run-t0ken", "CI", "true"),
+            docker,
+            deploy,
+            npmrc);
+    Host host = continuingHost(phaseTwoWithRegistry(), "echo \"publish=$QITS_PUBLISH_TOKEN\"");
+
+    int code =
+        runDaemon(tokenEnv(host.url("/ci/daemon")), ready(), credentials).get(30, TimeUnit.SECONDS);
+    host.awaitDrained();
+
+    assertEquals(ExitCode.OK, code);
+    assertEquals(new Continued("run-10"), host.first(Continued.class), host.received::toString);
+    assertEquals(NEW_AUTH, Files.readString(docker.resolve("config.json")));
+    assertEquals(
+        "rw-------",
+        java.nio.file.attribute.PosixFilePermissions.toString(
+            Files.getPosixFilePermissions(docker.resolve("config.json"))));
+    String settings = Files.readString(deploy);
+    assertFalse(settings.contains("run-t0ken"), settings);
+    assertEquals(3, settings.split("Bearer next-t0ken", -1).length - 1, settings);
+    assertEquals(
+        "rw-------",
+        java.nio.file.attribute.PosixFilePermissions.toString(
+            Files.getPosixFilePermissions(deploy)));
+    assertEquals(
+        "color=false\n//registry.qits.example/:_authToken=next-t0ken\n"
+            + "//mirror.qits.example/:_authToken=next-t0ken\n",
+        Files.readString(npmrc));
+    StringBuilder out = new StringBuilder();
+    host.all(StepChunk.class).forEach(chunk -> out.append(chunk.text()));
+    assertEquals("publish=next-t0ken\n", out.toString());
+    try (var left = Files.list(baked)) {
+      assertTrue(
+          left.noneMatch(p -> p.getFileName().toString().endsWith(".tmp")), "no temp file left");
+    }
+  }
+
+  @Test
+  void aCredentialFileThatCannotBeWrittenFailsTheContinueAndTheDaemonStaysUpUntilClose()
+      throws Exception {
+    Path notADirectory = workDir.resolve("a-file");
+    Files.writeString(notADirectory, "x");
+    CredentialRefresh credentials =
+        new CredentialRefresh(Map.of(), notADirectory.resolve("docker"), null, null);
+    ScriptedWorktree worktree = worktree(() -> MirrorWorktree.Preparation.READY);
+    Host host = continuingHost(phaseTwoWithRegistry(), "true");
+
+    int code =
+        runDaemon(tokenEnv(host.url("/ci/daemon")), worktree, credentials)
+            .get(30, TimeUnit.SECONDS);
+    host.awaitDrained();
+
+    assertEquals(ExitCode.OK, code);
+    ContinueFailed failed = host.first(ContinueFailed.class);
+    assertNotNull(failed, host.received::toString);
+    assertEquals(ContinueFailed.Reason.CHECKOUT_FAILED, failed.reason());
+    assertTrue(failed.detail().startsWith("credentials: "), failed.detail());
+    assertFalse(failed.detail().contains("next-t0ken"), failed.detail());
+    assertNull(host.first(Continued.class));
+    assertTrue(worktree.continuations.isEmpty(), "the worktree does not move under bad credentials");
+    assertEquals(List.of("p1"), host.all(StepFinished.class).stream().map(StepFinished::correlationId).toList());
+  }
+
   @Test
   void aMatchingAckIsConfirmedBeforeTheCloneStarts() throws Exception {
     Host host = host((h, message) -> h.reply(message));

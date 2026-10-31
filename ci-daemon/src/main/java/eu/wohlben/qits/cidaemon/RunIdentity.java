@@ -38,10 +38,13 @@ final class RunIdentity {
   /**
    * Become {@code next}'s run. The overlay is its {@code env} with {@code QITS_TOKEN} set to its
    * token — the frame's field wins over an env entry, because the field is the bearer the host
-   * actually commissioned and the two must not disagree in a step.
+   * actually commissioned and the two must not disagree in a step. {@code inherited} — lease
+   * variables still holding the old token ({@link CredentialRefresh#inheritedOverlay}) — sits
+   * underneath both.
    */
-  synchronized void continueAs(Continue next) {
-    Map<String, String> env = new LinkedHashMap<>(next.env());
+  synchronized void continueAs(Continue next, Map<String, String> inherited) {
+    Map<String, String> env = new LinkedHashMap<>(inherited == null ? Map.of() : inherited);
+    env.putAll(next.env());
     if (next.token() != null && !next.token().isBlank()) {
       env.put("QITS_TOKEN", next.token());
     }

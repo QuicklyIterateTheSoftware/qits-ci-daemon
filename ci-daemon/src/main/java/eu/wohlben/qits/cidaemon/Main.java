@@ -229,7 +229,10 @@ public class Main {
                       // has always completed by the time a step runs (the lane orders them).
                       worktree.shell(),
                       worktree.processGroups()),
-              telemetry)
+              telemetry,
+              // The process environment, not DaemonEnv: it is what every step child inherits,
+              // the bootstrap's exports (QITS_PUBLISH_TOKEN) included.
+              CredentialRefresh.fromEnvironment(System.getenv()))
           .run();
     }
 

@@ -153,7 +153,13 @@ run (the build of the cut tag) share one lease. After phase 1's last `StepFinish
 queued — and otherwise answers `ContinueFailed{NOT_IDLE}` and leaves the run alone. Then, on the
 lane: the run-scoped identity becomes the new run's (the bearer the socket re-dials with and the
 telemetry posts with, and an env layer — `Continue.env` plus `QITS_TOKEN` — that every later step
-gets between the lease env and its own `RunStep.env`); `refs/tags/<branch>` is fetched into the
+gets between the lease env and its own `RunStep.env`, plus every lease variable that still holds
+the old token, `QITS_PUBLISH_TOKEN` above all); the credentials the ci-slot bootstrap baked into
+the container are re-pointed (`CredentialRefresh`: `$DOCKER_CONFIG/config.json` rewritten whole from
+the new `QITS_CI_REGISTRY_AUTH_CONFIG`, the old token replaced by the new one in
+`/tmp/qits-deploy-settings.xml` and `$HOME/.npmrc`, each written atomically and owner-only; a
+failure answers `ContinueFailed{CHECKOUT_FAILED, "credentials: …"}`), because the host revokes the
+first run's token once it reads `Continued`; `refs/tags/<branch>` is fetched into the
 mirror under its lock with the new token in git's env (the sha itself as the fallback; skipped when
 the mirror already has it); `git checkout --force --detach <sha>` runs in the **same** `/work/<runId>`
 — no `git clean`, so `target/`, `node_modules/` and the rest of phase 1's untracked output stay

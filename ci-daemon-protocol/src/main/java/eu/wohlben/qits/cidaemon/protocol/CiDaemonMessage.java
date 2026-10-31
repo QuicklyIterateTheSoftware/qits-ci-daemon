@@ -16,4 +16,7 @@ public sealed interface CiDaemonMessage
         Ack,
         RunStep,
         Cancel,
-        Close {}
+        Close,
+        Continue,
+        Continued,
+        ContinueFailed {}

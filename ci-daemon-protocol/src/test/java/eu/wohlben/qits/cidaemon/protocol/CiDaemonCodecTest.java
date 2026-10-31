@@ -1,7 +1,9 @@
 package eu.wohlben.qits.cidaemon.protocol;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -228,9 +230,99 @@ class CiDaemonCodecTest {
   }
 
   @Test
-  void theCapabilityVersionIsTwo() {
+  void theCapabilityVersionIsThree() {
     // Pinned so a bump is a deliberate edit rather than a side effect. It reaches qits-ci as a
-    // version bump of this jar, and the host's side of the skew is decided there.
-    assertEquals(2, CiDaemonProtocol.CAPABILITY_VERSION);
+    // version bump of this jar, and the host's side of the skew is decided there. 3 is qits-732's
+    // Continue.
+    assertEquals(3, CiDaemonProtocol.CAPABILITY_VERSION);
+  }
+
+  @Test
+  void anAckOfEitherCapabilityTwoOrThreeRoundTripsUnchanged() {
+    // The daemon accepts both — a capability-2 host simply never sends Continue — and it can only
+    // tell them apart if the codec hands it the number it received.
+    assertEquals(new Ack(2), roundTrip(new Ack(2)));
+    assertEquals(new Ack(3), roundTrip(new Ack(3)));
+  }
+
+  @Test
+  void continueRoundTripsWithItsRunIdentityAndEnv() {
+    Continue next =
+        new Continue(
+            "run-2",
+            "2026.1031.120000",
+            "0123456789abcdef0123456789abcdef01234567",
+            "qits_tok_secret",
+            Map.of("QITS_CI_RUN_ID", "run-2", "QITS_TOKEN", "qits_tok_secret"));
+    assertEquals(next, roundTrip(next));
+    Map<String, Object> map = CiDaemonCodec.encode(next);
+    assertEquals(CiDaemonProtocol.Type.CONTINUE, map.get(CiDaemonProtocol.Field.TYPE));
+    assertEquals("run-2", map.get(CiDaemonProtocol.Field.RUN_ID));
+    assertEquals("2026.1031.120000", map.get(CiDaemonProtocol.Field.BRANCH));
+    assertEquals("qits_tok_secret", map.get(CiDaemonProtocol.Field.TOKEN));
+    // Nested, never flattened, like RunStep's.
+    assertEquals(
+        Map.of("QITS_CI_RUN_ID", "run-2", "QITS_TOKEN", "qits_tok_secret"),
+        map.get(CiDaemonProtocol.Field.ENV));
+  }
+
+  @Test
+  void continueWithoutAnEnvDecodesToAnEmptyOne() {
+    Map<String, Object> map =
+        new LinkedHashMap<>(CiDaemonCodec.encode(new Continue("r", "b", "abc1234", "t", null)));
+    map.remove(CiDaemonProtocol.Field.ENV);
+    assertEquals(Map.of(), ((Continue) CiDaemonCodec.decode(map)).env());
+  }
+
+  @Test
+  void aContinueNeverPrintsItsTokenOrItsEnvValues() {
+    Continue next =
+        new Continue(
+            "run-2",
+            "v1",
+            "abc1234",
+            "qits_tok_secret",
+            Map.of(
+                "QITS_TOKEN", "qits_tok_secret",
+                "QITS_MAVEN_AUTH_PSW", "maven-secret",
+                "QITS_CI_REGISTRY_AUTH_CONFIG", "{\"auths\":{}}"));
+    String printed = next.toString();
+    assertFalse(printed.contains("qits_tok_secret"), printed);
+    assertFalse(printed.contains("maven-secret"), printed);
+    assertFalse(printed.contains("auths"), printed);
+    assertTrue(printed.contains("run-2"), printed);
+    assertTrue(printed.contains("QITS_MAVEN_AUTH_PSW"), "keys are named: " + printed);
+  }
+
+  @Test
+  void continuedRoundTrips() {
+    Continued continued = new Continued("run-2");
+    assertEquals(continued, roundTrip(continued));
+    assertEquals(
+        CiDaemonProtocol.Type.CONTINUED,
+        CiDaemonCodec.encode(continued).get(CiDaemonProtocol.Field.TYPE));
+  }
+
+  @Test
+  void continueFailedRoundTripsEveryReason() {
+    for (ContinueFailed.Reason reason : ContinueFailed.Reason.values()) {
+      ContinueFailed failed = new ContinueFailed("run-2", reason, "fatal: no such ref");
+      assertEquals(failed, roundTrip(failed));
+    }
+    Map<String, Object> map =
+        CiDaemonCodec.encode(new ContinueFailed("run-2", ContinueFailed.Reason.NOT_IDLE, null));
+    assertEquals(CiDaemonProtocol.Type.CONTINUE_FAILED, map.get(CiDaemonProtocol.Field.TYPE));
+    assertEquals("NOT_IDLE", map.get(CiDaemonProtocol.Field.REASON));
+  }
+
+  @Test
+  void decodeRejectsAnUnknownContinueFailureReason() {
+    Map<String, Object> map =
+        Map.of(
+            CiDaemonProtocol.Field.TYPE,
+            CiDaemonProtocol.Type.CONTINUE_FAILED,
+            CiDaemonProtocol.Field.REASON,
+            "DISK_FULL");
+    assertThrows(IllegalArgumentException.class, () -> CiDaemonCodec.decode(map));
   }
 }

@@ -70,6 +70,25 @@ public final class CiDaemonCodec {
         map.put(Field.CORRELATION_ID, m.correlationId());
       }
       case Close _ -> map.put(Field.TYPE, Type.CLOSE); // no fields beyond the tag
+      case Continue m -> {
+        map.put(Field.TYPE, Type.CONTINUE);
+        map.put(Field.RUN_ID, m.runId());
+        map.put(Field.BRANCH, m.branch());
+        map.put(Field.SHA, m.sha());
+        map.put(Field.TOKEN, m.token());
+        // Nested, like RunStep's: the env's keys must never share a namespace with the frame's.
+        map.put(Field.ENV, new LinkedHashMap<>(m.env()));
+      }
+      case Continued m -> {
+        map.put(Field.TYPE, Type.CONTINUED);
+        map.put(Field.RUN_ID, m.runId());
+      }
+      case ContinueFailed m -> {
+        map.put(Field.TYPE, Type.CONTINUE_FAILED);
+        map.put(Field.RUN_ID, m.runId());
+        map.put(Field.REASON, m.reason() == null ? null : m.reason().name());
+        map.put(Field.DETAIL, m.detail());
+      }
     }
     return map;
   }
@@ -109,6 +128,17 @@ public final class CiDaemonCodec {
               stringMap(map, Field.ENV));
       case Type.CANCEL -> new Cancel(str(map, Field.CORRELATION_ID));
       case Type.CLOSE -> new Close();
+      case Type.CONTINUE ->
+          new Continue(
+              str(map, Field.RUN_ID),
+              str(map, Field.BRANCH),
+              str(map, Field.SHA),
+              str(map, Field.TOKEN),
+              stringMap(map, Field.ENV));
+      case Type.CONTINUED -> new Continued(str(map, Field.RUN_ID));
+      case Type.CONTINUE_FAILED ->
+          new ContinueFailed(
+              str(map, Field.RUN_ID), continueReason(map, Field.REASON), str(map, Field.DETAIL));
       default -> throw new IllegalArgumentException("unknown ci-daemon message type: " + type);
     };
   }
@@ -170,5 +200,11 @@ public final class CiDaemonCodec {
   private static InitFailed.Reason reason(Map<String, Object> map, String key) {
     String value = str(map, key);
     return value == null ? null : InitFailed.Reason.valueOf(value);
+  }
+
+  /** As {@link #reason}: absent decodes to {@code null}, unknown throws. */
+  private static ContinueFailed.Reason continueReason(Map<String, Object> map, String key) {
+    String value = str(map, key);
+    return value == null ? null : ContinueFailed.Reason.valueOf(value);
   }
 }

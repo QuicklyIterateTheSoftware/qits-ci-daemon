@@ -18,7 +18,8 @@ import org.eclipse.microprofile.config.inject.ConfigProperty;
 /**
  * Entry point, and <b>the one CDI shell</b>: it resolves configuration, news up the plain classes
  * that do the work, and hands its exit code back to the runtime. Everything below it — {@link
- * DaemonMain}, {@link ControlSocket}, {@link MirrorWorktree}, {@link StepProcess} — is a plain
+ * DaemonMain}, {@link ControlSocket}, {@link MirrorWorktree}, {@link StepProcess}, {@link
+ * BuilderGate} — is a plain
  * class with a plain constructor, which is what makes the suite able to drive the whole flow
  * without a container.
  *
@@ -136,6 +137,12 @@ public class Main {
     @ConfigProperty(name = "qits.ci.step-kill-grace-ms", defaultValue = "5000")
     long stepKillGraceMillis;
 
+    // qits-1807: the cap on how long a step's clock may stand still while its builds wait for the
+    // target's shared buildkitd, and the shim's own bound on one build's wait. A step's env value of
+    // QITS_CI_BUILDER_WAIT_MAX_SECONDS wins over this; see BuilderGate.
+    @ConfigProperty(name = "qits.ci.builder-wait-max-seconds", defaultValue = "3600")
+    long builderWaitMaxSeconds;
+
     /** Flush on a newline, on this many characters, or on the interval below — whichever first. */
     @ConfigProperty(name = "qits.ci.step-chunk-max-chars", defaultValue = "8192")
     int stepChunkMaxChars;
@@ -206,6 +213,14 @@ public class Main {
               Duration.ofSeconds(worktreeStaleAfterSeconds));
       // One counter for every step of the lease; see StepProcess on seq.
       AtomicLong seq = new AtomicLong();
+      // qits-1807: the buildctl shim, resolved and written once per lease — the image does not
+      // change under a running container, and every step then shares one answer.
+      BuilderGate gate =
+          BuilderGate.install(
+              BuilderGate.DEFAULT_BIN_DIR,
+              BuilderGate.DEFAULT_CLOCK_ROOT,
+              System.getenv("PATH"),
+              builderWaitMaxSeconds);
       return new DaemonMain(
               vertx,
               env,
@@ -228,7 +243,9 @@ public class Main {
                       // Read here rather than captured above: initialization decides them, and it
                       // has always completed by the time a step runs (the lane orders them).
                       worktree.shell(),
-                      worktree.processGroups()),
+                      worktree.processGroups(),
+                      gate,
+                      1000),
               telemetry,
               // The process environment, not DaemonEnv: it is what every step child inherits,
               // the bootstrap's exports (QITS_PUBLISH_TOKEN) included.

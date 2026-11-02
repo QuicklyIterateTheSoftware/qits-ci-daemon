@@ -10,14 +10,21 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.Reader;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * The step's script, running as this daemon's child. {@code <shell> -c <script>} with the checkout as
@@ -49,6 +56,16 @@ import java.util.function.Consumer;
  * host when a later step's output is replayed after an outage. Two pumps racing to allocate and then emitting out of order would show the host a gap —
  * the exact thing the counter exists to detect — so the allocation and the emission are one atomic
  * step rather than two.
+ *
+ * <p><b>The clock pauses while a build waits for the builder (qits-1807).</b> Every lease on a
+ * target shares one buildkitd, and time a build spends queued for it is the target's congestion,
+ * not the step's work. The {@link BuilderGate}'s {@code buildctl} shim leaves {@code
+ * $QITS_CI_STEP_CLOCK_DIR/wait-<pid>} while it waits, and the deadline below spends its budget only
+ * while no <em>live</em> marker is there: one whose pid is this step's shell or one of its
+ * descendants, and running. That is the one place script-written data steers this daemon, so it is
+ * bounded twice: a marker naming a process outside the step counts for nothing, and the paused time
+ * is capped at {@code QITS_CI_BUILDER_WAIT_MAX_SECONDS} — past it the clock runs whatever the
+ * directory says, so a forged marker buys at most the cap the shim itself would have waited.
  */
 public final class StepProcess implements Step {
 
@@ -58,6 +75,15 @@ public final class StepProcess implements Step {
   private final int maxChunkChars;
   private final long flushIntervalMillis;
   private final long killGraceMillis;
+
+  /** The shim and the clock directory; {@link BuilderGate#none()} keeps the plain wall clock. */
+  private final BuilderGate gate;
+
+  /** How often the deadline loop looks at the clock directory. A second in production. */
+  private final long tickMillis;
+
+  /** {@code wait-<pid>}, exactly: the shim's {@code .tmp} and anything else are not markers. */
+  private static final Pattern MARKER = Pattern.compile("wait-([0-9]{1,10})");
 
   /**
    * The shell to run the script under, decided by {@code MirrorWorktree.probeTooling()} and passed in
@@ -91,6 +117,34 @@ public final class StepProcess implements Step {
       long killGraceMillis,
       String shell,
       boolean processGroup) {
+    this(
+        workDir,
+        request,
+        emit,
+        seq,
+        maxChunkChars,
+        flushIntervalMillis,
+        killGraceMillis,
+        shell,
+        processGroup,
+        BuilderGate.none(),
+        1000);
+  }
+
+  public StepProcess(
+      Path workDir,
+      RunStep request,
+      Consumer<CiDaemonMessage> emit,
+      AtomicLong seq,
+      int maxChunkChars,
+      long flushIntervalMillis,
+      long killGraceMillis,
+      String shell,
+      boolean processGroup,
+      BuilderGate gate,
+      long tickMillis) {
+    this.gate = gate == null ? BuilderGate.none() : gate;
+    this.tickMillis = Math.max(10, tickMillis);
     this.shell = shell == null || shell.isBlank() ? "sh" : shell;
     this.seq = seq;
     this.processGroup = processGroup;
@@ -119,14 +173,25 @@ public final class StepProcess implements Step {
     argv.add("-c");
     argv.add(request.script() == null ? "" : request.script());
     Process started;
+    Optional<Path> clockDir = Optional.empty();
+    long waitMaxSeconds;
     try {
       ProcessBuilder builder = new ProcessBuilder(argv);
       builder.directory(workDir.toFile());
       // The step's env over the lease's, for this child only. A key the OS cannot hold (a '=' or a
       // NUL in it) is refused here as IllegalArgumentException, which ends as a failed spawn.
-      builder.environment().putAll(request.env());
+      Map<String, String> environment = builder.environment();
+      environment.putAll(request.env());
+      // The run is the one the step env names — after a Continue that is the next run, whose step
+      // indices start from 0 again — so two runs of one lease never share a clock directory.
+      String runId = environment.getOrDefault("QITS_CI_RUN_ID", request.correlationId());
+      clockDir = gate.clockDirFor(runId, request.stepIndex());
+      waitMaxSeconds = gate.waitMaxSeconds(environment);
+      // Last, over the step's own env: the clock directory and the real buildctl are the daemon's.
+      environment.putAll(gate.stepEnv(environment, clockDir));
       started = builder.start();
     } catch (IOException | IllegalArgumentException e) {
+      clockDir.ifPresent(BuilderGate::deleteClockDir);
       // A failed spawn still has to produce a terminal frame, or the host's await runs to timeout
       // and records a stalled step instead of a step that could not start. 127 is the shell's own
       // "command not found", which is what this is.
@@ -158,7 +223,7 @@ public final class StepProcess implements Step {
     boolean timedOut = false;
     try {
       if (request.timeoutSeconds() > 0) {
-        if (!started.waitFor(request.timeoutSeconds(), TimeUnit.SECONDS)) {
+        if (!awaitDeadline(started, clockDir, waitMaxSeconds)) {
           // The deadline is enforced HERE, by the process's parent, so a timeout is a recorded
           // outcome rather than a container the host reaps for going quiet. The host keeps a longer
           // deadline behind this one for a daemon that stops answering at all.
@@ -187,6 +252,7 @@ public final class StepProcess implements Step {
     flusher.shutdownNow();
     out.flushPending();
     err.flushPending();
+    clockDir.ifPresent(BuilderGate::deleteClockDir);
 
     int exitCode;
     try {
@@ -198,6 +264,165 @@ public final class StepProcess implements Step {
     // they are different outcomes to the person reading the run, and the exit code cannot tell them
     // apart because it is the kill's either way.
     return new StepFinished(request.correlationId(), request.stepIndex(), exitCode, timedOut);
+  }
+
+  /**
+   * Wait for the child, spending {@code timeoutSeconds} only while no live builder-wait marker is
+   * in {@code clockDir}. True when the child ended within its budget, false at the deadline.
+   *
+   * <p>Each tick's elapsed time is charged to what the previous tick saw: a pause is noticed up to
+   * a tick late and ends up to a tick late, which is a second either way and never in the step's
+   * favour by more than that. Without a clock directory this is the old single {@code waitFor}.
+   */
+  private boolean awaitDeadline(Process started, Optional<Path> clockDir, long waitMaxSeconds)
+      throws InterruptedException {
+    long budget = TimeUnit.SECONDS.toNanos(request.timeoutSeconds());
+    if (clockDir.isEmpty()) {
+      return started.waitFor(budget, TimeUnit.NANOSECONDS);
+    }
+    long cap = TimeUnit.SECONDS.toNanos(waitMaxSeconds);
+    long spent = 0;
+    long paused = 0;
+    boolean capReached = false;
+    String pausedFor = null; // the builder of the pause in progress, null while the clock runs
+    long pauseStarted = 0;
+    long last = System.nanoTime();
+    while (true) {
+      long wait =
+          pausedFor != null ? tickMillis : Math.min(tickMillis, nanosToMillisCeil(budget - spent));
+      if (started.waitFor(Math.max(1, wait), TimeUnit.MILLISECONDS)) {
+        if (pausedFor != null) {
+          resumed(System.nanoTime() - pauseStarted, pausedFor, budget - spent);
+        }
+        return true;
+      }
+      long now = System.nanoTime();
+      long elapsed = now - last;
+      last = now;
+      if (pausedFor != null) {
+        paused += elapsed;
+      } else {
+        spent += elapsed;
+      }
+      if (!capReached && paused >= cap && pausedFor != null) {
+        capReached = true;
+        emitChunk(
+            Stream.ERR,
+            "[step clock: builder wait cap of "
+                + waitMaxSeconds
+                + "s reached; the clock runs again]\n");
+        pausedFor = null;
+      }
+      String builder = capReached ? null : liveMarker(started, clockDir.get());
+      if (builder != null && pausedFor == null) {
+        pausedFor = builder;
+        pauseStarted = now;
+        emitChunk(
+            Stream.ERR,
+            "[step clock paused: waiting for builder "
+                + builder
+                + " since "
+                + Instant.now().truncatedTo(ChronoUnit.SECONDS)
+                + "]\n");
+      } else if (builder == null && pausedFor != null) {
+        resumed(now - pauseStarted, pausedFor, budget - spent);
+        pausedFor = null;
+      }
+      if (pausedFor == null && spent >= budget) {
+        return false;
+      }
+    }
+  }
+
+  private void resumed(long waitedNanos, String builder, long leftNanos) {
+    emitChunk(
+        Stream.ERR,
+        "[step clock resumed: waited "
+            + minutesSeconds(waitedNanos)
+            + " for builder "
+            + builder
+            + ", not counted; "
+            + minutesSeconds(Math.max(0, leftNanos))
+            + " left]\n");
+  }
+
+  private static long nanosToMillisCeil(long nanos) {
+    return nanos <= 0 ? 0 : (nanos + 999_999) / 1_000_000;
+  }
+
+  static String minutesSeconds(long nanos) {
+    long seconds = TimeUnit.NANOSECONDS.toSeconds(nanos);
+    return (seconds / 60) + "m" + (seconds % 60) + "s";
+  }
+
+  /**
+   * The builder named by a live marker in {@code clockDir}, or null when there is none. Live: the
+   * pid in its name is this step's shell or one of its descendants, and running. A marker naming
+   * any other process — dead, a zombie, or nothing to do with the step — is ignored, because the
+   * file is the script's to write and the pid is the only part of it the daemon can check.
+   */
+  private String liveMarker(Process started, Path clockDir) {
+    List<Path> markers;
+    try (var entries = Files.list(clockDir)) {
+      markers = entries.toList();
+    } catch (IOException | RuntimeException e) {
+      return null;
+    }
+    for (Path marker : markers) {
+      Matcher name = MARKER.matcher(marker.getFileName().toString());
+      if (!name.matches()) {
+        continue;
+      }
+      long pid = Long.parseLong(name.group(1));
+      if (!ownsLive(started, pid)) {
+        continue;
+      }
+      return builderNamedBy(marker);
+    }
+    return null;
+  }
+
+  private static boolean ownsLive(Process started, long pid) {
+    boolean ours =
+        pid == started.pid()
+            || started.toHandle().descendants().anyMatch(handle -> handle.pid() == pid);
+    if (!ours) {
+      return false;
+    }
+    // ProcessHandle reports a zombie as alive; /proc says Z. Without /proc, trust the handle.
+    try {
+      String stat = Files.readString(Path.of("/proc", String.valueOf(pid), "stat"));
+      return !stat.substring(stat.lastIndexOf(')') + 2).startsWith("Z");
+    } catch (IOException | RuntimeException e) {
+      return ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false);
+    }
+  }
+
+  /**
+   * The marker's first line, the builder's address — script-written, so it is cut to a bounded run
+   * of printable characters before it reaches a log line. {@code $BUILDKIT_HOST} from the step's
+   * env, then "the builder", when it says nothing usable.
+   */
+  private String builderNamedBy(Path marker) {
+    String first = "";
+    try {
+      byte[] head;
+      try (InputStream in = Files.newInputStream(marker)) {
+        head = in.readNBytes(512);
+      }
+      first = new String(head, StandardCharsets.UTF_8).lines().findFirst().orElse("");
+    } catch (IOException | RuntimeException e) {
+      // gone between the listing and the read: the pid was live a moment ago, so it still counts
+    }
+    String cleaned = first.replaceAll("[^\\x21-\\x7e]", "");
+    if (cleaned.length() > 200) {
+      cleaned = cleaned.substring(0, 200);
+    }
+    if (cleaned.isEmpty()) {
+      String host = request.env().getOrDefault("BUILDKIT_HOST", System.getenv("BUILDKIT_HOST"));
+      cleaned = host == null || host.isBlank() ? "the builder" : host;
+    }
+    return cleaned;
   }
 
   @Override

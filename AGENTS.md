@@ -140,6 +140,18 @@ invisible from this one, so to prune every other live run looks dead. A run's wo
 its own `worktree add --lock`, removed by its own Close, and otherwise only aged out past
 `qits.ci.worktree-stale-after-seconds`; touch no other run's entry.
 
+## The step clock reads one file the script can write (qits-1807)
+
+The one exception to "nothing the script writes is read back as instructions": a `wait-<pid>` marker
+in the step's `QITS_CI_STEP_CLOCK_DIR` stops that step's deadline clock while the `buildctl` shim
+(`BuilderGate`, resource `qits-buildctl-shim.sh`) waits for the target's shared buildkitd. Keep it
+bounded the way it is: the marker counts only while its pid is the step's shell or a descendant and
+is running, the paused time is capped at `QITS_CI_BUILDER_WAIT_MAX_SECONDS`
+(`qits.ci.builder-wait-max-seconds`, 3600), and its content only ever reaches a log line, cut to
+printable characters. The shim is POSIX `sh` (the ci-slot `/bin/sh` is dash) plus `flock`; test it
+under `sh`, never `bash`, and keep its fd 9 open across the final `exec` — the lock is the build's
+place in the queue. A build that waits past the bound exits 75. See README.md, "The builder gate".
+
 ## Formatting
 
 `google-java-format`, 100 columns, two-space indent. Javadoc explains *why* — the tradeoff, the

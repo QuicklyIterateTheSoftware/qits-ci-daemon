@@ -235,6 +235,53 @@ carrying a capability version this binary does not know, or dial failure after a
 The socket already carried whether the daemon behaved; the exit code is about whether the
 *container* did what it was started for, which is why 5 is not a zero.
 
+## The builder gate and the paused step clock (qits-1807)
+
+Every lease on a target dials the one buildkitd at `$BUILDKIT_HOST`, and a step's
+`buildctl build` that buildkitd had not started yet used to wait on the step's clock — so on a busy
+target a step could time out having built nothing. Two halves fix that:
+
+**The shim.** At startup the daemon resolves the real `buildctl` on its `PATH` (never its own shim
+directory) and, if there is one, writes `qits-buildctl-shim.sh` (a resource of `ci-daemon`, named in
+`quarkus.native.resources.includes`) to `/tmp/qits-ci-bin/buildctl` and puts that directory first on
+every step's `PATH`. An image without `buildctl` gets no shim and runs exactly as before. The shim
+is POSIX `sh` plus util-linux `flock`. Anything that is not a build (no argument is exactly `build`)
+is exec'd at once. A build takes a ticket in a lock-file queue on the target's shared cache —
+`<gate>/q/<epoch-ns>-<hostname>-<pid>`, created and `flock`ed under `<gate>/new/` and renamed into
+`q/` so no waiter ever sees an unlocked live ticket — and every second sweeps tickets whose lock is
+free (their build has ended) and counts the live ones ahead of its own. Among the first
+`QITS_CI_BUILDER_SLOTS` it execs the real `buildctl` with the same argv; the lock's fd stays open
+across the exec, so the place is held exactly as long as buildctl runs.
+
+**The clock.** `StepProcess` spends a step's `timeoutSeconds` only while its clock directory,
+`/tmp/qits-step-clock/<runId>-<stepIndex>`, holds no *live* `wait-<pid>` marker — one whose pid is the
+step's shell or a descendant of it and is running. The shim writes it (builder address, start epoch
+seconds, builds ahead) while it waits and removes it the moment it has a place. Paused time is
+capped at the builder wait max; past the cap the clock runs whatever the directory says, so a
+forged marker buys at most what the shim itself would have waited. The directory is removed after
+the step.
+
+| Env | What |
+|---|---|
+| `QITS_CI_STEP_CLOCK_DIR` | Set by the daemon on every step: where the marker goes. |
+| `QITS_CI_REAL_BUILDCTL` | Set by the daemon when the shim is installed: what it execs. |
+| `QITS_CI_BUILDER_GATE_DIR` | The queue; `/cache/git/.qits-builder-gate` unless set. Its parent missing or read-only builds ungated. |
+| `QITS_CI_BUILDER_SLOTS` | Builds the builder runs at once; `1` unless set. |
+| `QITS_CI_BUILDER_WAIT_MAX_SECONDS` | One build's wait bound in the shim and the cap on a step's paused time. A step's own value wins; otherwise the daemon sets it from `qits.ci.builder-wait-max-seconds` (3600). |
+
+What a step's log shows (stderr):
+
+    [builder] waiting for tcp://qits-system-runner-buildkitd-983a0438:1234 (2 builds ahead)
+    [step clock paused: waiting for builder tcp://qits-system-runner-buildkitd-983a0438:1234 since 2026-11-02T10:15:04Z]
+    [step clock resumed: waited 4m12s for builder tcp://qits-system-runner-buildkitd-983a0438:1234, not counted; 11m40s left]
+    [step clock: builder wait cap of 3600s reached; the clock runs again]
+    [builder] tcp://qits-system-runner-buildkitd-983a0438:1234 did not start this build within 3600s (2 builds ahead)
+    [builder] gate unavailable at /cache/git/.qits-builder-gate, building ungated
+
+A build that waits past its bound exits **75** (`EX_TEMPFAIL`) without ever reaching buildkitd, so
+the step fails as "the builder was busy", not as a timeout. A build that got a place at once writes
+no marker and prints nothing.
+
 ## Telemetry
 
 The daemon ships its own log, its step's output and the step's spans to qits-observability, so a

@@ -293,7 +293,122 @@ class StepProcessTest {
     assertFalse(running(child));
   }
 
+  // --- the paused clock (qits-1807) ---------------------------------------------------------------
+
+  @Test
+  void timeAStepSpendsWaitingForTheBuilderIsNotChargedToItsDeadline() throws Exception {
+    // 3s behind a live marker and 1s after it, on a 2s deadline: only the second counts.
+    String script =
+        "echo \"$QITS_CI_STEP_CLOCK_DIR\" > clock-dir\n"
+            + "echo tcp://builder:1234 > \"$QITS_CI_STEP_CLOCK_DIR/wait-$$\"\n"
+            + "sleep 3\n"
+            + "rm -f \"$QITS_CI_STEP_CLOCK_DIR/wait-$$\"\n"
+            + "sleep 1\n"
+            + "exit 0";
+
+    StepFinished finished = runClocked(new RunStep("c1", 3, script, 2, Map.of()), 60);
+
+    assertFalse(finished.timedOut(), () -> "timed out; stderr was: " + textOf(Stream.ERR));
+    assertEquals(0, finished.exitCode());
+    String err = textOf(Stream.ERR);
+    assertTrue(
+        err.contains("[step clock paused: waiting for builder tcp://builder:1234 since "), err);
+    assertTrue(err.contains("[step clock resumed: waited 0m"), err);
+    assertTrue(err.contains("s for builder tcp://builder:1234, not counted; "), err);
+    Path clockDir = Path.of(Files.readString(workDir.resolve("clock-dir")).strip());
+    assertTrue(clockDir.getFileName().toString().endsWith("-3"), "the dir names the step index");
+    assertFalse(Files.exists(clockDir), "the step's clock directory goes with the step");
+  }
+
+  @Test
+  void aMarkerNamingAProcessOutsideTheStepDoesNotStopTheClock() {
+    // pid 1 is alive and not the step's; a pid past any pid_max is nobody. Neither pauses anything.
+    String script =
+        "echo forged > \"$QITS_CI_STEP_CLOCK_DIR/wait-1\"\n"
+            + "echo forged > \"$QITS_CI_STEP_CLOCK_DIR/wait-4999999999\"\n"
+            + "sleep 30";
+
+    long startedAt = System.nanoTime();
+    StepFinished finished = runClocked(new RunStep("c1", 0, script, 2, Map.of()), 60);
+    long elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000L;
+
+    assertTrue(finished.timedOut());
+    assertTrue(elapsedMillis < 10_000, () -> "took " + elapsedMillis + "ms on a 2s deadline");
+    assertFalse(textOf(Stream.ERR).contains("[step clock paused"), textOf(Stream.ERR));
+  }
+
+  @Test
+  void aMarkerHeldPastTheBuilderWaitCapStopsTheClockOnlyForTheCap() {
+    // The step's own shell, so the marker is live — the forgery the pid check cannot catch. The cap
+    // is what bounds it: 1s paused, then the 2s deadline runs out at about 3s.
+    String script =
+        "echo tcp://builder:1234 > \"$QITS_CI_STEP_CLOCK_DIR/wait-$$\"\n" + "sleep 10\n" + "exit 0";
+
+    long startedAt = System.nanoTime();
+    StepFinished finished = runClocked(new RunStep("c1", 0, script, 2, Map.of()), 1);
+    long elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000L;
+
+    assertTrue(finished.timedOut());
+    assertTrue(elapsedMillis >= 2_500, () -> "the cap bought nothing: " + elapsedMillis + "ms");
+    assertTrue(elapsedMillis < 8_000, () -> "the marker outlived the cap: " + elapsedMillis + "ms");
+    String err = textOf(Stream.ERR);
+    assertTrue(err.contains("[step clock paused: waiting for builder tcp://builder:1234"), err);
+    assertTrue(
+        err.contains("[step clock: builder wait cap of 1s reached; the clock runs again]"), err);
+  }
+
+  @Test
+  void theStepsOwnBuilderWaitMaxOverridesTheDaemonsCap() {
+    String script =
+        "echo \"$QITS_CI_BUILDER_WAIT_MAX_SECONDS\"\n"
+            + "echo b > \"$QITS_CI_STEP_CLOCK_DIR/wait-$$\"\n"
+            + "sleep 10";
+
+    StepFinished finished =
+        runClocked(
+            new RunStep("c1", 0, script, 1, Map.of("QITS_CI_BUILDER_WAIT_MAX_SECONDS", "1")), 600);
+
+    assertTrue(finished.timedOut(), "a 600s daemon cap would have held this step for 10s");
+    assertEquals("1\n", textOf(Stream.OUT));
+    assertTrue(textOf(Stream.ERR).contains("builder wait cap of 1s reached"), textOf(Stream.ERR));
+  }
+
+  @Test
+  void aStepIsToldTheDaemonsBuilderWaitCapAndNoRealBuildctlWhenTheImageHasNone() {
+    StepFinished finished =
+        runClocked(
+            new RunStep(
+                "c1",
+                0,
+                "echo \"$QITS_CI_BUILDER_WAIT_MAX_SECONDS ${QITS_CI_REAL_BUILDCTL-unset}\"",
+                30,
+                Map.of()),
+            42);
+
+    assertEquals(0, finished.exitCode());
+    // No buildctl in this gate, so no shim and no real-buildctl variable; the cap is the daemon's.
+    assertEquals("42 unset\n", textOf(Stream.OUT));
+  }
+
   // --- helpers ------------------------------------------------------------------------------------
+
+  /** A step on the paused clock: its clock directories under the temp dir, a 100ms tick. */
+  private StepFinished runClocked(RunStep request, long waitMaxSeconds) {
+    BuilderGate gate = new BuilderGate(null, null, workDir.resolve("clock"), waitMaxSeconds);
+    return new StepProcess(
+            workDir,
+            request,
+            emitted::add,
+            new AtomicLong(),
+            8192,
+            100,
+            2000,
+            shell,
+            true,
+            gate,
+            100)
+        .run();
+  }
 
   private StepFinished run(String script, int timeoutSeconds) {
     return run(new RunStep("c1", 0, script, timeoutSeconds, Map.of()), new AtomicLong());

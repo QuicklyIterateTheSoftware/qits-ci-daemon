@@ -63,6 +63,16 @@
             </plugin>
             <plugin>
                 <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <!-- qits-1892: the gate is itself a ci-daemon step, so its env carries the live
+                         daemon's builder-gate variables (qits-1807). A step spawned by a test would
+                         inherit them and the live daemon's cap would win over the one under test. -->
+                    <excludedEnvironmentVariables>
+                        <excludedEnvironmentVariable>QITS_CI_BUILDER_WAIT_MAX_SECONDS</excludedEnvironmentVariable>
+                        <excludedEnvironmentVariable>QITS_CI_REAL_BUILDCTL</excludedEnvironmentVariable>
+                        <excludedEnvironmentVariable>QITS_CI_STEP_CLOCK_DIR</excludedEnvironmentVariable>
+                    </excludedEnvironmentVariables>
+                </configuration>
             </plugin>
         </plugins>
     </build>

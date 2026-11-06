@@ -969,6 +969,93 @@ class DaemonMainTest {
   }
 
   @Test
+  void aRunStepThatArrivesBeforeTheAckRunsOnceTheWorktreeIsReady() throws Exception {
+    // qits-1893: the step used to reach the lane ahead of the initialization, find no worktree and
+    // vanish — no StepFinished, its index spent, and the host waited out its backstop.
+    Host host =
+        host(
+            (h, message) -> {
+              if (message instanceof Hello) {
+                h.send(new RunStep("c1", 0, "echo early", 30, Map.of()));
+                h.send(new Ack(CiDaemonProtocol.CAPABILITY_VERSION));
+              }
+            });
+
+    int code = runDaemon(host.url("/ci/daemon"), ready(), 30).get(30, TimeUnit.SECONDS);
+    host.awaitDrained();
+
+    assertEquals(ExitCode.OK, code);
+    assertEquals(1, stepsCreated.get());
+    assertEquals(
+        List.of(0), host.all(StepFinished.class).stream().map(StepFinished::stepIndex).toList());
+    assertTrue(
+        indexOfFirst(host.received, Initialized.class)
+            < indexOfFirst(host.received, StepFinished.class),
+        () -> "the step runs only once the worktree is ready: " + host.received);
+    StringBuilder out = new StringBuilder();
+    host.all(StepChunk.class).forEach(chunk -> out.append(chunk.text()));
+    assertEquals("early\n", out.toString());
+  }
+
+  @Test
+  void aRunStepHeldForTheAckAndSentAgainAfterItStillRunsOnce() throws Exception {
+    // What a re-admitting host does: send the step again once it reads Initialized. The held step
+    // already owns index 0, so the re-send is the repeat it looks like.
+    Host host =
+        host(
+            (h, message) -> {
+              if (message instanceof Hello) {
+                h.send(new RunStep("c1", 0, "echo early", 30, Map.of()));
+                h.send(new Ack(CiDaemonProtocol.CAPABILITY_VERSION));
+              } else if (message instanceof Initialized) {
+                h.send(new RunStep("c1", 0, "echo again", 30, Map.of()));
+              }
+            });
+
+    int code = runDaemon(host.url("/ci/daemon"), ready(), 30).get(30, TimeUnit.SECONDS);
+    host.awaitDrained();
+
+    assertEquals(ExitCode.OK, code);
+    assertEquals(1, stepsCreated.get());
+    assertEquals(
+        List.of(0), host.all(StepFinished.class).stream().map(StepFinished::stepIndex).toList());
+    StringBuilder out = new StringBuilder();
+    host.all(StepChunk.class).forEach(chunk -> out.append(chunk.text()));
+    assertEquals("early\n", out.toString());
+  }
+
+  @Test
+  void aRunStepHeldForTheAckDoesNotRunWhenTheInitializationFails() throws Exception {
+    Host host =
+        host(
+            (h, message) -> {
+              if (message instanceof Hello) {
+                h.send(new RunStep("c1", 0, "echo early", 30, Map.of()));
+                h.send(new Ack(CiDaemonProtocol.CAPABILITY_VERSION));
+              }
+            });
+
+    int code =
+        runDaemon(
+                host.url("/ci/daemon"),
+                worktree(
+                    () ->
+                        new MirrorWorktree.Preparation(
+                            InitFailed.Reason.SHA_GONE, "fatal: reference is not a tree")),
+                30)
+            .get(30, TimeUnit.SECONDS);
+    host.awaitDrained();
+
+    // The InitFailed is the host's answer for the held step, as for any step behind a failed
+    // initialization.
+    assertEquals(ExitCode.INIT_FAILED_SENT, code);
+    assertEquals(InitFailed.Reason.SHA_GONE, host.first(InitFailed.class).reason());
+    assertNull(host.first(Initialized.class));
+    assertNull(host.first(StepFinished.class));
+    assertEquals(0, stepsCreated.get());
+  }
+
+  @Test
   void aCloseWhileAStepRunsKillsItStillReportsItAndThenRemovesTheWorktree() throws Exception {
     Host host =
         host(
@@ -1437,7 +1524,11 @@ class DaemonMainTest {
 
   private final java.util.concurrent.atomic.AtomicLong seq = new java.util.concurrent.atomic.AtomicLong();
 
+  /** How many steps the daemon built, so a test can say a step ran once or not at all. */
+  private final AtomicInteger stepsCreated = new AtomicInteger();
+
   private Step step(RunStep request, java.util.function.Consumer<CiDaemonMessage> emit) {
+    stepsCreated.incrementAndGet();
     return new StepProcess(workDir, request, emit, seq, 8192, 100, 2000, "bash", true);
   }
 

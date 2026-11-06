@@ -41,7 +41,9 @@ import org.jboss.logging.Logger;
  * Initialized} when the worktree cannot be made, and {@code Cancel} killing the step that is
  * running. Steps run one at a time, in the order they arrive, on one lane that also runs the
  * initialization and the {@code Close} — so a {@code RunStep} that arrives early waits for the
- * worktree, and the worktree is removed only after the last step on the lane is done.
+ * worktree (one that arrives before the {@code Ack} itself is parked until the Ack has queued the
+ * initialization ahead of it), and the worktree is removed only after the last step on the lane is
+ * done.
  *
  * <p><b>One lease, two runs (capability 3, qits-732).</b> A release request's QA run on the fold and
  * its build of the cut tag share a lease: after the first run's last {@code StepFinished} the host
@@ -163,6 +165,23 @@ public final class DaemonMain implements ControlSocket.Listener {
 
   /** Accepted RunSteps not yet finished on the lane; under {@code this}. A Continue needs zero. */
   private int queuedSteps;
+
+  /**
+   * RunSteps accepted before the first {@code Ack}, in the order they arrived (which is step-index
+   * order: acceptance only ever moves {@link #lastStepIndex} up); under {@code this}. They count in
+   * {@link #queuedSteps} and hold their index from the moment they are accepted, so a re-send after
+   * the Ack is the repeat it looks like.
+   *
+   * <p>Parked rather than queued, because the lane is the ordering: the initialization goes on it
+   * only when the Ack arrives, so a step queued earlier would run ahead of it, find no worktree and
+   * return — no {@code StepFinished}, and its index already spent, so the host's re-send on
+   * re-admission was ignored as a repeat and the run waited out the host's backstop with no output
+   * (qits-1893). The Ack queues the initialization and then these behind it, under one lock with
+   * this list, so nothing can slip between them. A failed initialization still ends them the way it
+   * ends any step behind it: {@code runStep} finds the worktree not ready and the {@code InitFailed}
+   * is the host's answer.
+   */
+  private final java.util.List<RunStep> beforeAck = new java.util.ArrayList<>();
 
   /** A Continue is on the lane; under {@code this}. A second one meanwhile is NOT_IDLE. */
   private boolean continuing;
@@ -357,16 +376,29 @@ public final class DaemonMain implements ControlSocket.Listener {
       closeAndFinish(ExitCode.CAPABILITY_MISMATCH, why);
       return;
     }
-    if (acked.compareAndSet(false, true)) {
-      endSpan(dialSpan, null);
-      // Confirms host→daemon delivery, which Hello never did — see AckReceived's javadoc. Fired
-      // before the worktree is made and best-effort. Only for the first Ack: the one a reconnect
-      // earns re-admits a launch that was confirmed long ago, and a second worktree for the same
-      // run would be a second initialization of one lease.
-      socket
-          .send(new AckReceived())
-          .onFailure(t -> LOG.debugf("ci-daemon could not confirm the Ack: %s", t.getMessage()));
-      lane.execute(this::initialize);
+    java.util.List<RunStep> parked = null;
+    synchronized (this) {
+      if (acked.compareAndSet(false, true)) {
+        endSpan(dialSpan, null);
+        // Confirms host→daemon delivery, which Hello never did — see AckReceived's javadoc. Fired
+        // before the worktree is made and best-effort. Only for the first Ack: the one a reconnect
+        // earns re-admits a launch that was confirmed long ago, and a second worktree for the same
+        // run would be a second initialization of one lease.
+        socket
+            .send(new AckReceived())
+            .onFailure(t -> LOG.debugf("ci-daemon could not confirm the Ack: %s", t.getMessage()));
+        lane.execute(this::initialize);
+        // Behind the initialization, still under the lock onRunStep parks under: a RunStep that
+        // arrives now is queued after these, never between them and the initialization.
+        parked = new java.util.ArrayList<>(beforeAck);
+        beforeAck.clear();
+        parked.forEach(this::enqueue);
+      }
+    }
+    if (parked != null && !parked.isEmpty()) {
+      LOG.infof(
+          "ci-daemon queued %d RunStep(s) that arrived before the Ack behind the initialization",
+          parked.size());
     }
     release();
   }
@@ -427,11 +459,27 @@ public final class DaemonMain implements ControlSocket.Listener {
       }
       lastStepIndex = request.stepIndex();
       queuedSteps++;
+      if (!acked.get()) {
+        // Not on the lane yet: the initialization is not on it either. See beforeAck.
+        LOG.infof(
+            "ci-daemon holding RunStep %d (%s) until the Ack: the worktree is not made yet",
+            request.stepIndex(), request.correlationId());
+        beforeAck.add(request);
+      } else {
+        enqueue(request);
+      }
     }
     anyStep.set(true);
     synchronized (outbox) {
       continueAnswer = null; // the host read it: it is sending the next run's steps
     }
+  }
+
+  /**
+   * Under {@code this}, for a step already counted in {@link #queuedSteps}: put it on the lane,
+   * behind the initialization — which is why it is called only once the first Ack has queued that.
+   */
+  private void enqueue(RunStep request) {
     try {
       lane.execute(
           () -> {
@@ -586,7 +634,8 @@ public final class DaemonMain implements ControlSocket.Listener {
   /** On the lane. */
   private void runStep(RunStep request) {
     if (ending.get() || !ready) {
-      // Initialization failed (InitFailed is on its way) or a Close got here first.
+      // Initialization failed (InitFailed is on its way) or a Close got here first. Never "not
+      // initialized yet": a step reaches the lane only behind the initialization (see beforeAck).
       return;
     }
     Spans.Span script = telemetry.span("script");
@@ -672,6 +721,12 @@ public final class DaemonMain implements ControlSocket.Listener {
   private void teardown(int code, String rootError, boolean closeSocket, String why) {
     if (!ending.compareAndSet(false, true)) {
       return;
+    }
+    synchronized (this) {
+      // An ending before the first Ack: what was parked for it will never run. Not queued, so not
+      // finished on the lane either — uncount it here.
+      queuedSteps -= beforeAck.size();
+      beforeAck.clear();
     }
     Step running = step;
     if (running != null) {

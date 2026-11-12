@@ -22,6 +22,7 @@ import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import org.jboss.logging.Logger;
@@ -71,6 +72,15 @@ import org.jboss.logging.Logger;
  * is a Continue's answer ({@code Continued} or {@code ContinueFailed}), after the replay. A re-dial
  * after a Continue presents the new run's token. Only a reconnect budget that runs out ends the
  * process, as exit 6.
+ *
+ * <p><b>A running step is worth re-dialling for until it cannot be running any more</b> (qits-2163).
+ * The budget alone ended every step of every target in an edge outage longer than 90 seconds, steps
+ * that were healthy and that qits-ci now holds for as long. So while a step runs, or its {@code
+ * StepFinished} waits to be delivered, the socket is told to keep re-dialling past the budget ({@link
+ * #holdRemainingMillis}) until the step's own deadline — its {@code timeoutSeconds} plus the
+ * builder-wait cap its clock may pause for (qits-1807), counted from its start — and one more
+ * reconnect budget after it, for the kill and the frame's flight. No step, no hold: the budget is the
+ * end, as before, and so is a host that refuses the re-dial ({@link ControlSocket}).
  *
  * <p><b>Telemetry is flushed once, at the ending, before the socket is closed.</b> A {@code
  * StepFinished} no longer ends the container, so there is no reaping to race until qits-ci deletes
@@ -231,6 +241,25 @@ public final class DaemonMain implements ControlSocket.Listener {
   private long heldChars;
   private long droppedChunks;
 
+  /** The builder-wait cap a step env does not state its own of; see {@link BuilderGate}. */
+  static final long DEFAULT_BUILDER_WAIT_MAX_SECONDS = 3600;
+
+  /** The cap on a step's paused clock when its env names none — part of how long it can run. */
+  private final long builderWaitMaxSeconds;
+
+  /** How long an outage may last with no step to hold for; also the hold's tail after a deadline. */
+  private final long reconnectBudgetMillis;
+
+  /**
+   * The {@link System#nanoTime} by which the step on the lane can no longer be running and its result
+   * no longer be deliverable; read only while {@link #stepOwed} or a held {@code StepFinished} says
+   * there is a step to hold for (qits-2163).
+   */
+  private volatile long stepHoldUntilNanos;
+
+  /** From a step's start until its {@code StepFinished} was handed to {@link #deliver}. */
+  private volatile boolean stepOwed;
+
   /** The terminal frame ({@code InitFailed}) and the exit it ends in; kept until it is written. */
   private CiDaemonMessage terminal;
   private int terminalCode;
@@ -260,13 +289,59 @@ public final class DaemonMain implements ControlSocket.Listener {
       Steps steps,
       Telemetry telemetry,
       CredentialRefresh credentials) {
+    this(
+        vertx,
+        env,
+        settings,
+        worktree,
+        steps,
+        telemetry,
+        credentials,
+        DEFAULT_BUILDER_WAIT_MAX_SECONDS);
+  }
+
+  public DaemonMain(
+      Vertx vertx,
+      DaemonEnv env,
+      ControlSocket.Settings settings,
+      Worktree worktree,
+      Steps steps,
+      Telemetry telemetry,
+      CredentialRefresh credentials,
+      long builderWaitMaxSeconds) {
+    this.builderWaitMaxSeconds = builderWaitMaxSeconds;
+    this.reconnectBudgetMillis = settings.reconnectBudgetMillis();
     this.credentials = credentials;
     this.env = env;
     this.worktree = worktree;
     this.steps = steps;
     this.telemetry = telemetry;
     this.identity = new RunIdentity(env);
-    this.socket = new ControlSocket(vertx, env.daemonUrl(), identity::token, settings, this);
+    this.socket =
+        new ControlSocket(
+            vertx, env.daemonUrl(), identity::token, settings, this, this::holdRemainingMillis);
+  }
+
+  /**
+   * How much longer the socket is worth re-dialling for past its budget ({@link
+   * ControlSocket.Hold}, qits-2163): until {@link #stepHoldUntilNanos} while a step runs or its
+   * {@code StepFinished} is held for the host, and not at all otherwise — between steps, before the
+   * first, or once the lease is ending.
+   */
+  long holdRemainingMillis() {
+    if (ending.get()) {
+      return 0;
+    }
+    boolean owed = stepOwed;
+    if (!owed) {
+      synchronized (outbox) {
+        owed = held.values().stream().anyMatch(StepFinished.class::isInstance);
+      }
+    }
+    if (!owed) {
+      return 0;
+    }
+    return Math.max(0, (stepHoldUntilNanos - System.nanoTime()) / 1_000_000L);
   }
 
   /**
@@ -645,6 +720,15 @@ public final class DaemonMain implements ControlSocket.Listener {
       script.attribute("qits.ci.run_id", runId);
     }
     cancelRequested = false;
+    // The longest this step can be running, and then one reconnect budget for its kill and its
+    // result's flight: how long an outage is worth re-dialling through for it (qits-2163).
+    long runsFor =
+        TimeUnit.SECONDS.toMillis(
+                Math.max(0, request.timeoutSeconds())
+                    + BuilderGate.waitMaxSeconds(request.env(), builderWaitMaxSeconds))
+            + reconnectBudgetMillis;
+    stepHoldUntilNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(runsFor);
+    stepOwed = true;
     Step running =
         steps.create(
             withRunEnv(request),
@@ -674,6 +758,8 @@ public final class DaemonMain implements ControlSocket.Listener {
     // Not the terminal frame any more: the lease goes on to the next RunStep or the Close. It is
     // held through an outage like the chunks before it, and after them.
     deliver(finished);
+    // Sent, or held — and a held one keeps the hold up (holdRemainingMillis).
+    stepOwed = false;
   }
 
   private void onCancel(Cancel cancel) {

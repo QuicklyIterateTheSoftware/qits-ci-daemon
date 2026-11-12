@@ -249,7 +249,10 @@ public class Main {
               telemetry,
               // The process environment, not DaemonEnv: it is what every step child inherits,
               // the bootstrap's exports (QITS_PUBLISH_TOKEN) included.
-              CredentialRefresh.fromEnvironment(System.getenv()))
+              CredentialRefresh.fromEnvironment(System.getenv()),
+              // How long a running step can last is part of how long its socket is worth
+              // re-dialling for (qits-2163); the step env's own value wins, as for the clock.
+              builderWaitMaxSeconds)
           .run();
     }
 

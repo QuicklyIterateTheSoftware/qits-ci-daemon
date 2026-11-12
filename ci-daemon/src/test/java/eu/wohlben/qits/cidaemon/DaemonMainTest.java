@@ -717,6 +717,129 @@ class DaemonMainTest {
     assertTrue(elapsedMillis < 10_000, () -> "the reconnect budget did not bound the retry: " + elapsedMillis + "ms");
   }
 
+  /**
+   * qits-2163, the 2026-11-12 edge outage in miniature: the socket drops with a step running and
+   * every re-dial is refused for more than three reconnect budgets. The step can still be running, so
+   * the daemon keeps re-dialling past the budget, is re-admitted once the host is back, and the step
+   * finishes with its own exit code — no SOCKET_CLOSED_EARLY teardown.
+   */
+  @Test
+  void aHostUnreachableForLongerThanTheReconnectBudgetWhileAStepRunsIsReDialledUntilItIsBack()
+      throws Exception {
+    java.util.concurrent.atomic.AtomicBoolean dropped =
+        new java.util.concurrent.atomic.AtomicBoolean();
+    java.util.concurrent.atomic.AtomicLong droppedAt = new java.util.concurrent.atomic.AtomicLong();
+    java.util.concurrent.atomic.AtomicLong backAt = new java.util.concurrent.atomic.AtomicLong();
+    Host host =
+        host(
+            (h, message) -> {
+              if (message instanceof Hello) {
+                if (h.upgrades.get() > 1) {
+                  backAt.set(System.nanoTime());
+                }
+                h.send(new Ack(CiDaemonProtocol.CAPABILITY_VERSION));
+              } else if (message instanceof Initialized) {
+                h.send(
+                    new RunStep(
+                        "c1", 0, "echo before; sleep 2.5; echo after; exit 4", 300, Map.of()));
+              } else if (message instanceof StepChunk && dropped.compareAndSet(false, true)) {
+                // The edge goes dark with the step running, and stays dark past the budget.
+                h.rejecting = true;
+                droppedAt.set(System.nanoTime());
+                h.socket.close();
+                vertx.setTimer(2_000, id -> h.rejecting = false);
+              }
+            });
+
+    int code =
+        runDaemon(tokenEnv(host.url("/ci/daemon")), ready(), 30, 10_000, 600)
+            .get(30, TimeUnit.SECONDS);
+    host.awaitDrained();
+
+    assertEquals(ExitCode.OK, code, "re-admitted and closed by the host, not SOCKET_CLOSED_EARLY");
+    assertTrue(host.rejected.get() >= 2, () -> "re-dials refused: " + host.rejected.get());
+    long gapMillis = (backAt.get() - droppedAt.get()) / 1_000_000L;
+    assertTrue(gapMillis >= 3 * 600, () -> "back after three budgets, not inside one: " + gapMillis);
+    assertEquals(2, host.upgrades.get(), "one admitted re-dial");
+    StepFinished finished = host.first(StepFinished.class);
+    assertNotNull(finished);
+    assertEquals(4, finished.exitCode(), "the step's own result");
+    assertFalse(finished.timedOut());
+    StringBuilder out = new StringBuilder();
+    host.all(StepChunk.class).forEach(chunk -> out.append(chunk.text()));
+    assertTrue(out.toString().contains("after"), out::toString);
+  }
+
+  /** A host that refuses the re-dial outright (1008: the launch is gone) is not waited out. */
+  @Test
+  void aReDialTheHostRefusesWhileAStepRunsEndsWithinTheReconnectBudget() throws Exception {
+    java.util.concurrent.atomic.AtomicBoolean dropped =
+        new java.util.concurrent.atomic.AtomicBoolean();
+    Host host =
+        host(
+            (h, message) -> {
+              if (message instanceof Hello) {
+                if (h.upgrades.get() == 1) {
+                  h.send(new Ack(CiDaemonProtocol.CAPABILITY_VERSION));
+                } else {
+                  h.socket.close((short) 1008, "UNKNOWN_DAEMON");
+                }
+              } else if (message instanceof Initialized) {
+                h.send(new RunStep("c1", 0, "echo before; sleep 20", 300, Map.of()));
+              } else if (message instanceof StepChunk && dropped.compareAndSet(false, true)) {
+                h.socket.close();
+              }
+            });
+
+    long startedAt = System.nanoTime();
+    int code =
+        runDaemon(tokenEnv(host.url("/ci/daemon")), ready(), 30, 10_000, 600)
+            .get(30, TimeUnit.SECONDS);
+    long elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000L;
+
+    assertEquals(ExitCode.SOCKET_CLOSED_EARLY, code);
+    assertTrue(host.upgrades.get() >= 2, () -> "expected a re-dial, saw " + host.upgrades.get());
+    assertTrue(elapsedMillis < 10_000, () -> "a refusal must not be held for: " + elapsedMillis + "ms");
+  }
+
+  /** The hold is the step's own deadline plus one budget, not forever. */
+  @Test
+  void aHostThatNeverComesBackIsReDialledOnlyUntilTheStepsDeadlineAndOneBudgetMore()
+      throws Exception {
+    java.util.concurrent.atomic.AtomicBoolean dropped =
+        new java.util.concurrent.atomic.AtomicBoolean();
+    java.util.concurrent.atomic.AtomicLong droppedAt = new java.util.concurrent.atomic.AtomicLong();
+    Host host =
+        host(
+            (h, message) -> {
+              if (message instanceof Hello) {
+                h.send(new Ack(CiDaemonProtocol.CAPABILITY_VERSION));
+              } else if (message instanceof Initialized) {
+                // A two-second step whose clock may not pause at all: it can run for 2s, no more.
+                h.send(
+                    new RunStep(
+                        "c1",
+                        0,
+                        "echo before; sleep 30",
+                        2,
+                        Map.of("QITS_CI_BUILDER_WAIT_MAX_SECONDS", "0")));
+              } else if (message instanceof StepChunk && dropped.compareAndSet(false, true)) {
+                h.rejecting = true;
+                droppedAt.set(System.nanoTime());
+                h.socket.close();
+              }
+            });
+
+    int code =
+        runDaemon(tokenEnv(host.url("/ci/daemon")), ready(), 30, 10_000, 600)
+            .get(30, TimeUnit.SECONDS);
+    long outageMillis = (System.nanoTime() - droppedAt.get()) / 1_000_000L;
+
+    assertEquals(ExitCode.SOCKET_CLOSED_EARLY, code);
+    assertTrue(outageMillis >= 2_000, () -> "held past the budget for the step: " + outageMillis);
+    assertTrue(outageMillis < 10_000, () -> "bounded by the step's deadline: " + outageMillis);
+  }
+
   @Test
   void aHostThatAcceptsTheReDialButNeverSpeaksDoesNotResetTheReconnectBudget() throws Exception {
     Host host =
@@ -1658,6 +1781,11 @@ class DaemonMainTest {
     /** Which upgrade (1-based) each entry of {@link #received} arrived on. */
     private final List<Integer> receivedOn = Collections.synchronizedList(new ArrayList<>());
     final AtomicInteger upgrades = new AtomicInteger();
+
+    /** While set, every upgrade is refused 502 — an edge that is down (qits-2163). */
+    volatile boolean rejecting;
+
+    final AtomicInteger rejected = new AtomicInteger();
     volatile MultiMap headers;
     volatile String requestPath;
     volatile String requestUri;
@@ -1699,6 +1827,12 @@ class DaemonMainTest {
     }
 
     private void onUpgrade(ServerWebSocket ws) {
+      if (rejecting) {
+        // What a dark edge answers: the upgrade fails, and nothing reaches the conversation.
+        rejected.incrementAndGet();
+        ws.reject(502);
+        return;
+      }
       headers = ws.headers();
       requestPath = ws.path();
       requestUri = ws.uri();

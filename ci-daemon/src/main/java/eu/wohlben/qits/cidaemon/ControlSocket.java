@@ -28,8 +28,18 @@ import org.jboss.logging.Logger;
  * which is what every step does when qits-edge, the path the socket travels, is redeployed (qits-748).
  * The step behind the socket is still running and the host holds its launch through a grace of its
  * own, so the same token re-dials and the conversation resumes. Only a reconnect budget that runs
- * out is terminal: the host has reaped the launch by then, and retrying past it only delays an
- * outcome that is already decided.
+ * out is terminal: with no step running the host has given the launch up by then, and retrying past
+ * it only delays an outcome that is already decided.
+ *
+ * <p><b>A running step stretches the reconnect budget to its own deadline</b> (qits-2163). The edge
+ * sits on both legs, so an edge outage longer than the budget used to end every step on every target
+ * while the steps themselves were healthy (2026-11-12: 85 minutes, every daemon gone at second 90).
+ * So when the budget is spent the owner is asked how much longer it still needs the socket ({@link
+ * Hold}) — for as long as its step can still be running, and its result still has to be delivered —
+ * and the re-dialling goes on, at the same capped backoff, until that runs out too. The host holds a
+ * running step for as long. A host that <em>refuses</em> a re-dial (a close {@value #POLICY_VIOLATION},
+ * such as {@code UNKNOWN_DAEMON}: the launch is gone) is not waited out: that outage keeps the plain
+ * budget, as before.
  *
  * <p>An outage lasts from the close until the host <em>speaks</em> on a new socket, not until the
  * upgrade completes: a host that accepts and closes again has not taken the launch back, so the
@@ -62,6 +72,22 @@ public final class ControlSocket {
 
   /** The one handshake header: it carries the run's own token. */
   static final String HEADER_AUTHORIZATION = "Authorization";
+
+  /** The close status a host refuses a dial with: 1008, "policy violation". */
+  static final short POLICY_VIOLATION = 1008;
+
+  /**
+   * How much longer the owner still needs a dropped socket back, past the reconnect budget
+   * (qits-2163): asked once the budget is spent, and again before every attempt after it. Zero or
+   * less is "nothing to hold for", and the budget is the end, as before. In milliseconds from now
+   * rather than an instant, so that "no hold" needs no sentinel a nanosecond clock could collide with.
+   */
+  @FunctionalInterface
+  public interface Hold {
+    Hold NONE = () -> 0;
+
+    long remainingMillis();
+  }
 
   /**
    * What the socket tells its owner. Deliberately events and not a message stream: two of them are
@@ -97,7 +123,8 @@ public final class ControlSocket {
    * on purpose: a daemon that cannot reach its host is a container the host reaps on its own
    * register timeout. The reconnect budget has to cover an edge redeploy and must be at least the
    * host's own reconnect grace ({@code qits.ci.daemon.reconnect-grace-seconds} in qits-ci), or the
-   * daemon gives up on a launch the host is still holding for it.
+   * daemon gives up on a launch the host is still holding for it. A running step stretches it to
+   * that step's own deadline ({@link Hold}, qits-2163).
    */
   public record Settings(
       long heartbeatMillis,
@@ -117,6 +144,7 @@ public final class ControlSocket {
 
   private final Settings settings;
   private final Listener listener;
+  private final Hold hold;
 
   private volatile WebSocketClient client;
   private volatile WebSocket socket;
@@ -137,6 +165,12 @@ public final class ControlSocket {
   /** Attempts in the current dial or outage, accept-then-close cycles included; drives backoff. */
   private volatile int attempts;
 
+  /** The host refused a re-dial in the current outage (a 1008 close): no {@link Hold} applies. */
+  private volatile boolean refused;
+
+  /** The current outage outlasted the budget and goes on for the {@link Hold}; logged once. */
+  private volatile boolean holding;
+
   public ControlSocket(
       Vertx vertx,
       String url,
@@ -152,11 +186,22 @@ public final class ControlSocket {
       Supplier<String> token,
       Settings settings,
       Listener listener) {
+    this(vertx, url, token, settings, listener, Hold.NONE);
+  }
+
+  public ControlSocket(
+      Vertx vertx,
+      String url,
+      Supplier<String> token,
+      Settings settings,
+      Listener listener,
+      Hold hold) {
     this.vertx = vertx;
     this.url = url;
     this.token = token;
     this.settings = settings;
     this.listener = listener;
+    this.hold = hold;
   }
 
   /**
@@ -203,12 +248,29 @@ public final class ControlSocket {
             });
   }
 
-  /** Schedule the next attempt, or report the budget in force as spent. */
+  /**
+   * Schedule the next attempt, or report the budget in force as spent — unless the outage is past
+   * its budget and the owner still holds for a running step (qits-2163), which a refusal ends.
+   */
   private void retryOrGiveUp(String lastFailure) {
     long backoff = backoffFor(attempts);
     if (System.nanoTime() + backoff * 1_000_000L < deadlineNanos) {
       vertx.setTimer(backoff, id -> connect());
       return;
+    }
+    if (connectedOnce && !refused) {
+      long remaining = hold.remainingMillis();
+      if (remaining > backoff) {
+        if (!holding) {
+          holding = true;
+          LOG.warnf(
+              "ci-daemon could not re-establish the control socket to %s within %dms; its step can"
+                  + " still be running, so it keeps re-dialling for up to %dms more: %s",
+              url, settings.reconnectBudgetMillis(), remaining, lastFailure);
+        }
+        vertx.setTimer(backoff, id -> connect());
+        return;
+      }
     }
     if (!connectedOnce) {
       end(
@@ -225,8 +287,12 @@ public final class ControlSocket {
       return;
     }
     LOG.warnf(
-        "ci-daemon could not re-establish the control socket to %s within %dms (%d attempts): %s",
-        url, settings.reconnectBudgetMillis(), attempts, lastFailure);
+        "ci-daemon could not re-establish the control socket to %s within %dms%s (%d attempts): %s",
+        url,
+        settings.reconnectBudgetMillis(),
+        holding ? " and its step's hold" : refused ? " (the host refused the re-dial)" : "",
+        attempts,
+        lastFailure);
     end(listener::onClosed);
   }
 
@@ -274,6 +340,8 @@ public final class ControlSocket {
       outageStartedNanos = System.nanoTime();
       deadlineNanos = outageStartedNanos + settings.reconnectBudgetMillis() * 1_000_000L;
       attempts = 0;
+      refused = false;
+      holding = false;
       LOG.warnf(
           "ci-daemon control socket closed (%s); re-dialling for up to %dms",
           closeDetail, settings.reconnectBudgetMillis());
@@ -281,6 +349,11 @@ public final class ControlSocket {
       LOG.warnf(
           "ci-daemon control socket closed again (%s) on re-dial attempt %d",
           closeDetail, attempts);
+    }
+    Short code = ws.closeStatusCode();
+    if (code != null && code == POLICY_VIOLATION) {
+      // The host refused this launch: there is nothing left there for a held step to come back to.
+      refused = true;
     }
     listener.onDisconnected();
     retryOrGiveUp("the socket closed");
@@ -317,6 +390,8 @@ public final class ControlSocket {
     // back, a frame does.
     outageStartedNanos = 0;
     attempts = 0;
+    refused = false;
+    holding = false;
     listener.onMessage(message);
   }
 

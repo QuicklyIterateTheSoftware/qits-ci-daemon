@@ -219,7 +219,15 @@ public final class BuilderGate {
    * it is a non-negative number, the daemon's default otherwise.
    */
   long waitMaxSeconds(Map<String, String> stepEnv) {
-    String raw = stepEnv.get(WAIT_MAX);
+    return waitMaxSeconds(stepEnv, defaultWaitMaxSeconds);
+  }
+
+  /**
+   * {@link #waitMaxSeconds(Map)} for a caller holding no gate — {@link DaemonMain}, bounding how long
+   * it re-dials for a running step by the same cap the step's clock pauses for (qits-2163).
+   */
+  static long waitMaxSeconds(Map<String, String> stepEnv, long defaultWaitMaxSeconds) {
+    String raw = stepEnv == null ? null : stepEnv.get(WAIT_MAX);
     if (raw != null) {
       try {
         long parsed = Long.parseLong(raw.strip());

@@ -12,6 +12,15 @@ import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -28,10 +37,11 @@ import org.jboss.logging.Logger;
  *         &lt;work&gt;/&lt;runId&gt; &lt;sha&gt;
  *     git submodule init + sync, each url set to the sibling beside the run's origin
  *                                         (they write the mirror's shared config)
- *   then, per submodule:
+ *   then, for every submodule, at most 8 at once (qits-2310), all waited for:
  *     its own mirror, cloned under its own lock if missing
  *     git -c submodule.&lt;name&gt;.url=&lt;sibling&gt; submodule update --init --depth 50
- *         [--reference &lt;its mirror&gt;] -- &lt;path&gt;
+ *         [--reference &lt;its mirror&gt;] -- &lt;path&gt;    (transient failures retried)
+ *     the first failure stops the ones not yet started; the running ones finish
  *   on Continue (qits-732), the lease's next run in the same worktree:
  *     under the lock: git fetch origin +refs/tags/&lt;branch&gt;:refs/tags/&lt;branch&gt;
  *                     | git fetch origin &lt;sha&gt;          (skipped when the mirror has it)
@@ -84,6 +94,17 @@ import org.jboss.logging.Logger;
  * created under its own lock, never while the parent's is held, so the two locks are never taken in
  * opposite orders.
  *
+ * <p><b>Why the submodules run side by side (qits-2310).</b> Each one is a few round trips to the
+ * git host — a fetch into its mirror's clone when that is missing, then the update's own fetch —
+ * and the wrapper has 52 of them: one after another they took 36–62 s, which with the parent's
+ * fetch overran qits-ci-service's 120 s init timeout. They are independent of one another — each
+ * writes its own {@code modules/<name>} and its own path, and reads its own mirror — so {@link
+ * #SUBMODULE_PARALLELISM} of them run at once on a pool that lives only as long as {@link
+ * #prepare()}. What they do share is the mirror's config, which {@code --init} reads and git locks
+ * with a {@code config.lock} it fails on rather than waits for; that failure is retried like a
+ * 5xx. A failed submodule stops the ones not yet started and waits for the running ones, so the
+ * run fails with the first broken submodule's path and no git child outlives the preparation.
+ *
  * <p><b>Credentials</b> are the bootstrap's, exactly as for the old clone: the bootstrap writes a git
  * credential helper that answers with {@code $QITS_TOKEN}, and every git invocation here inherits
  * it. Nothing in this class reads the token: after a {@code Continue} the new run's {@code
@@ -103,6 +124,15 @@ public final class MirrorWorktree implements DaemonMain.Worktree {
   static final int SUBMODULE_DEPTH = 50;
 
   /**
+   * How many submodules are made at once (qits-2310). The wrapper has 52, and one after another
+   * their round trips to the git host took 36–62 s, past qits-ci-service's 120 s init timeout once
+   * the parent mirror's own fetch was added; eight at a time took 18–27 s on a quiet host. Bounded
+   * rather than one thread each because every one is a git process and a connection to the one
+   * git host, and the slot shares its target with other leases.
+   */
+  static final int SUBMODULE_PARALLELISM = 8;
+
+  /**
    * qits-1253, kept from the clone this replaced: a git host that answers with a transient
    * condition — a 503, a dropped connection — is tried again, twice, rather than failing the run.
    */
@@ -119,7 +149,11 @@ public final class MirrorWorktree implements DaemonMain.Worktree {
           Pattern.compile("Operation timed out", Pattern.CASE_INSENSITIVE),
           Pattern.compile("early EOF", Pattern.CASE_INSENSITIVE),
           Pattern.compile("RPC failed", Pattern.CASE_INSENSITIVE),
-          Pattern.compile("unexpected disconnect", Pattern.CASE_INSENSITIVE));
+          Pattern.compile("unexpected disconnect", Pattern.CASE_INSENSITIVE),
+          // qits-2310: git fails rather than waits on a held config.lock, and the submodule
+          // updates now run side by side with each other and with other runs' init and sync on
+          // the mirror's shared config.
+          Pattern.compile("could not lock config file", Pattern.CASE_INSENSITIVE));
 
   /** The {@code detail} budget, matching a step chunk's; the tail is kept. */
   static final int DETAIL_MAX_CHARS = 8192;
@@ -243,6 +277,7 @@ public final class MirrorWorktree implements DaemonMain.Worktree {
   /** Make the worktree, or report why not. Never throws. */
   @Override
   public Preparation prepare() {
+    long started = System.nanoTime();
     Preparation tooling = probeTooling();
     if (tooling != null) {
       return tooling;
@@ -354,27 +389,152 @@ public final class MirrorWorktree implements DaemonMain.Worktree {
           InitFailed.Reason.CLONE_FAILED, tail("the mirror could not be locked or written: " + e));
     }
 
-    for (Submodule submodule : submodules) {
-      Path reference = referenceMirror(projectDir, submodule);
-      List<String> argv = new ArrayList<>();
-      if (submodule.url() != null && configKeyName(submodule.name())) {
-        argv.add("-c");
-        argv.add("submodule." + submodule.name() + ".url=" + submodule.url());
+    long submodulesStarted = System.nanoTime();
+    Preparation updated = updateSubmodules(projectDir, target, submodules);
+    if (updated != null) {
+      return updated;
+    }
+    long finished = System.nanoTime();
+    LOG.infof(
+        "ci-daemon worktree ready: %d submodules in %.1f s, init %.1f s",
+        submodules.size(), seconds(finished - submodulesStarted), seconds(finished - started));
+    return Preparation.READY;
+  }
+
+  private static double seconds(long nanos) {
+    return nanos / 1_000_000_000.0;
+  }
+
+  /**
+   * Every submodule's mirror and {@code submodule update}, {@link #SUBMODULE_PARALLELISM} at a
+   * time; null when all of them succeeded, the failure to report otherwise.
+   *
+   * <p><b>Nothing is interrupted.</b> {@link CommandRunner#forking} reads a child's output to the
+   * end before it waits, so an interrupt does not stop a running git — it only turns a finished
+   * one's result into "interrupted" — and a pool torn down with {@code shutdownNow} would return
+   * while its git children still write into this worktree. A failure instead stops further
+   * submodules from <em>starting</em> and waits for the ones already running, each bounded by the
+   * runner's own timeout, so no git child outlives {@link #prepare()}; an interrupt of the
+   * preparing thread does the same and is re-asserted on the way out.
+   *
+   * <p>The failure reported is the first in {@code .gitmodules} order among those that ran, not
+   * whichever finished first, so the same broken submodule gives the same detail from one run to
+   * the next.
+   */
+  private Preparation updateSubmodules(Path projectDir, Path target, List<Submodule> submodules) {
+    if (submodules.isEmpty()) {
+      return null;
+    }
+    AtomicBoolean failed = new AtomicBoolean();
+    AtomicInteger threads = new AtomicInteger();
+    ExecutorService pool =
+        Executors.newFixedThreadPool(
+            Math.min(SUBMODULE_PARALLELISM, submodules.size()),
+            task -> {
+              Thread thread =
+                  new Thread(task, "ci-daemon-submodule-" + threads.incrementAndGet());
+              thread.setDaemon(true);
+              return thread;
+            });
+    List<Future<CommandRunner.Result>> futures = new ArrayList<>();
+    boolean interrupted = false;
+    try {
+      for (Submodule submodule : submodules) {
+        futures.add(
+            pool.submit(
+                () -> {
+                  if (failed.get()) {
+                    return null; // another submodule failed: this one never starts
+                  }
+                  CommandRunner.Result result;
+                  try {
+                    result = updateSubmodule(projectDir, target, submodule);
+                  } catch (RuntimeException e) {
+                    result = new CommandRunner.Result(-1, String.valueOf(e));
+                  }
+                  if (!result.ok()) {
+                    failed.set(true);
+                  }
+                  return result;
+                }));
       }
-      argv.addAll(List.of("submodule", "update", "--init", "--depth"));
-      argv.add(String.valueOf(SUBMODULE_DEPTH));
-      if (reference != null) {
-        argv.add("--reference");
-        argv.add(reference.toString());
+    } finally {
+      pool.shutdown();
+      // Queued submodules see `failed` (or the shutdown) and return at once; running ones are
+      // waited out, whatever happens to this thread meanwhile.
+      while (true) {
+        try {
+          if (pool.awaitTermination(1, TimeUnit.MINUTES)) {
+            break;
+          }
+        } catch (InterruptedException e) {
+          interrupted = true;
+          failed.set(true);
+        }
       }
-      argv.add("--");
-      argv.add(submodule.path());
-      CommandRunner.Result updated = git(target, argv.toArray(String[]::new));
-      if (!updated.ok()) {
-        return new Preparation(InitFailed.Reason.CLONE_FAILED, tail(updated.output()));
+      if (interrupted) {
+        Thread.currentThread().interrupt();
       }
     }
-    return Preparation.READY;
+    for (int i = 0; i < futures.size(); i++) {
+      CommandRunner.Result result = finished(futures.get(i));
+      if (result != null && !result.ok()) {
+        return new Preparation(
+            InitFailed.Reason.CLONE_FAILED,
+            tail("submodule " + submodules.get(i).path() + ": " + result.output()));
+      }
+    }
+    if (interrupted) {
+      return new Preparation(
+          InitFailed.Reason.CLONE_FAILED, "interrupted while updating the submodules");
+    }
+    return null;
+  }
+
+  /** A terminated pool's result for one submodule; null when it never started. */
+  private static CommandRunner.Result finished(Future<CommandRunner.Result> future) {
+    try {
+      return future.get(0, TimeUnit.SECONDS);
+    } catch (ExecutionException e) {
+      return new CommandRunner.Result(-1, String.valueOf(e.getCause()));
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      return null;
+    } catch (TimeoutException | CancellationException e) {
+      return null;
+    }
+  }
+
+  /**
+   * One submodule: its mirror for {@code --reference}, then its {@code submodule update}. Runs on
+   * the submodule pool, so it touches no field this class writes after {@link #prepare()}'s locked
+   * phase, and {@link #runner} is called from several threads at once — the production runner
+   * keeps no state between calls, each fork being its own {@code ProcessBuilder}.
+   */
+  private CommandRunner.Result updateSubmodule(Path projectDir, Path target, Submodule submodule) {
+    Path reference = referenceMirror(projectDir, submodule);
+    List<String> argv = new ArrayList<>();
+    if (submodule.url() != null && configKeyName(submodule.name())) {
+      argv.add("-c");
+      argv.add("submodule." + submodule.name() + ".url=" + submodule.url());
+    }
+    argv.addAll(List.of("submodule", "update", "--init", "--depth"));
+    argv.add(String.valueOf(SUBMODULE_DEPTH));
+    if (reference != null) {
+      argv.add("--reference");
+      argv.add(reference.toString());
+    }
+    argv.add("--");
+    argv.add(submodule.path());
+    String[] args = argv.toArray(String[]::new);
+    // No partial clone to clear before a retry. The contested config is the mirror's shared one,
+    // which the --init step reads (and writes only for a submodule init has not already set up)
+    // before any clone starts, so a lock failure there leaves nothing on disk; a clone cut off by
+    // a 5xx removes its own gitdir and work tree on the way out, as `git clone` always does; and a
+    // gitdir that did survive under modules/ is complete, which the retry reconnects rather than
+    // refusing. Clearing it ourselves would mean joining the untrusted name onto worktrees/<id>/
+    // modules/ — a path this class would rather never build.
+    return withRetry(() -> git(target, args), null);
   }
 
   /**

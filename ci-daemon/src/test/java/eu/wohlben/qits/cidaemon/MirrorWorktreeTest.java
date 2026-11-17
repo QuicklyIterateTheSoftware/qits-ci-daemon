@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
@@ -259,6 +260,94 @@ class MirrorWorktreeTest {
     // Two clones in all: the superproject's mirror and the submodule's, each once.
     assertEquals(2, count("clone", "--mirror"));
     assertEquals(2, count("--reference", tmp.resolve("cache/p1/sub.git").toString()));
+  }
+
+  /**
+   * qits-2310: fifty-two submodules one after another overran the host's init timeout. Each update
+   * waits at a latch until a second one has arrived; one after another, the first would wait out
+   * the latch's bound alone and the most-in-flight count would stay at one.
+   */
+  @Test
+  void submodulesAreUpdatedSideBySideRatherThanOneAfterAnother() throws Exception {
+    Path remote = remoteWithSubmodules("repo", "a", "b", "c");
+    CountDownLatch arrived = new CountDownLatch(2);
+    AtomicInteger inFlight = new AtomicInteger();
+    AtomicInteger mostInFlight = new AtomicInteger();
+    CommandRunner overlapping =
+        (dir, argv) -> {
+          if (!isSubmoduleUpdate(argv)) {
+            return runner().run(dir, argv);
+          }
+          mostInFlight.accumulateAndGet(inFlight.incrementAndGet(), Math::max);
+          try {
+            arrived.countDown();
+            arrived.await(10, TimeUnit.SECONDS);
+            return runner().run(dir, argv);
+          } catch (InterruptedException e) {
+            throw new IllegalStateException(e);
+          } finally {
+            inFlight.decrementAndGet();
+          }
+        };
+
+    MirrorWorktree.Preparation preparation =
+        worktree(remote, "r1", Git.sha(remote, "HEAD"), overlapping).prepare();
+
+    assertTrue(preparation.ready(), preparation::toString);
+    assertTrue(mostInFlight.get() >= 2, () -> "at most " + mostInFlight + " update at a time");
+    for (String name : List.of("a", "b", "c")) {
+      assertEquals(
+          name + " content\n", Files.readString(tmp.resolve("work/r1/libs/" + name + "/file.txt")));
+    }
+  }
+
+  @Test
+  void aSubmoduleThatCannotBeUpdatedIsCloneFailedNamingItsPathAndGitsOutput() throws Exception {
+    Path remote = remoteWithSubmodules("repo", "a", "b", "c");
+    AtomicInteger bAttempts = new AtomicInteger();
+    CommandRunner brokenB =
+        (dir, argv) -> {
+          if (isSubmoduleUpdate(argv) && argv[argv.length - 1].equals("libs/b")) {
+            bAttempts.incrementAndGet();
+            return new CommandRunner.Result(128, "fatal: repository 'b' not found");
+          }
+          return runner().run(dir, argv);
+        };
+
+    MirrorWorktree.Preparation preparation =
+        worktree(remote, "r1", Git.sha(remote, "HEAD"), brokenB).prepare();
+
+    assertEquals(InitFailed.Reason.CLONE_FAILED, preparation.failure(), preparation::toString);
+    assertTrue(
+        preparation.detail().contains("submodule libs/b: fatal: repository 'b' not found"),
+        preparation::detail);
+    // Not transient: one attempt, no retry.
+    assertEquals(1, bAttempts.get());
+  }
+
+  @Test
+  void aConfigLockHeldByAnotherGitIsRetriedAndTheSubmoduleStillArrives() throws Exception {
+    Path remote = remoteWithSubmodules("repo", "a", "b");
+    AtomicInteger attempts = new AtomicInteger();
+    CommandRunner contested =
+        (dir, argv) -> {
+          if (isSubmoduleUpdate(argv)
+              && argv[argv.length - 1].equals("libs/a")
+              && attempts.incrementAndGet() == 1) {
+            commands.add(List.of(argv));
+            return new CommandRunner.Result(
+                255, "error: could not lock config file /cache/p1/repo.git/config: File exists");
+          }
+          return runner().run(dir, argv);
+        };
+
+    MirrorWorktree.Preparation preparation =
+        worktree(remote, "r1", Git.sha(remote, "HEAD"), contested).prepare();
+
+    assertTrue(preparation.ready(), preparation::toString);
+    assertEquals(2, attempts.get());
+    assertEquals(2, countUpdates("libs/a"));
+    assertEquals("a content\n", Files.readString(tmp.resolve("work/r1/libs/a/file.txt")));
   }
 
   @Test
@@ -654,6 +743,54 @@ class MirrorWorktreeTest {
     Files.createDirectories(bare.getParent());
     Git.run(tmp, "clone", "-q", "--bare", source.toString(), bare.toString());
     return bare;
+  }
+
+  /**
+   * A bare superproject with one submodule per name, each its own remote {@code <name>.git} with
+   * a file.txt of {@code "<name> content"}, at {@code libs/<name>} by the relative url {@code
+   * ../<name>.git}.
+   */
+  private Path remoteWithSubmodules(String name, String... subs) throws Exception {
+    Path source = tmp.resolve("src/" + name);
+    Files.createDirectories(source);
+    Git.run(source, "init", "-q", "-b", "main");
+    Files.writeString(source.resolve("README"), "super\n");
+    Git.run(source, "add", "README");
+    for (String sub : subs) {
+      Path subRemote = remote(sub, sub + " content\n");
+      String path = "libs/" + sub;
+      Git.run(
+          source,
+          "-c",
+          "protocol.file.allow=always",
+          "submodule",
+          "add",
+          "-q",
+          subRemote.toString(),
+          path);
+      String url = "../" + sub + ".git";
+      Git.run(source, "config", "-f", ".gitmodules", "submodule." + path + ".url", url);
+    }
+    Git.run(source, "add", ".gitmodules");
+    Git.run(source, "commit", "-q", "-m", "with submodules");
+    Path bare = tmp.resolve("remote/" + name + ".git");
+    Files.createDirectories(bare.getParent());
+    Git.run(tmp, "clone", "-q", "--bare", source.toString(), bare.toString());
+    return bare;
+  }
+
+  private static boolean isSubmoduleUpdate(String... argv) {
+    return Collections.indexOfSubList(List.of(argv), List.of("submodule", "update")) >= 0;
+  }
+
+  /** How many recorded {@code submodule update}s named {@code path}. */
+  private long countUpdates(String path) {
+    synchronized (commands) {
+      return commands.stream()
+          .filter(argv -> isSubmoduleUpdate(argv.toArray(String[]::new)))
+          .filter(argv -> argv.get(argv.size() - 1).equals(path))
+          .count();
+    }
   }
 
   /** The test's own git, with an identity and nothing from the user's config. */
